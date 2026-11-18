@@ -10,8 +10,8 @@ test/anomaly-detection/cross-agent-timing-and-sequence.test.ts(371,7): error TS2
 test/anomaly-detection/time-of-day-activity.test.ts(417,7): error TS2353: Object literal may only specify known properties, and 'minSamplesForPrediction' does not exist in type 'PsiClassifierOptions'.
 test/audit/tools.test.ts(109,57): error TS2345: Argument of type '{ query: Mock<() => Promise<never>>; }' is not assignable to parameter of type 'Pick<AuditLog, "query" | "getAuditChainVerdict">'.
 test/audit/tools.test.ts(45,10): error TS2352: Conversion of type '{ version: string; state_dir: string; master_key_source: string; }' to type 'SanctuaryConfig' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
-test/auto-trigger/auto-trigger.test.ts(910,22): error TS2304: Cannot find name 'HeadersInit'.
-test/auto-trigger/auto-trigger.test.ts(913,24): error TS2304: Cannot find name 'HeadersInit'.
+test/auto-trigger/auto-trigger.test.ts(911,22): error TS2304: Cannot find name 'HeadersInit'.
+test/auto-trigger/auto-trigger.test.ts(914,24): error TS2304: Cannot find name 'HeadersInit'.
 test/broker-mcp/audit-integrity-gate-classification.test.ts(45,17): error TS18046: 'result.content' is of type 'unknown'.
 test/broker-mcp/broker-server.test.ts(87,3): error TS2578: Unused '@ts-expect-error' directive.
 test/castle-wall/export/exporter.test.ts(618,43): error TS2493: Tuple type '[]' of length '0' has no element at index '1'.
@@ -291,8 +291,8 @@ test/evidence-pack/discrete-exports.test.ts(59,73): error TS2345: Argument of ty
 test/evidence-pack/discrete-exports.test.ts(66,7): error TS2741: Property 'daemon_store' is missing in type '{ max_entries: number; retained_total: number; max_total_size_bytes: number; retained_total_size_bytes: number; ever_pruned: false; earliest_retained_at: string; }' but required in type 'RetentionFacts'.
 test/evidence-pack/dry10-chokepoints.test.ts(67,33): error TS2554: Expected 0 arguments, but got 1.
 test/evidence-pack/dry10-chokepoints.test.ts(71,74): error TS2345: Argument of type '"pw"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
-test/evidence-pack/dry11-chokepoints.test.ts(82,33): error TS2554: Expected 0 arguments, but got 1.
-test/evidence-pack/dry11-chokepoints.test.ts(86,74): error TS2345: Argument of type '"pw"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
+test/evidence-pack/dry11-chokepoints.test.ts(83,33): error TS2554: Expected 0 arguments, but got 1.
+test/evidence-pack/dry11-chokepoints.test.ts(87,74): error TS2345: Argument of type '"pw"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
 test/evidence-pack/generate.test.ts(523,65): error TS2345: Argument of type '{ max_entries: number; retained_total: number; max_total_size_bytes: number; retained_total_size_bytes: number; ever_pruned: true; earliest_retained_at: string; }' is not assignable to parameter of type 'RetentionFacts'.
 test/evidence-pack/generate.test.ts(53,33): error TS2554: Expected 0 arguments, but got 1.
 test/evidence-pack/generate.test.ts(57,73): error TS2345: Argument of type '"pw"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
@@ -505,13 +505,13 @@ test/principal-policy/posture-evidence.test.ts(301,25): error TS18046: 'body' is
 test/principal-policy/posture-evidence.test.ts(97,12): error TS18046: 'body' is of type 'unknown'.
 test/principal-policy/posture-evidence.test.ts(98,26): error TS18046: 'body' is of type 'unknown'.
 test/principal-policy/posture-evidence.test.ts(99,12): error TS18046: 'body' is of type 'unknown'.
-test/principal-policy/posture-exclusive-egress-cap.test.ts(633,14): error TS18046: 'home' is of type 'unknown'.
-test/principal-policy/posture-exclusive-egress-cap.test.ts(634,23): error TS18046: 'home' is of type 'unknown'.
-test/principal-policy/posture-exclusive-egress-cap.test.ts(673,14): error TS18046: 'home' is of type 'unknown'.
-test/principal-policy/posture-exclusive-egress-cap.test.ts(674,23): error TS18046: 'home' is of type 'unknown'.
-test/principal-policy/posture-exclusive-egress-cap.test.ts(733,14): error TS18046: 'home' is of type 'unknown'.
+test/principal-policy/posture-exclusive-egress-cap.test.ts(634,14): error TS18046: 'home' is of type 'unknown'.
+test/principal-policy/posture-exclusive-egress-cap.test.ts(635,23): error TS18046: 'home' is of type 'unknown'.
+test/principal-policy/posture-exclusive-egress-cap.test.ts(674,14): error TS18046: 'home' is of type 'unknown'.
+test/principal-policy/posture-exclusive-egress-cap.test.ts(675,23): error TS18046: 'home' is of type 'unknown'.
 test/principal-policy/posture-exclusive-egress-cap.test.ts(734,14): error TS18046: 'home' is of type 'unknown'.
-test/principal-policy/posture-exclusive-egress-cap.test.ts(735,23): error TS18046: 'home' is of type 'unknown'.
+test/principal-policy/posture-exclusive-egress-cap.test.ts(735,14): error TS18046: 'home' is of type 'unknown'.
+test/principal-policy/posture-exclusive-egress-cap.test.ts(736,23): error TS18046: 'home' is of type 'unknown'.
 test/principal-policy/posture-query-privacy.test.ts(31,3): error TS2739: Type '{ origin_machine: string; feature_id: string; label: string; liveness: "event_driven"; status: FeatureHealthStatus; basis: "no_activity_event_driven"; invocation_count: number; last_evidence_at: null; broken_zero_detectable: false; audit_integrity_ok: true; freshness_window_ms: number; }' is missing the following properties from type 'FeatureHealthRow': expectation_floor, trailing_window_volume
 test/principal-policy/posture-routes.test.ts(176,12): error TS18046: 'body' is of type 'unknown'.
 test/principal-policy/posture-routes.test.ts(177,12): error TS18046: 'body' is of type 'unknown'.
