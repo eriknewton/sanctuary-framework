@@ -328,6 +328,30 @@
     "notes": "AuditLog.appendCritical in revokeFileGrant (success, not-found, and scrub-failure paths); reconciles expired grants on this touch"
   },
   {
+    "subcommand": "sanctuary hermes memory-delete",
+    "file_path": "src/cli/hermes-memory.ts",
+    "line_number": 377,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "AuditLog.appendCritical hermes_memory_owner_delete intent row before deletePassage, then one terminal outcome row"
+  },
+  {
+    "subcommand": "sanctuary hermes memory-report",
+    "file_path": "src/cli/hermes-memory.ts",
+    "line_number": 361,
+    "classification": "read-only",
+    "audits_currently": null,
+    "notes": "read-only reader over ReadOnlyStorageGuard and a readOnly AuditLog; --out writes one new 0600 report file outside the fortress"
+  },
+  {
+    "subcommand": "sanctuary hermes memory-show",
+    "file_path": "src/cli/hermes-memory.ts",
+    "line_number": 372,
+    "classification": "read-only",
+    "audits_currently": null,
+    "notes": "read-only reader over ReadOnlyStorageGuard; terminal output only"
+  },
+  {
     "subcommand": "sanctuary honeypot compile",
     "file_path": "src/honeypot/cli.ts",
     "line_number": 138,

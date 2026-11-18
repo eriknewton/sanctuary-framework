@@ -31,4 +31,18 @@ describe("Hermes posture complete manifest parity", () => {
     }
     for (const marker of HERMES_SOUL_BLOCK.match(/<!--[\s\S]*?-->/g)!) expect(marker).not.toMatch(/ignore|override|system|secret|hidden/i);
   });
+  it("tells every session the same automatic-save and honesty wording the memory provider uses", () => {
+    // Python joins adjacent string literals, so the provider's prompts are read with those joins removed.
+    const provider = readFileSync(resolve("../hermes-plugin/sanctuary_memory/__init__.py"), "utf8").replace(/"\s*\n\s*"/g, "");
+    const automatic = "plain messages from the user may be saved to memory automatically after the turn ends";
+    const honesty = "Never say something was saved unless remember returned saved in this turn.";
+    expect(provider).toContain("Plain " + automatic.slice("plain ".length));
+    expect(provider.split(honesty)).toHaveLength(3); // Once in the capturing prompt and once in the remember-only prompt.
+    for (const text of [HERMES_SKILL, HERMES_SOUL_BLOCK]) {
+      // Hermes shows these to every platform, and only Telegram captures, so the sentence names Telegram.
+      expect(text).toContain("In a Telegram chat, " + automatic + "; save anything else with remember.");
+      expect(text).toContain(honesty);
+      expect(text).not.toContain("Save with remember.");
+    }
+  });
 });

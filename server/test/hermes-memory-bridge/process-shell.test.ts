@@ -17,6 +17,7 @@ import { fromBase64url } from "../../src/core/encoding.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, establishMaster } from "../../src/core/master-custody.js";
+import * as custodyModule from "../../src/core/master-custody.js";
 import {
   EXIT_CLEAN,
   EXIT_FATAL_BRIDGE,
@@ -1739,6 +1740,45 @@ describe("Hermes memory process shell", () => {
       shell?.signalStop("SIGTERM"); if (shell !== undefined) await shell.exited;
       append.mockRestore(); forward.mockRestore(); stop.mockRestore(); close.mockRestore(); pair.close();
     }
+  });
+
+  // A lock, intent or import journal written after the first checks but before the shared side is taken must still refuse startup.
+  it.each(["none", "corpus-lock", "unfinished-insert", "exit-import"] as const)("rechecks after custody admission (planted=%s)", async planted => {
+    const fixture = await seededFortress(`recheck-${planted}`);
+    const pair = await socketPair();
+    const storage = new FilesystemStorage(join(fixture.fortressDir, "state"));
+    const lockDir = storage.namespacePath(MEMORY_BATCH_LOCK_NAMESPACE);
+    const lockPath = join(lockDir, sdwMemoryCorpusBatchLockFile());
+    const intentDir = join(fixture.fortressDir, "state", HERMES_INSERT_INTENT_NAMESPACE);
+    const realEstablish = custodyModule.establishMaster;
+    const establish = vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+      // Planted after both first checks ran and before the barrier admits this bridge.
+      if (planted === "corpus-lock") { await mkdir(lockDir, { recursive: true, mode: 0o700 }); await writeFile(lockPath, ""); }
+      if (planted === "unfinished-insert") {
+        await mkdir(intentDir, { recursive: true, mode: 0o700 });
+        await writeFile(join(intentDir, `${HERMES_INSERT_INTENT_KEY}.enc`), "intent fixture");
+      }
+      if (planted === "exit-import") await storage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, "planted-import", Buffer.from("{}\n"));
+      return realEstablish(options);
+    });
+    const options = { env: fixture.env, storageFor: () => storage, uid: process.getuid?.() ?? 0, relaySocketFactory: () => pair.shell };
+    try {
+      if (planted === "none") {
+        const shell = await runHermesBridgeProcess(options);
+        expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
+        pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+        expect(await shell.exited).toBe(EXIT_CLEAN);
+      } else {
+        const refusal = await runProductionHermesBridgeProcess(options).then(() => undefined, cause => cause);
+        // The recheck runs inside the custody state, so its refusal never reads as a pre-custody state.
+        expect(refusal).toMatchObject({ state: "state_CUSTODY_PRESENT" });
+        if (planted === "corpus-lock") expect(refusal).toMatchObject({ lockPath });
+        else if (planted === "unfinished-insert") expect(refusal).toMatchObject({ name: "UnfinishedInsertRefusal" });
+        else expect(refusal).toMatchObject({ message: "interrupted exit-import journal is present" });
+        await expectNoRelayBytes(pair.relay);
+      }
+      expect(establish).toHaveBeenCalledOnce();
+    } finally { establish.mockRestore(); pair.close(); }
   });
 
   // A normal process exit preserves unfinished-save refusal across the production boot path.
