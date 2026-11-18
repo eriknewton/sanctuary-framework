@@ -10,13 +10,66 @@ import * as B from "../../src/evidence-pack/split-statement-contract.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
 const fixtureDeadline=120_000; // Real custody derivation and boot share a two-minute fixture ceiling.
 type Fixture=Awaited<ReturnType<typeof wiredSplitFixture>>;
-async function verified(x:Fixture){const receipt=B.parseReceipt(JSON.parse(x.receiptBytes.toString()));const pins={format:B.TRUST_FORMAT as typeof B.TRUST_FORMAT,packKey:x.signer.public_key,descriptorBytes:x.trust,expectedManifestDigest:receipt.manifest_digest};return {receipt,result:verifySnapshot(await captureSnapshotDirectory(x.output,pins.packKey,pins.expectedManifestDigest),pins,x.revision)};}
+async function verified(x:Fixture) {
+  const receiptBytes=Buffer.from(x.receiptBytes),receipt=B.parseReceipt(JSON.parse(receiptBytes.toString()));
+  const pins={format:B.TRUST_FORMAT as typeof B.TRUST_FORMAT,packKey:x.signer.public_key,descriptorBytes:x.trust,expectedManifestDigest:receipt.manifest_digest};
+  const capture=await captureSnapshotDirectory(x.output,pins.packKey,pins.expectedManifestDigest);
+  return {receipt,receiptBytes,keyBytes:Buffer.from(pins.packKey+"\n"),capture,result:verifySnapshot(capture,pins,x.revision)};
+}
+async function retainVerified(x:Fixture,proof:Awaited<ReturnType<typeof verified>>,destination:string,afterWrite?:(path:string)=>Promise<void>) {
+  expect(proof.result.status).toBe("PASS");expect(proof.result.accepted).toBe(true);
+  const assigned=resolve(import.meta.dirname,"../../../");
+  expect(destination.startsWith(assigned+"/.scratch/")).toBe(true);
+  await mkdir(destination);
+  const sources=new Map(proof.capture.files.map(file=>[Buffer.from(file.name).toString(),Buffer.from(file.bytes)]));
+  sources.set("receipt.json",proof.receiptBytes);sources.set("pack-key.txt",proof.keyBytes);
+  for(const [name,bytes] of sources) {
+    const path=join(destination,name);
+    await writeFile(path,bytes,{flag:"wx"});
+    await afterWrite?.(path);
+  }
+  const hashes:Record<string,string>={};
+  for(const [name,bytes] of sources) {
+    const retainedBytes=await readFile(join(destination,name));
+    // Every retained file equals the bytes used by verification before the success witness is written.
+    expect(retainedBytes,`retained bytes must match verified source: ${name}`).toEqual(bytes);
+    hashes[name]=createHash("sha256").update(retainedBytes).digest("hex"); // Recorded hashes describe the bytes read back from disk.
+  }
+  await writeFile(join(destination,"witness.json"),JSON.stringify({source_revision:x.revision,platform:process.platform,scope:"synthetic same-uid production wiring with native startup and ancestor-mode observations substituted",result:proof.result,observed:x.observed,hashes},null,2),{flag:"wx"});
+}
 let normal:Fixture;
 beforeAll(async()=>{normal=await wiredSplitFixture();},fixtureDeadline);
 afterAll(async()=>{if(normal)await normal.cleanup();},fixtureDeadline);
-it("exports a PASS statement through real boot and the registered command",async()=>{expect(normal.exits).toEqual([0]);const {result}=await verified(normal);expect(result.status).toBe("PASS");expect(result.accepted).toBe(true);
+it("exports a PASS statement through real boot and the registered command",async()=>{
+  expect(normal.exits).toEqual([0]);const proof=await verified(normal);
+  expect(proof.result.status).toBe("PASS");expect(proof.result.accepted).toBe(true);
   const retained=process.env.SANCTUARY_SPLIT_RETAIN_PATH;
-  if(retained){const assigned=resolve(import.meta.dirname,"../../../"),destination=resolve(retained);expect(destination.startsWith(assigned+"/.scratch/")).toBe(true);await mkdir(destination);const manifest=JSON.parse(await readFile(join(normal.output,C.MANIFEST_FILENAME),"utf8")),hashes:Record<string,string>={};for(const name of [C.MANIFEST_FILENAME,...manifest.files.map((row:any)=>row.filename)]){const bytes=await readFile(join(normal.output,name));await writeFile(join(destination,name),bytes,{flag:"wx"});hashes[name]=createHash("sha256").update(bytes).digest("hex");}for(const [name,bytes]of [["receipt.json",normal.receiptBytes],["pack-key.txt",Buffer.from(normal.signer.public_key+"\n")]] as const){await writeFile(join(destination,name),bytes,{flag:"wx"});hashes[name]=createHash("sha256").update(await readFile(join(destination,name))).digest("hex");}await writeFile(join(destination,"witness.json"),JSON.stringify({source_revision:normal.revision,platform:process.platform,scope:"synthetic same-uid production wiring with native startup and ancestor-mode observations substituted",result,observed:normal.observed,hashes},null,2),{flag:"wx"});}
+  if(retained)await retainVerified(normal,proof,resolve(retained));
+});
+it("records verified bytes and disk hashes for every retained file",async()=>{
+  const proof=await verified(normal),destination=join(normal.root,"retained-complete");
+  await retainVerified(normal,proof,destination);
+  const witness=JSON.parse(await readFile(join(destination,"witness.json"),"utf8"));
+  const manifest=JSON.parse(await readFile(join(destination,C.MANIFEST_FILENAME),"utf8"));
+  expect(Object.keys(witness.hashes).sort()).toEqual([C.MANIFEST_FILENAME,...manifest.files.map((row:{filename:string})=>row.filename),"receipt.json","pack-key.txt"].sort());
+  const sources=new Map(proof.capture.files.map(file=>[Buffer.from(file.name).toString(),Buffer.from(file.bytes)]));
+  sources.set("receipt.json",proof.receiptBytes);sources.set("pack-key.txt",proof.keyBytes);
+  for(const [name,bytes] of sources) {
+    const retainedBytes=await readFile(join(destination,name));
+    expect(retainedBytes).toEqual(bytes);
+    expect(witness.hashes[name]).toBe(createHash("sha256").update(retainedBytes).digest("hex"));
+  }
+  expect(witness.result).toEqual(proof.result);
+});
+it.each([C.REPORT_FILENAME,"receipt.json"])("requires retained %s bytes to equal verified bytes",async name=>{
+  const proof=await verified(normal),destination=join(normal.root,"retained-"+name);
+  let scheduled=false;
+  try {
+    await expect(retainVerified(normal,proof,destination,async path=>{
+      if(path===join(destination,name)){await writeFile(path,"different retained bytes");scheduled=true;}
+    })).rejects.toThrow("retained bytes must match verified source: "+name);
+    await expect(readFile(join(destination,"witness.json"))).rejects.toMatchObject({code:"ENOENT"});
+  } finally {expect(scheduled).toBe(true);}
 });
 it("delivers distinct genesis-based chain files and original signature counts",async()=>{const {result}=await verified(normal);expect(result.chains.map(c=>c.historical_signatures)).toEqual(["all_pinned","unsigned_present"]);expect(result.chains[1].unsigned_count).toBe(normal.observed.daemonAfterStop.checkpoints);for(const id of B.CHAIN_IDS){const rows=(await readFile(join(normal.output,B.FIXED_FILES[`audit-${id}`][0]),"utf8")).trim().split("\n").map(line=>JSON.parse(line));expect(rows.find(row=>row.type==="entry").seq).toBe(1);expect(rows.filter(row=>row.type==="entry")).toHaveLength(result.chains.find(c=>c.chain_id===id)!.entries_verified!);}});
 it("observes the boot-created tail close through normal cleanup before capture",async()=>{const {result}=await verified(normal);expect(normal.observed.operatorBeforeCleanup.entries).toBeGreaterThan(normal.observed.operatorBeforeBoot.entries);expect(normal.observed.operatorBeforeCleanup.tail).toBeGreaterThan(0);expect(normal.observed.operatorAfterCapture.tail).toBe(0);expect(result.chains.map(c=>c.tail_entries)).toEqual([0,0]);});

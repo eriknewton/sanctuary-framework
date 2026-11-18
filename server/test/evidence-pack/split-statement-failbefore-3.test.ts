@@ -1,7 +1,9 @@
+// Inventory semantics must match splitFixtureByteInventory in split-statement-inventory.ts.
+import {splitFixtureByteInventory} from "./split-statement-inventory.js";
 import {createFixtureLockRoot,disposeFixtureLockRoot,daemonStopRegistration} from "./split-statement-lock-root.js";
-// Semantic entry witness: imports only modules present at the original base and committed public bytes.
+// Semantic entry witness: production imports exist at the original base; shared inventory uses only Node modules.
 import {describe,expect,it,vi} from "vitest";
-import {readFileSync,constants as inventoryFs} from "node:fs";
+import {readFileSync} from "node:fs";
 import {verifySnapshot} from "../../src/evidence-pack/snapshot-verify.js";
 const corpus=JSON.parse(readFileSync(new URL("./fixtures/split-statement-static-packs.json",import.meta.url),"utf8"));
 const sample=corpus.cases.find((c:any)=>c.name==="complete");
@@ -19,7 +21,7 @@ describe("split production entry witness",()=>{
 
 });
 
-import {mkdir,mkdtemp,readdir,lstat,unlink,rmdir,writeFile,open as openForInventory} from "node:fs/promises";
+import {mkdir,mkdtemp,writeFile} from "node:fs/promises";
 import {join,resolve,dirname} from "node:path";
 import {FilesystemStorage} from "../../src/storage/filesystem.js";
 import {AuditLog,__testSetAuditWriterUidForRole} from "../../src/operational/audit-log.js";
@@ -51,7 +53,6 @@ vi.mock("node:fs",async importOriginal=>{
   }};
 });
 import {Writable} from "node:stream";
-import {createHash} from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {readFile} from "node:fs/promises";
 class SplitCaptureStream extends Writable {chunks:string[]=[];override _write(chunk:unknown,_encoding:BufferEncoding,done:(error?:Error|null)=>void){this.chunks.push(String(chunk));done();}}
@@ -61,11 +62,6 @@ async function splitFixtureExtent(storage:FilesystemStorage,namespace:string){
   for(const row of entries){const value=JSON.parse(Buffer.from((await storage.read(namespace,row.key))!).toString());head=Math.max(head,value.sequence);}
   for(const row of checkpoints){const value=JSON.parse(Buffer.from((await storage.read(namespace+"_checkpoints",row.key))!).toString());covered=Math.max(covered,value.checkpoint_sequence);}
   return {entries:entries.length,checkpoints:checkpoints.length,head,tail:head-covered};
-}
-async function splitFixtureByteInventory(root:string){
-  const directories=[root],files:Record<string,string>={};
-  for(let i=0;i<directories.length;i++)for(const name of await readdir(directories[i])){const path=join(directories[i],name);const handle=await openForInventory(path,inventoryFs.O_RDONLY|inventoryFs.O_NOFOLLOW|inventoryFs.O_NONBLOCK).catch((error:NodeJS.ErrnoException)=>{if(error.code==="ELOOP"||error.code==="ENXIO"||error.code==="EOPNOTSUPP")return null;throw error;});if(!handle)continue;try{const meta=await handle.stat();if(meta.isDirectory())directories.push(path);else if(meta.isFile())files[path.slice(root.length+1)]=createHash("sha256").update(await handle.readFile()).digest("hex");}finally{await handle.close();}} // One no-follow descriptor is both checked and read, so a link or a file swapped in after its check is never hashed; links and sockets are skipped as before.
-  return Object.fromEntries(Object.entries(files).sort(([a],[b])=>a<b?-1:1));
 }
 /** Real custody, migration, writers, scheduled emission, shutdown and registered export; only native startup is replaced. */
 export async function wiredSplitFixture(options:{preSplitWindow?:boolean;liveTail?:boolean;emptyPrefix?:boolean;unavailable?:boolean}={}) {
