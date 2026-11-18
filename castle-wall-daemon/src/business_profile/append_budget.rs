@@ -25,6 +25,7 @@ pub fn finish_admitted(remaining_ms: u64, seal: u64) -> bool {
         .unwrap_or(false)
 }
 /// Producer expiry comes from the independently authenticated S grant.
+// ProducerExpiry requires a concrete grant; this type must stay paired with the absent-grant status check in append_actor.rs::independent.
 #[derive(Clone, Copy, Debug)]
 pub struct ProducerExpiry {
     grant: [u8; 16],
@@ -92,6 +93,7 @@ impl ProducerExpiry {
     /// Composition supplies the authenticated producer grant and its absolute expiry.
     #[cfg_attr(not(any(test, feature = "test-isolation")), allow(dead_code))]
     pub(crate) fn checked(grant: [u8; 16], at_ms: u64, observed_ms: u64) -> Option<Self> {
+        // Freshness is dominated by BudgetSnapshot::append_deadline's original-window clamp; changing that bound reopens this predicate's evidence obligation.
         (at_ms > observed_ms).then_some(Self { grant, at_ms })
     }
 }
@@ -104,6 +106,7 @@ impl HExpiry {
     /// Composition supplies the independently observed H lease's absolute expiry.
     #[cfg_attr(not(any(test, feature = "test-isolation")), allow(dead_code))]
     pub(crate) fn checked(at_ms: u64, observed_ms: u64) -> Option<Self> {
+        // Freshness is dominated by BudgetSnapshot::append_deadline's original-window clamp; changing that bound reopens this predicate's evidence obligation.
         (at_ms > observed_ms).then_some(Self { at_ms })
     }
 }
@@ -120,6 +123,7 @@ impl RecheckInputs {
     /// Refuse expired observations before they can enter admission or completion.
     #[cfg_attr(not(any(test, feature = "test-isolation")), allow(dead_code))]
     pub(crate) fn checked(observed_ms: u64, producer: ProducerExpiry, h: HExpiry) -> Option<Self> {
+        // Freshness is dominated by BudgetSnapshot::append_deadline's original-window clamp; changing that bound reopens this predicate's evidence obligation.
         (observed_ms < producer.at_ms && observed_ms < h.at_ms).then_some(Self {
             observed_ms,
             producer,
@@ -157,7 +161,9 @@ impl BudgetSnapshot {
         let deadline = now_ms
             .checked_add(APPEND_BUDGET_MS)?
             .min(caller_deadline)
+            // This producer clamp must stay paired with ProducerExpiry/RecheckInputs freshness and BudgetSnapshot::recheck's producer end comparison.
             .min(self.producer_expiry.checked_sub(self.seal)?)
+            // This H clamp must stay paired with HExpiry/RecheckInputs freshness and BudgetSnapshot::recheck's H end comparison.
             .min(self.h_expiry.checked_sub(self.seal)?);
         (now_ms < deadline).then_some(deadline)
     }
@@ -173,15 +179,20 @@ impl BudgetSnapshot {
     }
     fn recheck(&self, input: RecheckInputs, remaining_cost: u64, append_deadline: u64) -> bool {
         // Completion consumes the original absolute snapshot, never a fresh lease.
+        // With a shared origin this lower bound is dominated by AppendWindow::recheck's start bound; each must stay paired and changing either reopens the other's evidence obligation.
         input.observed_ms >= self.observed_ms
+            // The consumed producer identity must stay paired with complete-status lease-id equality in append_actor.rs::independent.
             && input.producer.grant == self.grant
             && input.producer.at_ms == self.producer_expiry
             && input.h.at_ms == self.h_expiry
+            // This original-window bound must stay paired with ProducerExpiry, HExpiry and RecheckInputs freshness before completion.
             && input.observed_ms < append_deadline
             && input
                 .observed_ms
+                // Overflow is unreachable for append_actor.rs::independent's u64 nanoseconds divided by NS_PER_MS plus its bounded protocol cost; changing that range reopens this obligation.
                 .checked_add(remaining_cost)
                 .map(|end| {
+                    // Both strict expiry checks are dominated by append_deadline's respective seal-reserve clamps; changing either clamp reopens its paired predicate's evidence obligation.
                     end <= append_deadline && end < self.producer_expiry && end < self.h_expiry
                 })
                 .unwrap_or(false)
@@ -199,6 +210,7 @@ impl AppendWindow {
         self.deadline_ms
     }
     pub fn recheck(&self, input: RecheckInputs, remaining_cost: u64) -> bool {
+        // With a shared origin this start bound is dominated by BudgetSnapshot::recheck's observation bound; each must stay paired and changing either reopens the other's evidence obligation.
         input.observed_ms >= self.started_ms
             && self
                 .snapshot
@@ -228,6 +240,14 @@ impl CutObligation {
             },
             _ => false,
         }
+    }
+    /// Discharge only the exact count bound to a durably committed control for the owning grant.
+    pub fn discharge(&mut self, grant: [u8; 16], count: u64) -> bool {
+        if self.owned != Some((grant, count)) {
+            return false;
+        }
+        self.owned = None;
+        true
     }
     pub fn pending(&self) -> Option<([u8; 16], u64)> {
         self.owned

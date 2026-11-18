@@ -129,23 +129,71 @@ pub enum Reconciliation {
     NotReconciled,
     Reconciled(Box<StatusReply>),
 }
-// Only the closed production reconciler and the gated script can supply reconciliation evidence.
+// Only the ordinary evidence verifier and feature-gated fixtures implement this port.
 mod sealed {
     pub trait Sealed {}
+    impl Sealed for super::DrainReconciler {}
+    #[cfg(feature = "test-isolation")]
     impl Sealed for super::ClosedReconciler {}
     #[cfg(feature = "test-isolation")]
     impl Sealed for super::test_support::TestReconciler {}
 }
 pub trait Reconciler: sealed::Sealed {
     fn reconcile(&mut self, evidence: ReconcileEvidence<'_>) -> Reconciliation;
+    /// Check the admitted wall report against independently obtained signer authority.
+    fn checkpoint(
+        &self,
+        report: &super::append_checkpoint::Candidate,
+        evidence: ReconcileEvidence<'_>,
+    ) -> super::append_checkpoint::Result<()>;
 }
+/// Verifies W's report of D, authenticated by WallMainBinding, against independent S
+/// authority. The report is never P's own D observation. Only the single checkpoint
+/// adjudication may consume this evidence; heartbeat observations cannot stage a grant.
+pub struct DrainReconciler {
+    provider: super::append_checkpoint::OrdinaryCheckpointProvider,
+}
+impl DrainReconciler {
+    /// Composition roots must supply the ordinary evidence verifier in every build.
+    pub fn production(provider: super::append_checkpoint::OrdinaryCheckpointProvider) -> Self {
+        Self { provider }
+    }
+}
+impl Reconciler for DrainReconciler {
+    fn reconcile(&mut self, _evidence: ReconcileEvidence<'_>) -> Reconciliation {
+        // A signer STATUS alone has no wall checkpoint and cannot establish reconciliation.
+        Reconciliation::NotReconciled
+    }
+    fn checkpoint(
+        &self,
+        report: &super::append_checkpoint::Candidate,
+        evidence: ReconcileEvidence<'_>,
+    ) -> super::append_checkpoint::Result<()> {
+        self.provider.verify(
+            report,
+            evidence.observation,
+            evidence.fortress_id,
+            evidence.enrollment_revision,
+        )
+    }
+}
+#[cfg(feature = "test-isolation")]
 pub struct ClosedReconciler;
+#[cfg(feature = "test-isolation")]
 impl ClosedReconciler {
     pub fn production() -> Self {
         Self
     }
 }
+#[cfg(feature = "test-isolation")]
 impl Reconciler for ClosedReconciler {
+    fn checkpoint(
+        &self,
+        _: &super::append_checkpoint::Candidate,
+        _: ReconcileEvidence<'_>,
+    ) -> super::append_checkpoint::Result<()> {
+        Err(super::append_checkpoint::Refusal::Observation)
+    }
     fn reconcile(&mut self, _evidence: ReconcileEvidence<'_>) -> Reconciliation {
         // reconciliation with the drain and the wall's log is the only edge to a grant; until that evidence exists the writer serves status but never a signature.
         Reconciliation::NotReconciled
@@ -225,6 +273,7 @@ pub fn writer_next_request_bound_ns(t0: u64) -> Option<u64> {
 // Round that work term up to whole milliseconds; the measurement is pinned by adjudication_work_measurement.
 // The additional watchdog tick charges the existing relative sleep.
 const CHECKPOINT_ADJUDICATION_WORK_MS: u64 = 1;
+// Must match append_checkpoint::CHECKPOINT_ACK_MS: W allows this work and one serve poll after issue.
 pub const CHECKPOINT_ADJUDICATION_BUDGET_MS: u64 =
     CHECKPOINT_ADJUDICATION_WORK_MS + WATCHDOG_TICK_MS as u64;
 const _: () = assert!(CHECKPOINT_ADJUDICATION_BUDGET_MS < WRITER_HEARTBEAT_MS);
@@ -269,6 +318,7 @@ struct Checkpoint {
     transfer: Option<super::append_checkpoint::Transfer>,
     stage: Option<CheckpointStage>,
     replay: Option<CheckpointReplay>,
+    heartbeat_hold: u64,
 }
 
 /// The production transition to WallBound is private to the authenticated run loop.
@@ -290,6 +340,8 @@ pub struct WriterMachine<P: SignerPort, R: Reconciler> {
     awaiting_reread: Option<u64>,
     checkpoint_candidate: Option<CheckpointCandidate>,
     checkpoint: Checkpoint,
+    #[cfg(feature = "test-isolation")]
+    test_entry: Option<TestEntryDependencies>,
 }
 impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
     fn new(
@@ -319,6 +371,8 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
             awaiting_reread: None,
             checkpoint_candidate: None,
             checkpoint: Checkpoint::default(),
+            #[cfg(feature = "test-isolation")]
+            test_entry: None,
         }
     }
     pub fn state(&self) -> WriterState {
@@ -625,7 +679,34 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
         self.checkpoint.transfer = None;
         self.checkpoint.stage = None;
     }
-    fn checkpoint_stage(&mut self) -> Result<()> {
+    fn checkpoint_heartbeat(&mut self) -> Result<()> {
+        let began = self.now()?;
+        let result = self.heartbeat();
+        let ended = self.now()?;
+        let held = ended.checked_sub(began).ok_or(Error::Deadline)?;
+        // Only time spent in this synchronous S exchange is exempt from part silence.
+        // Challenge issue, observation age, S idle and grant expiry retain their original clocks.
+        self.checkpoint.heartbeat_hold = self
+            .checkpoint
+            .heartbeat_hold
+            .checked_add(held)
+            .ok_or(Error::Deadline)?;
+        if let Some(end) = self
+            .checkpoint
+            .challenge
+            .as_mut()
+            .and_then(|c| c.part_deadline.as_mut())
+        {
+            *end = end.checked_add(held).ok_or(Error::Deadline)?;
+        }
+        if let Some(replay) = self.checkpoint.replay.as_mut() {
+            if replay.next > 0 {
+                replay.last = replay.last.checked_add(held).ok_or(Error::Deadline)?;
+            }
+        }
+        result
+    }
+    fn checkpoint_stage(&mut self, after_heartbeat: bool) -> Result<()> {
         use super::append_checkpoint as cp;
         let now = self.now()?;
         if self.checkpoint.challenge.as_ref().is_some_and(|c| {
@@ -636,7 +717,7 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
             return Ok(());
         }
         // A bounded stage starts only with a complete watchdog tick before STATUS is due.
-        if self.heartbeat_due_within(WATCHDOG_TICK_MS as u64)? {
+        if !after_heartbeat && self.heartbeat_due_within(WATCHDOG_TICK_MS as u64)? {
             return Ok(());
         }
         let Some(stage) = self.checkpoint.stage.take() else {
@@ -655,7 +736,14 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
                     let mut challenge =
                         self.checkpoint.challenge.take().ok_or(cp::Refusal::Echo)?;
                     report.echo(&challenge.session, &challenge.request, &challenge.nonce)?;
-                    report.consistent(&challenge.status, &self.fortress, self.revision)?;
+                    self.reconciler.checkpoint(
+                        &report,
+                        ReconcileEvidence {
+                            observation: &challenge.status,
+                            fortress_id: &self.fortress,
+                            enrollment_revision: self.revision,
+                        },
+                    )?;
                     if self.state != WriterState::WallBound {
                         return Err(cp::Refusal::Observation);
                     }
@@ -739,9 +827,19 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
         op: &Operation,
         payload: &[u8],
         packet: &[u8],
+        received_at: u64,
+        hold_at_receipt: u64,
     ) -> Result<Option<(Operation, Vec<u8>)>> {
         use super::append_checkpoint as cp;
         let now = self.now()?;
+        let silence_origin = received_at
+            .checked_add(
+                self.checkpoint
+                    .heartbeat_hold
+                    .checked_sub(hold_at_receipt)
+                    .ok_or(Error::Deadline)?,
+            )
+            .ok_or(Error::Deadline)?;
         if let Operation::CheckpointPart(part) = op {
             // Replay is matched before challenge ownership and cannot consume a newer challenge.
             if let Some(replay) = &mut self.checkpoint.replay {
@@ -761,7 +859,7 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
                         return Ok(None);
                     }
                     replay.next += 1;
-                    replay.last = now;
+                    replay.last = silence_origin;
                     if replay.next == replay.hashes.len() {
                         replay.next = 0;
                         return Ok(Some((
@@ -825,10 +923,11 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
                         return Err(cp::Refusal::Echo);
                     }
                     if self.checkpoint.transfer.is_none() {
-                        self.checkpoint.transfer = Some(cp::Transfer::begin(part, now)?);
+                        self.checkpoint.transfer = Some(cp::Transfer::begin(part, received_at)?);
                     }
                     c.part_deadline = Some(
-                        now.checked_add(cp::CHECKPOINT_PART_SILENCE_MS * NS_PER_MS)
+                        silence_origin
+                            .checked_add(cp::CHECKPOINT_PART_SILENCE_MS * NS_PER_MS)
                             .ok_or(cp::Refusal::Expired)?,
                     );
                     if self
@@ -836,7 +935,7 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
                         .transfer
                         .as_mut()
                         .ok_or(cp::Refusal::Order)?
-                        .push(part, payload, packet, now)?
+                        .push(part, payload, packet, received_at)?
                     {
                         let transfer = self.checkpoint.transfer.take().ok_or(cp::Refusal::Order)?;
                         self.checkpoint.stage = Some(CheckpointStage::Digest(
@@ -1040,6 +1139,8 @@ pub struct Dependencies<P: SignerPort, R: Reconciler, N: Notifier> {
     pub clock: Clock,
     pub paths: ClosurePaths,
     pub environment: Vec<OsString>,
+    #[cfg(feature = "test-isolation")]
+    pub test_entry: Option<TestEntryDependencies>,
 }
 /// Owns the sole record lifetime and settles S on every refusal after readiness.
 pub fn run<P: SignerPort, R: Reconciler, N: Notifier>(
@@ -1098,6 +1199,10 @@ pub fn run<P: SignerPort, R: Reconciler, N: Notifier>(
         deps.config.value.enrollment_revision,
         bootstrapped_at,
     );
+    #[cfg(feature = "test-isolation")]
+    {
+        machine.test_entry = deps.test_entry.take();
+    }
     let ready = match machine.start() {
         Ok(text) => text,
         Err(e) => {
@@ -1165,12 +1270,17 @@ fn send(fd: i32, session: &str, op: &Operation, body: &[u8]) -> Result<()> {
     )?;
     Ok(())
 }
+struct ReceivedCheckpoint {
+    packet: signer_peer::Packet,
+    received_at: u64,
+    hold_at_receipt: u64,
+}
 struct Wall {
     fd: OwnedFd,
     binding: WallMainBinding,
     handshake: Handshake,
     session: String,
-    deferred_checkpoint: Option<signer_peer::Packet>,
+    deferred_checkpoint: Option<ReceivedCheckpoint>,
 }
 #[allow(clippy::too_many_arguments)]
 fn serve<P: SignerPort, R: Reconciler>(
@@ -1247,8 +1357,9 @@ fn serve<P: SignerPort, R: Reconciler>(
                     deferred_checkpoint: None,
                 });
             }
-            if machine.awaiting_reread.is_some() || machine.heartbeat_due()? {
-                machine.heartbeat()?;
+            let after_heartbeat = machine.awaiting_reread.is_some() || machine.heartbeat_due()?;
+            if after_heartbeat {
+                machine.checkpoint_heartbeat()?;
                 if machine
                     .checkpoint
                     .replay
@@ -1284,11 +1395,12 @@ fn serve<P: SignerPort, R: Reconciler>(
                 }
             }
             if let Some(w) = &mut wall {
-                machine.checkpoint_stage()?;
+                machine.checkpoint_stage(after_heartbeat)?;
                 if machine.awaiting_reread.is_none()
                     && (w.deferred_checkpoint.is_some() || readable(w.fd.as_raw_fd()))
                 {
                     if w.deferred_checkpoint.is_some()
+                        && !after_heartbeat
                         && machine.heartbeat_due_within(WATCHDOG_TICK_MS as u64)?
                     {
                         std::thread::sleep(std::time::Duration::from_millis(
@@ -1296,12 +1408,22 @@ fn serve<P: SignerPort, R: Reconciler>(
                         ));
                         continue;
                     }
-                    let packet = match w.deferred_checkpoint.take() {
-                        Some(packet) => packet,
-                        None => writer_protocol::receive(w.fd.as_raw_fd(), Direction::ToWriter)?,
+                    let resumed = w.deferred_checkpoint.is_some();
+                    let received = match w.deferred_checkpoint.take() {
+                        Some(received) => received,
+                        None => {
+                            let packet =
+                                writer_protocol::receive(w.fd.as_raw_fd(), Direction::ToWriter)?;
+                            ReceivedCheckpoint {
+                                packet,
+                                received_at: clock()?,
+                                hold_at_receipt: machine.checkpoint.heartbeat_hold,
+                            }
+                        }
                     };
+                    let packet = &received.packet;
                     let frame = w.handshake.receive(&packet.bytes)?;
-                    w.binding.packet(&packet)?;
+                    w.binding.packet(packet)?;
                     let now = clock()?;
                     if let Operation::Sign(h) = &frame.operation {
                         let admission = canonical_deadline(&h.deadline_boottime_ns)
@@ -1331,9 +1453,13 @@ fn serve<P: SignerPort, R: Reconciler>(
                     // Anchoring to both clocks retains at least WRITER_SIGN_DEADLINE_MAX_MS - WRITER_HEARTBEAT_MS
                     // of bus budget; the next heartbeat leaves inside SIGNER_IDLE_DEADLINE_MS of the last exchange.
                     // The caller deadline never selects this local identity window.
-                    let end = machine.wall_deadline(now)?;
-                    w.binding
-                        .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
+                    if !resumed {
+                        let end = machine.wall_deadline(now)?;
+                        w.binding
+                            .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
+                    }
+                    // A held packet already passed bus admission. Its immutable first receipt
+                    // survives the heartbeat; loop liveness and credential checks still apply.
                     let checkpoint_op = matches!(
                         frame.operation,
                         Operation::CheckpointQuery { .. } | Operation::CheckpointPart(_)
@@ -1345,13 +1471,17 @@ fn serve<P: SignerPort, R: Reconciler>(
                             CheckpointMode::Accept => {
                                 // Authenticated W checkpoint bytes carry no authority until adjudication.
                                 // Keep the whole packet and partial transfer while a due S heartbeat takes priority.
-                                if machine.heartbeat_due_within(WATCHDOG_TICK_MS as u64)? {
-                                    w.deferred_checkpoint = Some(packet);
+                                if !after_heartbeat
+                                    && machine.heartbeat_due_within(WATCHDOG_TICK_MS as u64)?
+                                {
+                                    w.deferred_checkpoint = Some(received);
                                 } else if let Some((op, payload)) = machine.checkpoint_packet(
                                     &w.session,
                                     &frame.operation,
                                     frame.payload,
                                     &packet.bytes,
+                                    received.received_at,
+                                    received.hold_at_receipt,
                                 )? {
                                     send(w.fd.as_raw_fd(), &w.session, &op, &payload)?;
                                 }
@@ -1374,6 +1504,23 @@ fn serve<P: SignerPort, R: Reconciler>(
                             &machine.status_payload().encode()?,
                         )?,
                         Operation::Sign(header) => {
+                            #[cfg(feature = "test-isolation")]
+                            if let Some(fixture) = &machine.test_entry {
+                                if fixture.verified_reply.is_none() {
+                                    use std::io::Write;
+                                    // P admission is counted independently of the downstream S request.
+                                    let mut file = OpenOptions::new()
+                                        .append(true)
+                                        .create(true)
+                                        .mode(custody::PRIVATE_MODE)
+                                        .custom_flags(libc::O_NOFOLLOW)
+                                        .open(&fixture.observed)?;
+                                    if file.metadata()?.len() >= TEST_SIGN_ADMISSIONS_MAX {
+                                        return Err(Error::State);
+                                    }
+                                    file.write_all(b"s")?;
+                                }
+                            }
                             let request_id = header.request_id.clone();
                             let result = machine.sign(header, frame.payload, |end| {
                                 w.binding
@@ -1382,6 +1529,42 @@ fn serve<P: SignerPort, R: Reconciler>(
                             });
                             match result {
                                 Ok(body) => {
+                                    // Isolated reply substitution runs only after P's own complete SIGN verification passed.
+                                    #[cfg(feature = "test-isolation")]
+                                    let body = if let Some(fixture) = machine
+                                        .test_entry
+                                        .as_ref()
+                                        .filter(|f| f.verified_reply.is_some())
+                                    {
+                                        use std::io::Write;
+                                        // An isolated observation creates its own private file and never follows an existing path.
+                                        OpenOptions::new()
+                                            .write(true)
+                                            .create_new(true)
+                                            .mode(custody::PRIVATE_MODE)
+                                            .custom_flags(libc::O_NOFOLLOW)
+                                            .open(&fixture.observed)?
+                                            .write_all(b"verified")?;
+                                        fixture.verified_reply.clone().ok_or(Error::State)?
+                                    } else {
+                                        body
+                                    };
+                                    #[cfg(feature = "test-isolation")]
+                                    if machine.test_entry.as_ref().is_some_and(|f| f.oversized) {
+                                        // This private malformed packet exercises W's real receive boundary, not a valid oversized envelope.
+                                        let header = serde_json::json!({"v":1,"protocol":writer_protocol::WRITER_PROTOCOL,"session_id":w.session,"op":"VERIFIED","request_id":request_id,"envelope_length":body.len()});
+                                        let header = crate::smb::jcs::encode(&header)
+                                            .map_err(|_| Error::State)?;
+                                        let bytes = [
+                                            &(header.len() as u32).to_be_bytes()[..],
+                                            header.as_bytes(),
+                                            &body,
+                                        ]
+                                        .concat();
+                                        signer_peer::send(w.fd.as_raw_fd(), &bytes, &[])?;
+                                        machine.sent_verified();
+                                        continue;
+                                    }
                                     send(
                                         w.fd.as_raw_fd(),
                                         &w.session,
@@ -1438,18 +1621,43 @@ pub mod test_support {
             CheckpointMode::Accept,
         )
     }
+    /// Supply only the bounded dependencies parsed by the isolated test-entry loader.
+    pub fn test_entry_dependencies<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+        dependencies: TestEntryDependencies,
+    ) {
+        machine.test_entry = Some(dependencies);
+    }
     pub fn checkpoint_packet<P: SignerPort, R: Reconciler>(
         machine: &mut WriterMachine<P, R>,
         session: &str,
         packet: &[u8],
     ) -> Result<Option<(Operation, Vec<u8>)>> {
         let frame = writer_protocol::decode(packet, Direction::ToWriter, session)?;
-        machine.checkpoint_packet(session, &frame.operation, frame.payload, packet)
+        machine.checkpoint_packet(
+            session,
+            &frame.operation,
+            frame.payload,
+            packet,
+            machine.now()?,
+            machine.checkpoint.heartbeat_hold,
+        )
     }
     pub fn scripted_signer<R: Reconciler>(
         machine: &mut WriterMachine<ScriptedSigner, R>,
     ) -> &mut ScriptedSigner {
         &mut machine.signer
+    }
+    /// Exercise measured heartbeat accounting with the production clock and signer port.
+    pub fn checkpoint_heartbeat<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+    ) -> Result<()> {
+        machine.checkpoint_heartbeat()
+    }
+    pub fn checkpoint_step_after_heartbeat<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+    ) -> Result<()> {
+        machine.checkpoint_stage(true)
     }
     pub fn checkpoint_identity<P: SignerPort, R: Reconciler>(
         machine: &mut WriterMachine<P, R>,
@@ -1462,7 +1670,7 @@ pub mod test_support {
     pub fn checkpoint_step<P: SignerPort, R: Reconciler>(
         machine: &mut WriterMachine<P, R>,
     ) -> Result<()> {
-        machine.checkpoint_stage()
+        machine.checkpoint_stage(false)
     }
     pub fn awaiting<P: SignerPort, R: Reconciler>(machine: &WriterMachine<P, R>) -> Option<u64> {
         machine.awaiting_reread
@@ -1556,6 +1764,17 @@ pub mod test_support {
         pub reconcile: Box<dyn FnMut(ReconcileEvidence<'_>) -> Reconciliation + Send>,
     }
     impl Reconciler for TestReconciler {
+        fn checkpoint(
+            &self,
+            report: &super::super::append_checkpoint::Candidate,
+            evidence: ReconcileEvidence<'_>,
+        ) -> super::super::append_checkpoint::Result<()> {
+            report.consistent(
+                evidence.observation,
+                evidence.fortress_id,
+                evidence.enrollment_revision,
+            )
+        }
         fn reconcile(&mut self, e: ReconcileEvidence<'_>) -> Reconciliation {
             (self.reconcile)(e)
         }
@@ -1588,6 +1807,40 @@ impl Activation {
 
 #[cfg(feature = "test-isolation")]
 pub const WRITER_TEST_SEAM_MARKER: &str = "SANCTUARY_WRITER_TEST_ISOLATION_V1";
+// Bound the one-byte admission log independently of all service storage pools.
+#[cfg(feature = "test-isolation")]
+const TEST_SIGN_ADMISSIONS_MAX: u64 = 512;
+/// Sealed optional reply fixture belongs only to test-entry dependencies and is absent from release builds.
+#[cfg(feature = "test-isolation")]
+pub struct TestEntryDependencies {
+    verified_reply: Option<Vec<u8>>,
+    oversized: bool,
+    observed: PathBuf,
+}
+/// Load an owned, bounded exact reply for an isolated entry; ordinary constructors have no substitution default.
+#[cfg(feature = "test-isolation")]
+pub fn load_test_entry_dependencies(path: &Path) -> io::Result<TestEntryDependencies> {
+    let bytes = custody::read_pinned(
+        path,
+        unsafe { libc::geteuid() },
+        writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
+        custody::PRIVATE_MODE,
+    )?;
+    let oversized = bytes == b"oversized-verified";
+    let verified_reply = if oversized {
+        Some(vec![0; writer_protocol::WRITER_ENVELOPE_MAX_BYTES + 1])
+    } else if bytes == b"sign-admissions" {
+        None
+    } else {
+        writer_protocol::decode_envelope(&bytes).map_err(|_| custody::refused())?;
+        Some(bytes)
+    };
+    Ok(TestEntryDependencies {
+        verified_reply,
+        oversized,
+        observed: path.with_extension("observed"),
+    })
+}
 #[cfg(feature = "test-isolation")]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1603,6 +1856,7 @@ struct TestSeam {
     artifact_owner: u32,
     library_owner: u32,
     signer_socket: PathBuf,
+    verified_reply: Option<PathBuf>,
 }
 #[cfg(feature = "test-isolation")]
 pub fn test_entry(path: &Path) -> io::Result<()> {
@@ -1621,10 +1875,17 @@ pub fn test_entry(path: &Path) -> io::Result<()> {
             return Err(custody::refused());
         }
         Ok(Dependencies {
+            test_entry: seam
+                .verified_reply
+                .as_deref()
+                .map(load_test_entry_dependencies)
+                .transpose()?,
             bootstrap: Box::new(move || {
                 Ok(ClientSignerPort::bootstrap_at(&seam.signer_socket, policy)?)
             }),
-            reconciler: ClosedReconciler::production(),
+            reconciler: DrainReconciler::production(
+                super::append_checkpoint::OrdinaryCheckpointProvider::production(),
+            ),
             notifier: SystemNotifier,
             config,
             bus: seam.bus,

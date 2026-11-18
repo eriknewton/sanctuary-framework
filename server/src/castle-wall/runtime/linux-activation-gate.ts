@@ -850,7 +850,7 @@ export async function activateLinuxProducerSignedCastleWall(
       // settled event is not needlessly re-pulled and an unsettled one is never
       // skipped. Even if this hint were stale, the consumer's chain validator is
       // the real guard (duplicate-drop / refuse-skip-ahead).
-      { ...drainOptions, initialCursor, initialPendingAckSeq }
+      { ...drainOptions, initialCursor, initialPendingAckSeq, mode: {kind:"Legacy"} }
     );
   }
 

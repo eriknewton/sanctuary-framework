@@ -1,4 +1,4 @@
-// fail-before-exempt: checkpoint timeout and repeated ownership assertions use native authenticated sockets and shared fixtures.
+// fail-before-exempt: checkpoint issue, acknowledgement and cancellation assertions use native authenticated sockets and shared fixtures.
 // fail-before-exempt: authenticated client and WAL fact fixtures use isolated native sockets, process pins and shared data.
 // W-CLIENT-CONTRACT
 // W-CHECKPOINT
@@ -25,6 +25,10 @@ use std::{
 const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SESSION: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const NS: u64 = 1_000_000;
+// W permits the challenge lifetime, bounded adjudication, and one final serve poll.
+const ACK_BOUND_MS: u64 = cp::CHECKPOINT_CHALLENGE_MS
+    + castle_wall_daemon::business_profile::writer_service::CHECKPOINT_ADJUDICATION_BUDGET_MS
+    + castle_wall_daemon::business_profile::signer_watchdog::WATCHDOG_TICK_MS as u64;
 struct Hooks(Arc<AtomicUsize>);
 impl ClientHooks for Hooks {
     fn before_send(&mut self) -> Result<()> {
@@ -687,6 +691,14 @@ fn checkpoint_deadlines_refuse_only_the_checkpoint_and_keep_the_session() {
         }
         f.now
             .store((cp::CHECKPOINT_CHALLENGE_MS + 1) * NS, Ordering::SeqCst);
+        if phase == "query" {
+            assert!(
+                matches!(c.poll(), Err(Refusal::Deadline)),
+                "unknown issue time requires reconnect"
+            );
+            assert_eq!(f.closes.load(Ordering::SeqCst), 1);
+            continue;
+        }
         if phase == "clock-error" {
             f.clock_fails.store(true, Ordering::SeqCst);
             assert_eq!(
@@ -737,4 +749,341 @@ fn checkpoint_deadlines_refuse_only_the_checkpoint_and_keep_the_session() {
         "ordinary deadline stays terminal"
     );
     assert_eq!(f.closes.load(Ordering::SeqCst), 1);
+}
+
+// Each fixture uses actual authenticated seqpacket framing with an independently advanced W clock.
+fn checkpoint_challenge_packet(issued: u64) -> Vec<u8> {
+    let report = append_contract::contract().unwrap()["checkpoint_vectors"][0]["value"].clone();
+    let pin = &report["wal_checkpoint"]["join_state"]["pin"];
+    let status = serde_json::from_value::<
+        castle_wall_daemon::business_profile::signer_client::StatusReply,
+    >(json!({
+        "op":"STATUS", "state":"LOCKED", "grant": {
+            "role":pin["role"], "epoch":1, "kid":pin["kid"], "public_key":pin["public_key"],
+            "identity_id":ID, "machine_id":ID, "activation_id":ID, "lease_id":ID, "generation":1
+        }, "started_boottime_ns":"0", "expires_boottime_ns":"0", "boot_id":ID,
+        "anchor_revision":null, "anchor_digest":null
+    }))
+    .unwrap();
+    p::encode(
+        p::Direction::ToWall,
+        SESSION,
+        &p::Operation::CheckpointChallenge {
+            request_id: ID.into(),
+            nonce: ID.into(),
+            issued_boottime_ns: issued,
+        },
+        &cp::status_bytes(&status).unwrap(),
+    )
+    .unwrap()
+}
+fn checkpoint_to_report(f: &Fixture, limit: u64) -> (WriterClient, OwnedFd, Vec<u8>, String) {
+    let (mut client, peer) = f.writer();
+    client.checkpoint_query(ID, limit).unwrap();
+    receive(&peer);
+    send(&peer, &checkpoint_challenge_packet(NS));
+    assert!(matches!(client.poll(), Ok(Some(WriterReply::Challenge(_)))));
+    let mut report = append_contract::contract().unwrap()["checkpoint_vectors"][0]["value"].clone();
+    report["session_id"] = json!(SESSION);
+    report["request_id"] = json!(ID);
+    report["nonce"] = json!(ID);
+    let raw = castle_wall_daemon::smb::jcs::encode(&report)
+        .unwrap()
+        .into_bytes();
+    let digest = cp::digest(&raw);
+    (client, peer, raw, digest)
+}
+fn checkpoint_to_ack(f: &Fixture, limit: u64) -> (WriterClient, OwnedFd, String) {
+    let (mut client, peer, raw, digest) = checkpoint_to_report(f, limit);
+    client.checkpoint_report(raw).unwrap();
+    assert!(client.poll().unwrap().is_none());
+    receive(&peer);
+    (client, peer, digest)
+}
+fn checkpoint_ack_packet(digest: &str) -> Vec<u8> {
+    p::encode(
+        p::Direction::ToWall,
+        SESSION,
+        &p::Operation::CheckpointAck {
+            request_id: ID.into(),
+            checkpoint_digest: digest.into(),
+        },
+        &[],
+    )
+    .unwrap()
+}
+#[test]
+fn checkpoint_issue_is_bounded_by_the_query_send_and_receive() {
+    for issued in [NS - 1, NS, NS + 1] {
+        let f = Fixture::new();
+        let (mut client, peer) = f.writer();
+        client.checkpoint_query(ID, u64::MAX).unwrap();
+        receive(&peer);
+        send(&peer, &checkpoint_challenge_packet(issued));
+        if issued == NS {
+            assert!(matches!(client.poll(), Ok(Some(WriterReply::Challenge(_)))));
+        } else {
+            assert!(
+                matches!(client.poll(), Err(Refusal::Deadline)),
+                "issue time must be inside W send/receive interval"
+            );
+            assert_eq!(f.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+#[test]
+fn checkpoint_query_uses_the_anchored_request_bound() {
+    let f = Fixture::new();
+    let (mut client, peer) = f.writer();
+    client.checkpoint_query(ID, u64::MAX).unwrap();
+    receive(&peer);
+    f.now.store(
+        castle_wall_daemon::business_profile::writer_service::writer_next_request_bound_ns(NS)
+            .unwrap(),
+        Ordering::SeqCst,
+    );
+    assert!(
+        matches!(client.poll(), Err(Refusal::Deadline)),
+        "unknown issue expires at P next-request bound"
+    );
+    assert_eq!(f.closes.load(Ordering::SeqCst), 1);
+}
+#[test]
+fn checkpoint_ack_after_an_in_window_grant_keeps_the_session() {
+    use castle_wall_daemon::business_profile::writer_service::test_support as support;
+    let f = Fixture::new();
+    let (signer, mut machine, mut report) = super::checkpoint::fixture();
+    let issued = signer.now.load(Ordering::SeqCst);
+    f.now.store(issued, Ordering::SeqCst);
+    let (mut client, peer) = f.writer();
+    client.checkpoint_query(ID, u64::MAX).unwrap();
+    let query = receive(&peer);
+    let (op, payload) = support::checkpoint_packet(&mut machine, SESSION, &query)
+        .unwrap()
+        .unwrap();
+    send(
+        &peer,
+        &p::encode(p::Direction::ToWall, SESSION, &op, &payload).unwrap(),
+    );
+    let Some(WriterReply::Challenge(challenge)) = client.poll().unwrap() else {
+        panic!("real P challenge")
+    };
+    let grant = issued + (cp::CHECKPOINT_CHALLENGE_MS - 1) * NS;
+    signer.now.store(grant, Ordering::SeqCst);
+    f.now.store(grant, Ordering::SeqCst);
+    machine.heartbeat().unwrap();
+    report["session_id"] = json!(challenge.session);
+    report["request_id"] = json!(challenge.request);
+    report["nonce"] = json!(challenge.nonce);
+    report["status_digest"] = json!(cp::digest(&payload));
+    report["observed_boottime_ns"] = json!(grant.to_string());
+    client
+        .checkpoint_report(
+            castle_wall_daemon::smb::jcs::encode(&report)
+                .unwrap()
+                .into_bytes(),
+        )
+        .unwrap();
+    assert!(client.poll().unwrap().is_none());
+    let part = receive(&peer);
+    assert!(support::checkpoint_packet(&mut machine, SESSION, &part)
+        .unwrap()
+        .is_none());
+    for _ in 0..3 {
+        support::checkpoint_step(&mut machine).unwrap();
+    }
+    let ack = support::checkpoint_reread(&mut machine)
+        .unwrap()
+        .expect("real P grants at issue plus 2999 ms");
+    assert_eq!(
+        signer.binds.load(Ordering::SeqCst),
+        1,
+        "real P grants exactly once"
+    );
+    f.now.store(
+        grant + castle_wall_daemon::business_profile::signer_watchdog::WATCHDOG_TICK_MS as u64 * NS,
+        Ordering::SeqCst,
+    );
+    send(
+        &peer,
+        &p::encode(p::Direction::ToWall, SESSION, &ack, &[]).unwrap(),
+    );
+    assert!(
+        matches!(
+            client.poll(),
+            Ok(Some(WriterReply::CheckpointAcknowledged(_)))
+        ),
+        "legal final-window ACK retains the authenticated session"
+    );
+    assert_eq!(f.closes.load(Ordering::SeqCst), 0);
+    client.status(ID, u64::MAX).unwrap();
+    receive(&peer);
+}
+#[test]
+fn checkpoint_expiry_distinguishes_empty_and_late_ack() {
+    for late in [false, true] {
+        let f = Fixture::new();
+        let (mut client, peer, digest) = checkpoint_to_ack(&f, u64::MAX);
+        f.now.store(NS + ACK_BOUND_MS * NS, Ordering::SeqCst);
+        if late {
+            send(&peer, &checkpoint_ack_packet(&digest));
+        }
+        if late {
+            assert!(
+                matches!(client.poll(), Err(Refusal::Deadline)),
+                "late authenticated ACK is terminal in the expiry poll"
+            );
+            assert_eq!(f.closes.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(matches!(client.poll(), Ok(Some(WriterReply::Refused))));
+            assert_eq!(f.closes.load(Ordering::SeqCst), 0);
+            client.status(ID, u64::MAX).unwrap();
+            receive(&peer);
+        }
+    }
+}
+#[test]
+fn checkpoint_early_cancellation_closes_and_busy_keeps_the_owned_lifetime() {
+    for report_call in [false, true] {
+        let f = Fixture::new();
+        // One poll is a caller deadline much shorter than P's three-second challenge.
+        let limit = NS
+            + castle_wall_daemon::business_profile::signer_watchdog::WATCHDOG_TICK_MS as u64 * NS;
+        let (mut client, peer, raw, _) = checkpoint_to_report(&f, limit);
+        if !report_call {
+            client.checkpoint_report(raw.clone()).unwrap();
+            assert!(client.poll().unwrap().is_none());
+            receive(&peer);
+        }
+        f.now.store(limit, Ordering::SeqCst);
+        if report_call {
+            assert_eq!(client.checkpoint_report(raw), Err(Refusal::Deadline));
+        } else {
+            assert!(
+                matches!(client.poll(), Err(Refusal::Deadline)),
+                "early cancellation cannot reuse an unfinished P challenge"
+            );
+        }
+        // Inspect closure while the owner is alive; its destructor must not supply this evidence.
+        assert_eq!(
+            f.closes.load(Ordering::SeqCst),
+            1,
+            "early report or ACK cancellation closes the unfinished P challenge"
+        );
+    }
+    let f = Fixture::new();
+    let (mut client, _peer, _) = checkpoint_to_ack(&f, u64::MAX);
+    assert_eq!(
+        client.checkpoint_query(SESSION, u64::MAX),
+        Err(Refusal::Busy)
+    );
+    f.now.store(NS + ACK_BOUND_MS * NS, Ordering::SeqCst);
+    assert!(
+        matches!(client.poll(), Ok(Some(WriterReply::Refused))),
+        "busy query preserves the old checkpoint lifetime"
+    );
+    assert_eq!(f.closes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn checkpoint_unrequested_reply_cannot_cross_report_ownership() {
+    for parts in [false, true] {
+        let f = Fixture::new();
+        let (mut client, peer, raw, digest) = checkpoint_to_report(&f, u64::MAX);
+        if parts {
+            client.checkpoint_report(raw).unwrap();
+        }
+        send(&peer, &checkpoint_ack_packet(&digest));
+        assert!(
+            matches!(client.poll(), Err(Refusal::Correlation)),
+            "an unsolicited ACK cannot cross report or part ownership"
+        );
+        assert_eq!(f.closes.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn wrong_id_read_never_renews_the_d_lease() {
+    let f = Fixture::new();
+    let (mut client, socket) = f.drain();
+    client.read(ID, u64::MAX).unwrap();
+    receive(&socket);
+    send(&socket, &read_reply(SESSION, false, false));
+    assert!(client.poll().is_err());
+    assert!(
+        !client.lease_live(f.now.load(Ordering::SeqCst)),
+        "wrong-id READ cannot renew D liveness"
+    );
+}
+
+#[test]
+fn continuation_original_busy_retains_unconfirmed_commit() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../src/business_profile/record_join_vectors.json"
+    ))
+    .unwrap();
+    let record = &vectors["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "listener-accept")
+        .unwrap()["records"][0];
+    let envelope = castle_wall_daemon::smb::jcs::encode(record)
+        .unwrap()
+        .into_bytes();
+    let body = castle_wall_daemon::smb::jcs::encode(&record["body"])
+        .unwrap()
+        .into_bytes();
+    let reserve = frozen_reserve(ID);
+    let mut expected = reserve.next().clone();
+    expected["reserved_body_digest"] =
+        json!(format!("sha256:{}", hex::encode(Sha256::digest(&body))));
+    let mut next = expected.clone();
+    next["committed_sequence"] = json!(1);
+    next["committed_digest"] = append_contract::identity(&envelope).unwrap()["commitment"].clone();
+    next["reserved_body_digest"] = serde_json::Value::Null;
+    let message = json!({"version":1,"op":"COMMIT","request_id":ID,"expected":expected,"next":next,"body_digest":format!("sha256:{}",hex::encode(Sha256::digest(&body)))});
+    let message = castle_wall_daemon::smb::jcs::encode(&message).unwrap();
+    let mut header = d::header("ANCHOR", ID, d::DRAIN_SLOTS[0].1);
+    header["message_length"] = json!(message.len());
+    header["envelope_length"] = json!(envelope.len());
+    let commit = FrozenMutation::checked(
+        d::encode(
+            &header,
+            &[message.as_bytes(), &envelope].concat(),
+            d::Direction::ToDrain,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let f = Fixture::new();
+    let (mut c, server) = f.drain();
+    c.mutation(&commit, u64::MAX).unwrap();
+    assert_eq!(receive(&server), commit.bytes());
+    send(&server, &anchor_reply("ANCHOR_ACK", commit.next(), false));
+    assert!(c.poll().unwrap().is_some());
+    let result = c.original(SESSION, &envelope, u64::MAX);
+    let mut poll = libc::pollfd {
+        fd: server.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut poll, 1, 0) },
+        0,
+        "unconfirmed C0 sends no ORIGINAL"
+    );
+    assert_eq!(result, Err(Refusal::Busy));
+    assert_eq!(c.retained_mutation().unwrap().bytes(), commit.bytes());
+    c.read(ID, u64::MAX).unwrap();
+    receive(&server);
+    send(&server, &anchor_reply("READ_REPLY", commit.next(), false));
+    assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
+    c.original(SESSION, &envelope, u64::MAX).unwrap();
+    assert!(matches!(
+        d::decode(&receive(&server), d::Direction::ToDrain)
+            .unwrap()
+            .operation,
+        d::Operation::Original { .. }
+    ));
 }
