@@ -184,9 +184,16 @@ cd "$repo_root"
 
 # ── Gate 1: typecheck ────────────────────────────────────────────────
 log "Gate 1/2: npm run typecheck"
-if ! (cd server && npm run typecheck --silent > /tmp/sanctuary-precommit-tsc.log 2>&1); then
+# A per-invocation log: one fixed /tmp path was shared by every concurrent
+# hook run (and by the test that runs this hook), so one run truncated
+# another's diagnostics. mktemp failing aborts the hook under set -e, so the
+# gate fails closed. This hook sets no other EXIT trap; a later one must chain
+# this cleanup rather than replace it.
+tsc_log=$(mktemp "${TMPDIR:-/tmp}/sanctuary-precommit-tsc.XXXXXX")
+trap 'rm -f "$tsc_log"' EXIT
+if ! (cd server && npm run typecheck --silent > "$tsc_log" 2>&1); then
   fail "TYPECHECK FAILED - commit blocked"
-  tail -40 /tmp/sanctuary-precommit-tsc.log >&2
+  tail -40 "$tsc_log" >&2
   printf '\n' >&2
   fail "Fix all TypeScript errors before committing."
   exit 1

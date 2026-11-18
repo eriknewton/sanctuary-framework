@@ -17,16 +17,22 @@
  *
  * Invariant: this file is the FIRST entry of both `globalSetup` and
  * `setupFiles` in vitest.config.ts. As the first globalSetup entry it clears
- * the vitest main process before any other globalSetup module runs and before
- * workers start; as the first setupFiles entry it clears every worker (a
+ * the vitest main process before any other globalSetup `setup` callback runs
+ * and before workers start (vitest may import the globalSetup modules
+ * concurrently, so another module's top-level code is not ordered after this;
+ * none of them runs git at import); as the first setupFiles entry it clears every worker (a
  * setup file runs in workers only, so neither entry alone covers both). Every
  * child a test spawns with an inherited environment then starts with these
  * variables absent. Bound: vitest loads its config file before globalSetup,
  * so only config evaluation itself still sees them; the config runs no git.
  * Deleting (not pointing at /dev/null) reverts to
  * the normal shell defaults, because many tests rely on the developer's usual
- * git identity and config; a test that needs no user config sets
- * `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` for its own children after this runs.
+ * git identity and config. Scope of the guarantee: the scrub stops a test
+ * being redirected into a repository or a config file it did not choose; it
+ * does NOT stop writes to the developer's own global config, because deleting
+ * `GIT_CONFIG_GLOBAL` falls back to `$HOME/.gitconfig`. A test that writes
+ * global (or system) git config must point `GIT_CONFIG_GLOBAL` /
+ * `GIT_CONFIG_SYSTEM` at /dev/null or a temp file for its own children itself.
  * `GIT_CEILING_DIRECTORIES` is deliberately NOT cleared: it only restricts
  * upward discovery and protects fixtures.
  *

@@ -62,9 +62,34 @@ function packageRoot(): string {
 }
 
 const rootPath = packageRoot();
-// Must match reapChildRunToken in test/structure/git-env-scrub.test.ts, which
-// identifies a killed child's token by this leading `<pid>-<ms>-` shape.
-const markerRunId = `${process.pid}-${Date.now()}-${randomUUID()}`;
+/**
+ * A parent test that launches a whole child vitest run (which inherits this
+ * globalSetup) may assign the child's token name, so that after killing the
+ * child it can delete exactly that token and nothing else. Must match
+ * TEST_RUN_TOKEN_ID_ENV in test/structure/git-env-scrub.test.ts.
+ *
+ * Invariant: an assigned id is used only if it is a canonical lowercase UUID
+ * (so it is a plain file name, never a path, and as unguessable as the
+ * default), and it is CONSUMED here: deleted from process.env before any
+ * worker or descendant can inherit it, so two runs can never share one token
+ * (the first teardown would then remove a live run's protection). An invalid
+ * id fails the run loudly rather than falling back to an unowned name.
+ */
+export const TEST_RUN_TOKEN_ID_ENV = "SANCTUARY_TEST_RUN_TOKEN_ID";
+// 36 = the canonical 8-4-4-4-12 hex UUID; fixed counts, so the check is linear.
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+function consumeAssignedRunId(): string | undefined {
+  const assigned = process.env[TEST_RUN_TOKEN_ID_ENV];
+  delete process.env[TEST_RUN_TOKEN_ID_ENV];
+  if (assigned === undefined) return undefined;
+  if (!CANONICAL_UUID.test(assigned)) {
+    throw new Error(`test-run-marker: ${TEST_RUN_TOKEN_ID_ENV} must be a canonical lowercase UUID`);
+  }
+  return assigned;
+}
+
+const markerRunId = consumeAssignedRunId() ?? `${process.pid}-${Date.now()}-${randomUUID()}`;
 
 export function testRunMarkerPath(root: string): string {
   return join(root, TEST_RUN_MARKER_FILENAME);

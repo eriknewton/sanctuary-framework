@@ -14,9 +14,19 @@
  * (fail-before). The bash copies of the list are pinned to
  * scripts/git-redirect-env-keys.json statically and by running them, the
  * pre-commit hook end to end with stub vitest launchers.
+ *
+ * Coverage bound: the end-to-end hook run exercises the branch a commit with
+ * a staged .ts file takes. A launch on a branch that run never reaches, in a
+ * spelling the static `mayLaunchVitest` heuristic does not list (for example
+ * `exec vitest` or `$(npm bin)/vitest`), is not caught by either check.
+ *
+ * Every child here runs in its own process group and the whole group is
+ * SIGKILLed on every exit path (timeout, failure, normal exit, afterAll), so
+ * no worker, subshell, git or node descendant outlives the test.
  */
 import { describe, it, expect, afterAll } from "vitest";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,7 +38,7 @@ import {
   isGitRedirectEnvKey,
   scrubGitRedirectEnv,
 } from "../setup/git-env-scrub.js";
-import { removeTestRunMarker, testRunMarkerPath } from "../setup/test-run-marker.js";
+import { removeTestRunMarker, TEST_RUN_TOKEN_ID_ENV } from "../setup/test-run-marker.js";
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = path.resolve(serverDir, "..");
@@ -113,36 +123,67 @@ function readNames(report: string): string[] {
 }
 
 /**
- * Removes the run token the child's own globalSetup (test-run-marker.ts, via
- * the spread real config) wrote into server/.sanctuary-test-run. Must match
- * the `markerRunId` shape `${pid}-${Date.now()}-${uuid}` in
- * test/setup/test-run-marker.ts. A token is the child's only if it names the
- * child's pid AND was minted while the child ran, so the parent run's token
- * and other runs' tokens are never touched. Failure mode this prevents: a
- * SIGKILLed child skips its teardown, its token survives the outer run, and
- * the checkout keeps reading as "under test" (the CLI refuses keychain work)
- * until a later run prunes it after the staleness ceiling.
+ * Process groups this file started and has not yet reaped. A detached child
+ * leads a new group whose id is its pid, so `kill(-pid)` reaches every
+ * descendant (vitest workers, hook subshells, git, the node redactor) even
+ * after the leader has exited.
  */
-function reapChildRunToken(pid: number | undefined, startedMs: number, endedMs: number): void {
-  if (!pid) return; // the child never started, so it wrote nothing
-  const markerDir = testRunMarkerPath(serverDir);
-  if (!fs.existsSync(markerDir)) return;
-  for (const token of fs.readdirSync(markerDir)) {
-    const [owner, minted] = token.split("-");
-    if (owner !== String(pid)) continue;
-    const mintedMs = Number(minted);
-    if (!(mintedMs >= startedMs && mintedMs <= endedMs)) continue;
-    removeTestRunMarker(serverDir, token);
+const liveGroups = new Set<number>();
+function killGroup(pgid: number): void {
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch (err) {
+    // ESRCH: the whole group is already gone, which is the goal.
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
   }
+  liveGroups.delete(pgid);
 }
 
-interface ProbeRun {
-  victim: string; fixture: string; workerSeen: string[]; mainSeen: string[];
-  status: number | null; signal: NodeJS.Signals | null; error?: Error; out: string;
+interface GroupRun { status: number | null; signal: NodeJS.Signals | null; error?: Error; timedOut: boolean; out: string }
+
+/**
+ * Runs `command` as the leader of its own process group, SIGKILLs the whole
+ * group if it outlives `timeoutMs`, and SIGKILLs the group again once the
+ * leader has closed, so a backgrounded descendant cannot survive a clean exit
+ * either. Failure mode this prevents: a timed-out hook or vitest child whose
+ * descendants keep running after the suite, holding files and CPU and
+ * reading as unrelated flakes in later runs.
+ */
+function runInOwnGroup(command: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }): Promise<GroupRun> {
+  return new Promise((resolve) => {
+    let out = "";
+    let timedOut = false;
+    let settled = false;
+    const child = spawn(command, args, {
+      cwd: opts.cwd,
+      env: { ...opts.env, VITEST: "true" }, // the keychain chokepoint refuses inside any child carrying VITEST
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const pgid = child.pid;
+    if (pgid !== undefined) liveGroups.add(pgid);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (pgid !== undefined) killGroup(pgid);
+    }, opts.timeoutMs);
+    const finish = (result: Omit<GroupRun, "timedOut" | "out">) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (pgid !== undefined) killGroup(pgid);
+      resolve({ ...result, timedOut, out });
+    };
+    child.stdout.on("data", (d: Buffer) => { out += d.toString("utf8"); });
+    child.stderr.on("data", (d: Buffer) => { out += d.toString("utf8"); });
+    child.on("error", (error) => finish({ status: null, signal: null, error }));
+    child.on("close", (status, signal) => finish({ status, signal }));
+  });
 }
+
+interface ProbeRun extends GroupRun { victim: string; fixture: string; workerSeen: string[]; mainSeen: string[] }
 
 /** Runs the probes as a child vitest seeded with every MUST_SCRUB and MUST_KEEP name. */
-function runProbe(withScrub: boolean): ProbeRun {
+async function runProbe(withScrub: boolean): Promise<ProbeRun> {
   const tmp = scratch();
   const victim = path.join(tmp, "victim");
   const fixture = path.join(tmp, "fixture");
@@ -162,13 +203,23 @@ function runProbe(withScrub: boolean): ProbeRun {
   const setupFiles = realSetup.filter(keep);
   const globalSetup = [...realGlobal.filter(keep), MAIN_PROBE];
   const cfg = path.join(tmp, "probe.config.mjs");
-  // One thread worker confines probe execution to the child process that spawnSync reaps.
+  // One thread worker keeps probe execution inside the child's own process group.
   fs.writeFileSync(cfg, `
 import config from ${JSON.stringify(path.join(serverDir, "vitest.config.ts"))};
 export default { ...config, cacheDir: ${JSON.stringify(path.join(tmp, "vite-cache"))}, test: { ...config.test, include: [${JSON.stringify(PROBE_GLOB)}], pool: "threads", maxWorkers: 1, setupFiles: ${JSON.stringify(setupFiles)}, globalSetup: ${JSON.stringify(globalSetup)} } };
 `);
   const workerReport = path.join(tmp, "worker-seen.json");
   const mainReport = path.join(tmp, "main-seen.json");
+  // The child's globalSetup (test-run-marker.ts, via the spread real config)
+  // names its marker token with this id, so the parent can delete exactly that
+  // token after the child exits. Must match TEST_RUN_TOKEN_ID_ENV in
+  // test/setup/test-run-marker.ts. Failure mode this prevents: a SIGKILLed
+  // child skips its teardown, its token survives the outer run, and the
+  // checkout keeps reading as "under test" (the CLI refuses keychain work)
+  // until a later run prunes it after the staleness ceiling. Matching by pid
+  // instead would be unsafe: runs in other pid namespaces sharing this
+  // checkout can carry the same pid.
+  const childTokenId = randomUUID();
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ...seeds(tmp, victim),
@@ -176,23 +227,22 @@ export default { ...config, cacheDir: ${JSON.stringify(path.join(tmp, "vite-cach
     PROBE_REPO: fixture,
     PROBE_REPORT: workerReport,
     PROBE_MAIN_REPORT: mainReport,
-    // The keychain chokepoint refuses inside any child that inherits VITEST.
-    VITEST: "true",
+    [TEST_RUN_TOKEN_ID_ENV]: childTokenId,
   };
-  const startedMs = Date.now();
-  // Thread workers die with the synchronous child, which is reaped even when its timeout fires.
-  const r = spawnSync(process.execPath, [path.join(serverDir, "node_modules/vitest/vitest.mjs"), "run", "--config", cfg], {
-    cwd: serverDir, encoding: "utf8", env, timeout: childTimeoutMs, killSignal: "SIGKILL",
-  });
-  // On every exit, clean or killed: the child is already reaped here, so its token can go.
-  reapChildRunToken(r.pid, startedMs, Date.now());
-  return {
-    victim, fixture, workerSeen: readNames(workerReport), mainSeen: readNames(mainReport),
-    status: r.status, signal: r.signal, error: r.error, out: `${r.stdout}${r.stderr}`,
-  };
+  try {
+    const r = await runInOwnGroup(process.execPath, [path.join(serverDir, "node_modules/vitest/vitest.mjs"), "run", "--config", cfg], {
+      cwd: serverDir, env, timeoutMs: childTimeoutMs,
+    });
+    return { ...r, victim, fixture, workerSeen: readNames(workerReport), mainSeen: readNames(mainReport) };
+  } finally {
+    // Every exit path: the group is already killed here, so its exact token can go.
+    // removeTestRunMarker tolerates a token or directory that is already gone (ENOENT).
+    removeTestRunMarker(serverDir, childTokenId);
+  }
 }
 
-function expectChildCompleted(r: { status: number | null; signal: NodeJS.Signals | null; error?: Error; out: string }): void {
+function expectChildCompleted(r: GroupRun): void {
+  expect(r.timedOut, `child timed out and its process group was killed:\n${r.out}`).toBe(false);
   expect(r.error, r.out).toBeUndefined();
   expect(r.signal, r.out).toBeNull();
   expect(r.status, r.out).toBe(0);
@@ -223,11 +273,11 @@ const COMPGEN_USE = "  for name in $(compgen -e); do";
 function expectBashCopyMatches(rel: string, callLines: string[]): string[] {
   const lines = codeLines(rel);
   const start = lines.indexOf(FN_DEF);
-  expect(start, rel).toBeGreaterThanOrEqual(0);
+  expect(start, `${rel}: no line equal to "${FN_DEF}"; the scrub function must be defined at column 0 in exactly that form`).toBeGreaterThanOrEqual(0);
   const end = lines.findIndex((l, i) => i > start && l === "}");
-  expect(end, rel).toBeGreaterThan(start);
+  expect(end, `${rel}: scrub_git_redirect_env has no closing "}" at column 0`).toBeGreaterThan(start);
   const body = lines.slice(start, end + 1);
-  for (const use of [KEYS_USE, RE_USE, COMPGEN_USE]) expect(body, rel).toContain(use);
+  for (const use of [KEYS_USE, RE_USE, COMPGEN_USE]) expect(body, `${rel}: the scrub function must contain the line ${JSON.stringify(use)}`).toContain(use);
   const expectations: [string, string[]][] = [
     ["GIT_REDIRECT_ENV_KEYS", [KEYS_DEF, KEYS_USE]],
     ["GIT_REDIRECT_NUMBERED_KEY_RE", [RE_DEF, RE_USE]],
@@ -235,12 +285,12 @@ function expectBashCopyMatches(rel: string, callLines: string[]): string[] {
     ["compgen", [COMPGEN_USE]],
   ];
   for (const [token, expected] of expectations) {
-    expect(lines.filter((l) => l.includes(token)), `${rel}: every line naming ${token}`).toEqual(expected);
+    expect(lines.filter((l) => l.includes(token)), `${rel}: every non-comment line naming ${token} must be one of these exact lines (a reassignment, append, second definition or extra call is refused); if the list changed, update scripts/git-redirect-env-keys.json and both bash copies together`).toEqual(expected);
   }
   // Definitions precede the function, which precedes every call.
-  expect(lines.indexOf(KEYS_DEF)).toBeLessThan(start);
-  expect(lines.indexOf(RE_DEF)).toBeLessThan(start);
-  for (const call of callLines) expect(lines.indexOf(call)).toBeGreaterThan(end);
+  expect(lines.indexOf(KEYS_DEF), `${rel}: the array must be defined before the scrub function`).toBeLessThan(start);
+  expect(lines.indexOf(RE_DEF), `${rel}: the pattern must be defined before the scrub function`).toBeLessThan(start);
+  for (const call of callLines) expect(lines.indexOf(call), `${rel}: the call ${JSON.stringify(call)} must come after the scrub function`).toBeGreaterThan(end);
   const harness = ["set -euo pipefail", KEYS_DEF, RE_DEF, ...body, "scrub_git_redirect_env", "compgen -e"].join("\n");
   const tmp = os.tmpdir();
   const out = execFileSync("bash", ["-c", harness], {
@@ -248,8 +298,8 @@ function expectBashCopyMatches(rel: string, callLines: string[]): string[] {
     env: { PATH: process.env.PATH, VITEST: "true", ...seeds(tmp, path.join(tmp, "victim")) },
   });
   const left = out.split("\n").filter(Boolean);
-  expect(MUST_SCRUB.filter((k) => left.includes(k))).toEqual([]);
-  expect(MUST_KEEP.filter((k) => !left.includes(k))).toEqual([]);
+  expect(MUST_SCRUB.filter((k) => left.includes(k)), `${rel}: names the extracted scrub function left set`).toEqual([]);
+  expect(MUST_KEEP.filter((k) => !left.includes(k)), `${rel}: names the extracted scrub function wrongly cleared`).toEqual([]);
   return lines;
 }
 
@@ -268,23 +318,68 @@ function mayLaunchVitest(l: string): boolean {
     || t.startsWith("vitest ") || l.includes("| vitest") || l.includes("&& vitest") || l.includes("; vitest") || l.includes("$(vitest");
 }
 
-/** One launcher stub: records its name, args and every GIT_* name it inherited, then succeeds. */
+/**
+ * One launcher stub: records its name, args and every GIT_* name it inherited.
+ * When PROBE_FAIL_TYPECHECK is set, the typecheck launch prints a planted
+ * diagnostic and fails, to prove the hook still shows its log tail.
+ */
 const DUMP_STUB = `#!/usr/bin/env bash
 {
   printf 'CALL %s' "\${0##*/}"; printf ' %s' "$@"; printf '\\n'
   compgen -e | grep '^GIT_' || true
   printf 'END\\n'
 } >> "$PROBE_DUMP"
+if [[ -n "\${PROBE_FAIL_TYPECHECK:-}" && "$*" == "run typecheck --silent" ]]; then
+  echo "planted-typecheck-diagnostic"
+  exit 1
+fi
 exit 0
 `;
 
+interface HookFixture { repo: string; dump: string; tmpdir: string; env: NodeJS.ProcessEnv }
+
+/** A throwaway repo holding the real hook, one staged .ts file, and dumping stubs for every launcher spelling. */
+function hookFixture(): HookFixture {
+  const tmp = scratch();
+  const repo = path.join(tmp, "repo");
+  const bin = path.join(tmp, "bin");
+  const home = path.join(tmp, "home");
+  // The hook's mktemp lands here, never in the shared system temp dir.
+  const tmpdir = path.join(tmp, "tmpdir");
+  for (const d of [repo, bin, home, tmpdir, path.join(repo, "server/node_modules/.bin"), path.join(repo, ".githooks"), path.join(repo, "scripts")]) {
+    fs.mkdirSync(d, { recursive: true });
+  }
+  execFileSync("git", ["init", "--quiet"], { cwd: repo, env: cleanEnv(process.env) });
+  fs.copyFileSync(path.join(repoRoot, HOOK), path.join(repo, HOOK));
+  fs.copyFileSync(path.join(repoRoot, "scripts/redact-test-output.mjs"), path.join(repo, "scripts/redact-test-output.mjs"));
+  fs.writeFileSync(path.join(repo, "server/staged.ts"), "export const staged = 1;\n");
+  execFileSync("git", ["add", "server/staged.ts"], { cwd: repo, env: cleanEnv(process.env) });
+  // Every launcher spelling routes to the dumping stub, so an unscrubbed extra launch is seen too.
+  for (const stub of [path.join(bin, "npx"), path.join(bin, "npm"), path.join(bin, "vitest"), path.join(bin, "pnpm"), path.join(bin, "yarn"), path.join(repo, "server/node_modules/.bin/vitest")]) {
+    fs.writeFileSync(stub, DUMP_STUB, { mode: 0o755 });
+  }
+  const dump = path.join(tmp, "dump.log");
+  // Seeds aim at the hook's own repo, as git's real hook env does, so the hook's git calls work.
+  const env: NodeJS.ProcessEnv = { ...seeds(tmp, repo), PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, TMPDIR: tmpdir, PROBE_DUMP: dump };
+  return { repo, dump, tmpdir, env };
+}
+
+function dumpedCalls(dump: string): { header: string; names: string[] }[] {
+  return fs.readFileSync(dump, "utf8").split("END\n").filter(Boolean).map((block) => {
+    const [header, ...names] = block.split("\n").filter(Boolean);
+    return { header, names };
+  });
+}
+
 afterAll(() => {
+  // Reap any group a failed or interrupted test left, before deleting its files.
+  for (const pgid of [...liveGroups]) killGroup(pgid);
   for (const d of cleanup) fs.rmSync(d, { recursive: true, force: true });
 });
 
 describe("test git-env scrub", () => {
-  it("with the scrub entries, no seeded git redirect reaches the main process or a test, and git writes stay in the test's repo", () => {
-    const r = runProbe(true);
+  it("with the scrub entries, no seeded git redirect reaches the main process or a test, and git writes stay in the test's repo", async () => {
+    const r = await runProbe(true);
     expectChildCompleted(r);
     expect(MUST_SCRUB.filter((k) => r.workerSeen.includes(k))).toEqual([]);
     expect(MUST_SCRUB.filter((k) => r.mainSeen.includes(k))).toEqual([]);
@@ -294,8 +389,8 @@ describe("test git-env scrub", () => {
     expect(bare(r.victim)).toBe("false"); // throwaway "real" repo unchanged
   }, probeTestTimeoutMs);
 
-  it("fail-before: without the scrub entries every seeded redirect reaches both probes and the victim repo is written", () => {
-    const r = runProbe(false);
+  it("fail-before: without the scrub entries every seeded redirect reaches both probes and the victim repo is written", async () => {
+    const r = await runProbe(false);
     expectChildCompleted(r);
     expect(MUST_SCRUB.filter((k) => !r.workerSeen.includes(k))).toEqual([]);
     expect(MUST_SCRUB.filter((k) => !r.mainSeen.includes(k))).toEqual([]);
@@ -305,43 +400,35 @@ describe("test git-env scrub", () => {
 
   it("the pre-commit hook defines the scrub once and calls it inside its one vitest launch", () => {
     const lines = expectBashCopyMatches(HOOK, [HOOK_CALL]);
-    expect(lines.filter(mayLaunchVitest)).toEqual([HOOK_LOG, HOOK_CALL]);
+    expect(lines.filter(mayLaunchVitest), `${HOOK}: the only lines that may name a vitest launcher are the progress log ${JSON.stringify(HOOK_LOG)} and the one scrubbed launch; a second launch must call scrub_git_redirect_env too and be added here`).toEqual([HOOK_LOG, HOOK_CALL]);
     // Exact line equality: nothing chained after the launch, and the scrub runs
     // inside the command-substitution subshell, so the hook's own git calls keep their env.
-    expect(lines[lines.indexOf(HOOK_CALL) + 1]).toBe(HOOK_CALL_NEXT);
+    expect(lines[lines.indexOf(HOOK_CALL) + 1], `${HOOK}: the launch must continue with exactly ${JSON.stringify(HOOK_CALL_NEXT)}`).toBe(HOOK_CALL_NEXT);
   });
 
-  it("the real pre-commit hook, run with git's hook env and every seeded redirect, launches vitest with none of them", () => {
-    const tmp = scratch();
-    const repo = path.join(tmp, "repo");
-    const bin = path.join(tmp, "bin");
-    const home = path.join(tmp, "home");
-    for (const d of [repo, bin, home, path.join(repo, "server/node_modules/.bin"), path.join(repo, ".githooks"), path.join(repo, "scripts")]) {
-      fs.mkdirSync(d, { recursive: true });
-    }
-    execFileSync("git", ["init", "--quiet"], { cwd: repo, env: cleanEnv(process.env) });
-    fs.copyFileSync(path.join(repoRoot, HOOK), path.join(repo, HOOK));
-    fs.copyFileSync(path.join(repoRoot, "scripts/redact-test-output.mjs"), path.join(repo, "scripts/redact-test-output.mjs"));
-    fs.writeFileSync(path.join(repo, "server/staged.ts"), "export const staged = 1;\n");
-    execFileSync("git", ["add", "server/staged.ts"], { cwd: repo, env: cleanEnv(process.env) });
-    // Every launcher spelling routes to the dumping stub, so an unscrubbed extra launch is seen too.
-    for (const stub of [path.join(bin, "npx"), path.join(bin, "npm"), path.join(bin, "vitest"), path.join(bin, "pnpm"), path.join(bin, "yarn"), path.join(repo, "server/node_modules/.bin/vitest")]) {
-      fs.writeFileSync(stub, DUMP_STUB, { mode: 0o755 });
-    }
-    const dump = path.join(tmp, "dump.log");
-    // Seeds aim at the hook's own repo, as git's real hook env does, so the hook's git calls work.
-    const env: NodeJS.ProcessEnv = { ...seeds(tmp, repo), PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, PROBE_DUMP: dump, VITEST: "true" };
-    const r = spawnSync("bash", [path.join(repo, HOOK)], { cwd: repo, encoding: "utf8", env, timeout: hookTimeoutMs, killSignal: "SIGKILL" });
-    expectChildCompleted({ ...r, out: `${r.stdout}${r.stderr}` });
-    const calls = fs.readFileSync(dump, "utf8").split("END\n").filter(Boolean).map((block) => {
-      const [header, ...names] = block.split("\n").filter(Boolean);
-      return { header, names };
-    });
+  it("the real pre-commit hook, run with git's hook env and every seeded redirect, launches vitest with none of them", async () => {
+    const f = hookFixture();
+    const r = await runInOwnGroup("bash", [path.join(f.repo, HOOK)], { cwd: f.repo, env: f.env, timeoutMs: hookTimeoutMs });
+    expectChildCompleted(r);
+    const calls = dumpedCalls(f.dump);
     // The typecheck gate runs before the scrub, in the hook's own env; every other launch must be clean.
     const launches = calls.filter((c) => c.header !== "CALL npm run typecheck --silent");
-    expect(launches.map((c) => c.header)).toEqual([`CALL npx vitest related --run ${path.join(repo, "server/staged.ts")}`]);
-    expect(MUST_SCRUB.filter((k) => launches[0].names.includes(k))).toEqual([]);
+    expect(launches.map((c) => c.header), "the hook must launch vitest exactly once, as `npx vitest related --run <staged file>`").toEqual([`CALL npx vitest related --run ${path.join(f.repo, "server/staged.ts")}`]);
+    expect(MUST_SCRUB.filter((k) => launches[0].names.includes(k)), "redirect variables that reached the hook's vitest launch").toEqual([]);
     expect(MUST_KEEP.filter((k) => !launches[0].names.includes(k))).toEqual([]);
+    expect(fs.readdirSync(f.tmpdir), "the hook's per-invocation typecheck log must be removed on exit").toEqual([]);
+  }, hookTimeoutMs + parentHeadroomMs);
+
+  it("the real pre-commit hook still shows the typecheck log tail on failure and removes the log", async () => {
+    const f = hookFixture();
+    const r = await runInOwnGroup("bash", [path.join(f.repo, HOOK)], { cwd: f.repo, env: { ...f.env, PROBE_FAIL_TYPECHECK: "1" }, timeoutMs: hookTimeoutMs });
+    expect(r.timedOut, r.out).toBe(false);
+    expect(r.signal, r.out).toBeNull();
+    expect(r.status, r.out).toBe(1);
+    expect(r.out).toContain("TYPECHECK FAILED - commit blocked");
+    expect(r.out).toContain("planted-typecheck-diagnostic");
+    expect(dumpedCalls(f.dump).map((c) => c.header), "a failed typecheck must stop the hook before any vitest launch").toEqual(["CALL npm run typecheck --silent"]);
+    expect(fs.readdirSync(f.tmpdir), "the hook's per-invocation typecheck log must be removed on exit").toEqual([]);
   }, hookTimeoutMs + parentHeadroomMs);
 
   it("the verify-fail-before self-test defines the scrub once and calls it in both git subshells", () => {

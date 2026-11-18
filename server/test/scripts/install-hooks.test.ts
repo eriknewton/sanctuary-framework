@@ -151,19 +151,26 @@ describe("install-hooks resolveHooksDir", () => {
     }
   }
 
+  // The installer keeps GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM, so each case pins
+  // whichever of them it does not set deliberately to /dev/null: the
+  // developer's real config can then never decide the expected answer.
+  const NO_USER_CONFIG = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+
   it("ignores an inherited one-command `git -c core.hooksPath` (GIT_CONFIG_PARAMETERS)", () => {
     const { repo, initEnv } = initRepo();
     const injected = path.join(tmpRoot, "injected-by-parameters");
-    const seeded = { GIT_CONFIG_PARAMETERS: `'core.hookspath=${injected}'` };
+    const seeded = { ...NO_USER_CONFIG, GIT_CONFIG_PARAMETERS: `'core.hookspath=${injected}'` };
     // Precondition: git really honors the seeded scope, so a pass below is the scrub's doing.
     expect(gitHooksPath(repo, { ...initEnv, ...seeded })).toBe(injected);
-    expect(withProcessEnv(seeded, () => resolveHooksDir(repo))).not.toBe(injected);
+    const result = withProcessEnv(seeded, () => resolveHooksDir(repo));
+    // With no other config in play, the answer is the repo's own default hooks dir.
+    expect(fs.realpathSync(result)).toBe(fs.realpathSync(path.join(repo, ".git", "hooks")));
   });
 
   it("follows a deliberate numbered-pair core.hooksPath to the directory git runs", () => {
     const { repo, initEnv } = initRepo();
     const deliberate = path.join(tmpRoot, "deliberate-numbered-pair");
-    const seeded = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: deliberate };
+    const seeded = { ...NO_USER_CONFIG, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: deliberate };
     expect(gitHooksPath(repo, { ...initEnv, ...seeded })).toBe(deliberate);
     expect(withProcessEnv(seeded, () => resolveHooksDir(repo))).toBe(deliberate);
   });
@@ -173,7 +180,7 @@ describe("install-hooks resolveHooksDir", () => {
     const deliberate = path.join(tmpRoot, "deliberate-global");
     const globalConfig = path.join(tmpRoot, "global.gitconfig");
     fs.writeFileSync(globalConfig, `[core]\n\thooksPath = ${deliberate}\n`, "utf8");
-    const seeded = { GIT_CONFIG_GLOBAL: globalConfig };
+    const seeded = { GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: globalConfig };
     expect(gitHooksPath(repo, { ...initEnv, ...seeded })).toBe(deliberate);
     expect(withProcessEnv(seeded, () => resolveHooksDir(repo))).toBe(deliberate);
   });
