@@ -512,11 +512,40 @@ describe("hermes owner verbs: memory-report", () => {
     expect(run.code, run.err).toBe(0);
     const parsed = report(run);
     expect(parsed.window.absence_claims_supported).toBe(true);
-    expect(rowFor(parsed, entryId)).toMatchObject({ passage_id: "saved", later_failure: false });
+    expect(rowFor(parsed, entryId)).toMatchObject({ passage_id: "saved", later_failure: "indeterminate" });
     expect(parsed.rows.filter((row: Record<string, any>) => row.kind === kind)).toMatchObject(terminals);
     for (const row of parsed.rows.filter((row: Record<string, any>) => row.kind === kind)) {
       expect(row).not.toHaveProperty("later_failure");
     }
+    expect(lastLine(run.err)).toContain(CLOSING);
+  });
+
+  it.each(["insert_refused", "insert_unconfirmed"] as const)("keeps %s correlation indeterminate for incomplete admission identities", async kind => {
+    const f = await ownerFortress(stack);
+    const entryId = "hermes-entry-1";
+    const passageId = "undefined";
+    const text = "identity passage";
+    await seedPassage(f, passageId, text);
+    const complete = admittedRow(passageId, text, entryId);
+    const admissions = [
+      { ...complete, entryId: undefined },
+      { ...complete, passage_id: undefined },
+      { ...complete, entryId: undefined, passage_id: undefined },
+      complete,
+    ];
+    const terminal = { kind, entryId: "hermes-entry-other", passage_id: "other" };
+    await seedBridgeRows(f, [...admissions, terminal]);
+    const run = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect(run.code, run.err).toBe(0);
+    const parsed = report(run);
+    expect(parsed.window.absence_claims_supported).toBe(true);
+    expect(parsed.rows.filter((row: Record<string, any>) => row.kind === "insert_admitted")).toMatchObject([
+      { later_failure: "indeterminate" },
+      { later_failure: "indeterminate" },
+      { later_failure: "indeterminate" },
+      { later_failure: false },
+    ]);
+    expect(parsed.rows.filter((row: Record<string, any>) => row.kind === kind)).toMatchObject([terminal]);
     expect(lastLine(run.err)).toContain(CLOSING);
   });
 

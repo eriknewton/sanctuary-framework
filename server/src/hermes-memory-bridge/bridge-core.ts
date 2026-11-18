@@ -789,6 +789,9 @@ export class HermesBridgeCore {
     );
   }
 
+  // Must match buildMemoryReport in server/src/cli/hermes-memory.ts: admitInsert issues each entry id once per
+  // process; assertAllowedToCommit sets commitIds from the admission context, and auditRefusedAdmission and
+  // auditUnconfirmed emit those ids only after durable admission (admissionDurable or hookAllowed).
   private auditRefusedAdmission(slot: InsertSlot): void {
     if (slot.refusedAfterAdmission === undefined || slot.refusalAudited ||
         !slot.admissionDurable) return;

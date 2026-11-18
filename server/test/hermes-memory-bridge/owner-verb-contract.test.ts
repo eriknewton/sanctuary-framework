@@ -10,15 +10,17 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import * as compositionModule from "../../src/hermes-memory-bridge/memory-adapter-composition.js";
 import {
-  HERMES_MEMORY_TOOL_NAMES, ID_GRAMMAR, hermesBridgeAuditPrincipal,
+  HERMES_MEMORY_TOOL_NAMES, ID_GRAMMAR, HermesBridgeCore, hermesBridgeAuditPrincipal, parsePublicFrame,
+  type HermesBridgeAuditRecord, type NodeToRelayInput,
 } from "../../src/hermes-memory-bridge/index.js";
 import { createSdwMemoryAdapter } from "../../src/index.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import {
-  ownerFortress, runCleanups, runVerb, seedPassage, startBridge, type Cleanup,
+  FIXTURE_AGENT_ID, ownerFortress, runCleanups, runVerb, seedPassage, startBridge, withSeedSession, type Cleanup,
 } from "../helpers/hermes-owner-fortress.js";
 
 const stack: Cleanup[] = [];
@@ -67,6 +69,94 @@ describe("owner verbs share the bridge's sources", () => {
     expect(run.code, run.err).toBe(0);
     expect(spy).toHaveBeenCalledOnce();
     expect(spy.mock.calls[0]![0]).toMatchObject({ ownerRef: "agent-owner", fortressId: f.fortressId });
+  });
+});
+
+describe("bridge admission identity contract", () => {
+  it("preserves admitted identity and durable order for both terminal kinds", async () => {
+    const f = await ownerFortress(stack);
+    await withSeedSession(f, async ({ masterKey, audit }) => {
+      const terminalKinds = ["insert_refused", "insert_unconfirmed"] as const;
+      const durable: HermesBridgeAuditRecord[] = [];
+      const writes: NodeToRelayInput[] = [];
+      let core: HermesBridgeCore;
+      let adapter: ReturnType<typeof createSdwMemoryAdapter>;
+      let terminalKind: typeof terminalKinds[number];
+      const connectionId = "c1";
+      const send = (frame: Record<string, unknown>) => {
+        const publicBytes = Buffer.from(JSON.stringify(frame));
+        core.relayFrame({ kind: "frame", connectionId, publicBytes, publicFrame: parsePublicFrame(publicBytes) });
+      };
+      core = new HermesBridgeCore({
+        agentId: FIXTURE_AGENT_ID,
+        abort: new AbortController(),
+        nowMs: Date.now,
+        setTimer: (ms, fire) => ({ ms, fire }),
+        clearTimer: () => undefined,
+        completeAuditInsert: () => undefined,
+        writeFrame: frame => { writes.push(frame); },
+        appendAudit: async record => {
+          if (record.kind === "insert_refused" || record.kind === "insert_unconfirmed") {
+            expect(durable.some(admitted => admitted.kind === "insert_admitted" &&
+              admitted.entryId === record.entryId && admitted.passage_id === record.passage_id)).toBe(true);
+          }
+          await audit.appendCritical({ layer: "l1", operation: "hermes_memory_bridge",
+            identity_id: "hermes-memory-bridge", result: "success", details: { ...record } });
+          durable.push(record);
+          if (record.kind === "insert_admitted" && terminalKind === "insert_refused") {
+            send({ type: "cancel", mcp_request_id: terminalKind });
+          }
+        },
+        adapter: {
+          insertPassage: async (input, taint) => {
+            const passage = await adapter.insertPassage(input, taint);
+            if (terminalKind === "insert_unconfirmed") throw new Error("insert settlement unavailable");
+            return passage;
+          },
+          getPassage: id => adapter.getPassage(id),
+          searchPassages: query => adapter.searchPassages(query),
+          recallPassages: budget => adapter.recallPassages(budget),
+        },
+      });
+      try {
+        const identityManager = new IdentityManager(f.storage, masterKey);
+        await identityManager.load();
+        const composed = await compositionModule.composeHermesMemoryAdapterOptions({
+          storage: f.storage, masterKey, fortressId: f.fortressId, ownerRef: FIXTURE_AGENT_ID, identityManager,
+          scanForeignDependencies: (did, fp) => adapter.scanForeignSignerDependencies(did, fp),
+        });
+        adapter = createSdwMemoryAdapter({ mode: "hermes-bridge", ...composed.options, commitCheck: core.commitCheck });
+        core.relayFrame({ kind: "accepted", connectionId });
+        for (terminalKind of terminalKinds) {
+          writes.length = 0;
+          send({ type: "tools_call", request_id: terminalKind, name: "memory_insert",
+            arguments: { text: "admission identity passage", passage_id: terminalKind, taint: "user_content" } });
+          await vi.waitFor(() => expect(writes.some(frame => frame.type === "probe")).toBe(true));
+          const probe = writes.find(frame => frame.type === "probe");
+          if (probe?.type !== "probe") throw new Error("probe unavailable");
+          core.relayFrame({ kind: "probe_reply", connectionId, nonce: probe.nonce });
+          await vi.waitFor(() => {
+            expect(durable.some(record => record.kind === terminalKind)).toBe(true);
+            expect(core.snapshot().slot).toBeUndefined();
+          });
+        }
+        const stored = (await audit.query({ operation_type: "hermes_memory_bridge" })).entries;
+        const admissions = stored.filter(row => row.details?.kind === "insert_admitted");
+        expect(admissions).toHaveLength(terminalKinds.length);
+        expect(new Set(admissions.map(row => row.details?.entryId)).size).toBe(terminalKinds.length);
+        for (const kind of terminalKinds) {
+          const terminal = stored.filter(row => row.details?.kind === kind);
+          expect(terminal).toHaveLength(1); // One terminal row belongs to each insert.
+          const admitted = admissions.find(row => row.details?.passage_id === kind)!;
+          expect(admitted).toBeDefined();
+          expect(terminal.at(0)?.details).toMatchObject({ entryId: admitted.details?.entryId, passage_id: kind });
+          expect(stored.indexOf(terminal.at(0)!)).toBeGreaterThan(stored.indexOf(admitted));
+        }
+      } finally {
+        core.relayEof();
+        await vi.waitFor(() => expect(core.snapshot().drained).toBe(true));
+      }
+    });
   });
 });
 

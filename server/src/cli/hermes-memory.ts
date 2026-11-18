@@ -104,7 +104,8 @@ unanswered for 120 seconds. The last line says how to start the Hermes memory re
 has been checked and no unresolved delete is identified in the retained audit record. After a delete that
 may have left the passage half-removed or unconfirmed, that run and every later run that reads the audit log
 says to leave the relay stopped until the coordinator has read a memory-report, and steps 5 and 6 wait until
-then. A usage error or a refusal that stops before the audit log can be checked also says to leave the relay stopped.
+then. A usage error or a refusal that stops before the audit log can be checked also says to
+leave the relay stopped.
 `;
 
 const HELP_REPORT = `Usage: sanctuary hermes memory-report --fortress <dir> --agent-id <id> [--since <ISO time>] [--out <file>] [--recovery-key-prompt]
@@ -745,13 +746,24 @@ async function buildMemoryReport(context: OwnerContext, args: ParsedArgs, runAt:
     for (const field of REPORT_ROW_FIELDS) if (details[field] !== undefined) row[field] = details[field];
     if (details.kind === "insert_admitted") {
       const later = windowRows.slice(index + 1).map(next => next.details ?? {});
-      // Each bridge process issues an entry id once; its next admission bounds terminal correlation to this run.
+      // Must match HermesBridgeCore.admitInsert, assertAllowedToCommit, auditRefusedAdmission and auditUnconfirmed
+      // in server/src/hermes-memory-bridge/bridge-core.ts: entry ids are issued once per process, and terminal
+      // rows follow durable admission with its passage id. The stop boundary assumes one bridge per fortress.
+      // RelaySocketLifecycle in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift locks one private
+      // directory; process-shell.ts takes shared custody. Fortress-wide single-bridge admission is not enforced.
+      const hasAdmissionIds = typeof details.entryId === "string" && typeof details.passage_id === "string";
       let terminalFailure = false;
+      let terminalIndeterminate = false;
       for (const next of later) {
-        if (next.kind === "insert_admitted" && next.entryId === details.entryId) break;
+        if (hasAdmissionIds && next.kind === "insert_admitted" && next.entryId === details.entryId) break;
+        if (next.kind !== "insert_refused" && next.kind !== "insert_unconfirmed") continue;
+        // An absent identifier is never read as evidence of absence.
+        if (!hasAdmissionIds || (next.entryId === details.entryId && next.passage_id === undefined)) {
+          terminalIndeterminate = true;
+          continue;
+        }
         // A terminal row describes only its admitted entry and passage, including when its own admission is absent.
-        if ((next.kind === "insert_refused" || next.kind === "insert_unconfirmed") &&
-            next.entryId === details.entryId && next.passage_id === details.passage_id) {
+        if (next.entryId === details.entryId && next.passage_id === details.passage_id) {
           terminalFailure = true;
           break;
         }
@@ -768,7 +780,7 @@ async function buildMemoryReport(context: OwnerContext, args: ParsedArgs, runAt:
         inspections.set(passageId, inspection);
       }
       const present = inspection.state === "absent" && !absenceSupported ? "indeterminate" : inspection.state;
-      row.later_failure = laterFailure ? true : absenceSupported ? false : "indeterminate";
+      row.later_failure = laterFailure ? true : absenceSupported && !terminalIndeterminate ? false : "indeterminate";
       row.present = present;
       // Compared in memory only; the stored text never leaves this function.
       row.digest_matches = inspection.state === "present"
