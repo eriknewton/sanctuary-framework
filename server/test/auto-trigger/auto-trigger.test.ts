@@ -30,6 +30,7 @@
  * writes the in-memory dispatcher + encrypted store only.
  */
 
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { describe, it, expect } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";

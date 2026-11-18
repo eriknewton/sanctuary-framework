@@ -22,6 +22,7 @@
  * so a "phrase absent" result can never be a vacuous pass.
  */
 
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { describe, it, expect, beforeEach } from "vitest";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
