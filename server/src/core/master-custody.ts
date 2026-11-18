@@ -238,7 +238,13 @@ const CUSTODY_ENVELOPE_COMMIT_STATE_PREPARED =
 
 /** One kernel-backed lock domain for every custody/master mutation. */
 export const CUSTODY_WRITE_LOCK_NAMESPACE = "_meta";
-export const CUSTODY_WRITE_LOCK_FILE = "custody-master.lock";
+// Must match SOURCE_RAW_NAME_PRODUCERS in audit/split-evidence-registry.ts.
+/** Complete custody lock grammar for source inventory consumers. */
+export const MASTER_CUSTODY_RAW_NAME_GRAMMARS = {
+  custodyWrite:{scope:"custody",disposition:"excluded",name:"custody-master.lock",pattern:/^custody-master\.lock$/},
+} as const;
+
+export const CUSTODY_WRITE_LOCK_FILE = MASTER_CUSTODY_RAW_NAME_GRAMMARS.custodyWrite.name;
 /** Runtime-only shared/exclusive gate between unlocked writers and rotation. */
 export const MASTER_ROTATION_BARRIER_NAME = "custody-master-rotation";
 

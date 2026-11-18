@@ -25,6 +25,9 @@
 /** Must match MANIFEST_DOMAIN in evidence-pack/snapshot-contract.ts. */
 export const EVIDENCE_SNAPSHOT_MANIFEST_DOMAIN = "sanctuary.evidence-snapshot.v0\n";
 
+/** Must match MANIFEST_DOMAIN in evidence-pack/split-statement-contract.ts. */
+export const EVIDENCE_SPLIT_STATEMENT_DOMAIN = "sanctuary.evidence-split-statement.v1\n";
+
 /** Hash domain for one exported SDW record's ciphertext envelope. */
 export const SDW_EXPORT_RECORD_HASH_DOMAIN = "sanctuary.sdw-export-record-hash.v1\n";
 /** Digest domain for the approval-bound export scope. */
@@ -89,6 +92,7 @@ export const INTERNAL_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
   ...K1_SIGNING_DOMAIN_PREFIXES,
   SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
   EVIDENCE_SNAPSHOT_MANIFEST_DOMAIN,
+  EVIDENCE_SPLIT_STATEMENT_DOMAIN,
   STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX,
   AUDIT_EVENT_SIGNING_DOMAIN_PREFIX,
   INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX,
