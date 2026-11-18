@@ -22,7 +22,9 @@ export function nativeBinary(profile: "debug" | "release", name: "signer" | "unl
   try { accessSync(path, constants.X_OK); } catch { throw new Error(`K1_NATIVE_BINARY_UNBUILT: ${profile}/${name}`); }
   return path;
 }
-// Must match the root-owned interpreter provisioning steps in all three Linux full-suite workflows.
+// Must match the root-owned interpreter provisioning steps in the Linux full-suite workflows and in
+// castle-wall-linux.yml (its cargo suite reaches this fixture through checkpoint-status.ts);
+// test/structure/signer-interpreter-provisioned.test.ts pins both.
 const fixtureNode = "/usr/bin/node";
 const digest = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

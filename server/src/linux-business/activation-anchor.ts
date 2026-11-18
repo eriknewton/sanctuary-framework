@@ -7,6 +7,7 @@ import { parseStrict } from "../smb/parse-strict.js";
 // Must match activation_anchor.rs: these are proposal codecs, never persistence or authentication authority.
 export const ANCHOR_VERSION = 1;
 export const ANCHOR_MAX_BYTES = 65536;
+// ID_HEX_LENGTH, DIGEST_HEX_LENGTH and SAFE_INTEGER must match signing/business-append-wire.ts; the contract test pins the complete scalar set.
 // DRAIN_SCHEMA_BEGIN
 // must match `drain_schema.json` via `scripts/generate-drain-contract.mjs`
 export const DRAIN_SCHEMA_DIGEST = "sha256:a9ce79996945b09990ea8ab538bbe3288a19be4051db013238d14431bfc4254d";

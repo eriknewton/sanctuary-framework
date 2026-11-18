@@ -1,4 +1,4 @@
-// fail-before-exempt: register the isolated append foundations target in the exact feature gate.
+// fail-before-exempt: native feature-gated item boundaries and composed append registries are pinned against Rust source and workflow files.
 // fail-before-exempt: Extend the exact gated and executed target registry for the two isolated drain suites.
 //! Structural guard: every integration target that can reach a HOST-GLOBAL
 //! object must be gated behind `required-features = ["test-isolation"]`.
@@ -129,9 +129,12 @@ fn all_isolation_targets() -> BTreeSet<String> {
 /// cannot drift independently. Remaining bound: this pins workflow TEXT between
 /// the markers, not which YAML node runs it. Commands before the begin marker,
 /// wrappers around the whole loop (`if false`, a subshell `|| true`, an
-/// uncalled function), step-level `if:` or `continue-on-error:`, and relocating
-/// the marked block into another scalar are out of reach, as is YAML-parse
-/// validity (separate workflow work).
+/// uncalled function), and relocating the marked block into another scalar are
+/// out of reach, as is YAML-parse validity (separate workflow work). A
+/// step-level `if:` or `continue-on-error:` on the root step, or either key on
+/// its job, is refused by signed_append_workflow_selection_has_exact_count.
+/// So is a `needs:` key on the job: a skipped dependency skips the job, and a
+/// skipped job reads as passing for a required check.
 fn workflow_suite_targets() -> BTreeSet<String> {
     let workflow_path = repo_root().join(".github/workflows/castle-wall-linux.yml");
     let workflow = std::fs::read_to_string(workflow_path).expect("read Linux workflow");
@@ -617,6 +620,7 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
         "linux_business_drain",
         "linux_business_reconciliation",
         "linux_business_append_foundations",
+        "linux_business_signed_append",
         "linux_business_signer_client",
         "linux_business_writer_protocol",
         "linux_business_writer_peer",
@@ -910,10 +914,14 @@ fn skipped_linux_business_writer_user_manager_requires_user_manager_witness() {
 fn writer_production_source(source: &str) -> String {
     let mut output = String::new();
     let mut gated = false;
+    let mut gated_indent = 0;
     let mut item_indent = None;
     for line in source.lines() {
         let trimmed = line.trim();
         if trimmed == "#[cfg(feature = \"test-isolation\")]" {
+            if !gated {
+                gated_indent = line.len() - line.trim_start().len();
+            }
             gated = true;
             continue;
         }
@@ -927,8 +935,8 @@ fn writer_production_source(source: &str) -> String {
                     gated = false;
                     item_indent = None;
                 }
-            } else if trimmed.ends_with(';') {
-                // A complete statement owns no following item, even when it contains braces.
+            } else if trimmed.ends_with(';') || (indent == gated_indent && trimmed.ends_with(',')) {
+                // A complete statement or field owns no following item, including a production implementation.
                 gated = false;
             } else if trimmed.contains('{') && !trimmed.ends_with('}') {
                 item_indent = Some(indent);
@@ -960,11 +968,11 @@ fn production_reconciler_implementation_set_is_closed() {
     let mut implementations = Vec::new();
     visit(&crate_root().join("src"), &mut implementations);
     // Must match execute in sanctuary-business-writer.rs: only this production implementation may supply reconciliation.
-    assert_eq!(implementations, vec!["ClosedReconciler"]);
+    assert_eq!(implementations, vec!["DrainReconciler"]);
 }
 
 #[test]
-fn writer_execute_composes_the_closed_reconciler() {
+fn writer_execute_composes_the_ordinary_reconciler() {
     let source =
         std::fs::read_to_string(crate_root().join("src/bin/sanctuary-business-writer.rs")).unwrap();
     let production = writer_production_source(&source);
@@ -980,7 +988,16 @@ fn writer_execute_composes_the_closed_reconciler() {
         .map(str::trim)
         .filter(|line| line.starts_with("reconciler:"))
         .collect();
-    assert_eq!(fields, vec!["reconciler: ClosedReconciler::production(),"]);
+    assert_eq!(fields, vec!["reconciler: DrainReconciler::production("]);
+    assert!(execute.contains("OrdinaryCheckpointProvider::production()"));
+    let service =
+        std::fs::read_to_string(crate_root().join("src/business_profile/writer_service.rs"))
+            .unwrap();
+    let entry = service.split("pub fn test_entry(").nth(1).unwrap();
+    assert!(entry.contains("reconciler: DrainReconciler::production("));
+    assert!(entry.contains("OrdinaryCheckpointProvider::production()"));
+    assert!(service.contains("reconciler: R,"));
+    assert!(service.contains("deps.reconciler,"));
 }
 
 // The compiler seals writer_service::Reconciler; this scan also pins its production implementation source.
@@ -1048,5 +1065,241 @@ fn gated_static_preserves_combined_implementation() {
     assert_gated_statement_keeps_implementation(
         "static VALUE: [u8; 1] = { [0] };",
         "impl<T: Bound<U>> path::Reconciler for Other {\n}",
+    );
+}
+
+#[test]
+fn gated_field_preserves_the_following_production_implementation() {
+    for field in ["fixture: Option<Fixture>,", "fixture: None,"] {
+        let source = format!(
+            "struct Config {{\n    #[cfg(feature = \"test-isolation\")]\n    {field}\n}}\nimpl Reconciler for Other {{\n}}\n"
+        );
+        let production = writer_production_source(&source);
+        assert_eq!(
+            production, "struct Config {\n}\nimpl Reconciler for Other {\n}\n",
+            "only the isolated field is removed"
+        );
+        assert_eq!(reconciler_implementations(&production), ["Other"]);
+    }
+    let function = "#[cfg(feature = \"test-isolation\")]\nfn isolated(\n    argument: (),\n) {\n    impl Reconciler for Fixture {}\n}\nimpl Reconciler for Other {\n}\n";
+    assert_eq!(
+        writer_production_source(function).trim(),
+        "impl Reconciler for Other {\n}",
+        "a parameter comma never ends the gated function"
+    );
+}
+
+#[test]
+fn real_signer_checkpoint_status_runs_unprivileged_with_exact_count() {
+    // Must match the #[ignore] in tests/support/checkpoint.rs: the root suite skips the case, so this step is its only run.
+    let workflow =
+        std::fs::read_to_string(crate_root().join("../.github/workflows/castle-wall-linux.yml"))
+            .unwrap();
+    let command = "        run: cargo test --locked --features test-isolation --test linux_business_append_foundations checkpoint::real_null_status_refuses_genesis_and_settled_with_populated_controls -- --ignored 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 1 passed; 0 failed; 0 ignored;'\n";
+    assert_eq!(workflow.matches(command).count(), 1);
+    let at = workflow.find(command).unwrap();
+    let step = &workflow[workflow[..at].rfind("      - name: ").unwrap()..at];
+    assert!(
+        !step.contains("sudo"),
+        "the real signer checkpoint status step must not run as root"
+    );
+    assert!(step.contains("working-directory: castle-wall-daemon"));
+}
+
+#[test]
+fn signed_append_workflow_selection_has_exact_count() {
+    let workflow =
+        std::fs::read_to_string(crate_root().join("../.github/workflows/castle-wall-linux.yml"))
+            .unwrap();
+    assert!(workflow.contains("cargo test --locked --features test-isolation --test linux_business_signed_append real_wall_writer_drain_commit_and_original_with_synthetic_signer 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 1 passed; 0 failed; 0 ignored;'"));
+    // The root step skips the signed append cases only because the next step
+    // runs the whole suite under its own bound; each half is useless alone.
+    let step = |name: &str| {
+        let start = workflow
+            .find(&format!("- name: {name}"))
+            .unwrap_or_else(|| panic!("workflow step {name}"));
+        let rest = &workflow[start + 1..];
+        &workflow[start..start + 1 + rest.find("\n      - name: ").unwrap_or(rest.len())]
+    };
+    let root = step("cargo test (lib + integration, as root for kernel access)");
+    // Both physical lines are pinned: a positional filter on the first line
+    // would drop root cases while every suite still prints its result line.
+    assert!(
+        root.contains(
+            "sudo -E env \"PATH=$PATH\" CARGO_TERM_COLOR=never cargo test --locked --all-targets --features test-isolation --color never \\\n            -- --test-threads=1 --skip signed_append:: --skip settlement_call_sites:: 2>&1 | tee cargo-test.log\n"
+        ),
+        "root step skips only the separately bounded signed append cases"
+    );
+    // Both modules are the whole signed append binary, so each of its cases
+    // runs exactly once, in the step below. Any other skip would drop cases
+    // that no other step runs as root.
+    let tokens: Vec<&str> = root
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let mut skips = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if *token == "--skip" {
+            skips.push(tokens.get(index + 1).copied().unwrap_or(""));
+        } else if let Some(filter) = token.strip_prefix("--skip=") {
+            skips.push(filter);
+        }
+    }
+    assert_eq!(
+        skips,
+        ["signed_append::", "settlement_call_sites::"],
+        "root step skips exactly the two signed append suite modules"
+    );
+    // Keys and values are read from a block's own lines at its indent, so a
+    // comment line or a key nested deeper (such as under `with:`) is never one
+    // of them. Each key and value is normalised first: surrounding spaces and
+    // one pair of quotes are YAML spellings of the same scalar.
+    let normalised = |text: &str| -> String {
+        let text = text.trim();
+        for quote in ['"', '\''] {
+            if let Some(inner) = text
+                .strip_prefix(quote)
+                .and_then(|rest| rest.strip_suffix(quote))
+            {
+                return inner.to_string();
+            }
+        }
+        text.to_string()
+    };
+    let entries = |block: &str, indent: usize| -> Vec<(String, String)> {
+        let pad = " ".repeat(indent);
+        block
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.strip_prefix(pad.as_str()))
+            .filter(|rest| !rest.starts_with([' ', '#']))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(key, value)| {
+                let value = value.split(" #").next().unwrap_or_default();
+                (normalised(key), normalised(value))
+            })
+            .collect()
+    };
+    let keys = |block: &str, indent: usize| -> Vec<String> {
+        entries(block, indent)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    };
+    // Every occurrence is returned, so a repeated key cannot hide behind the
+    // expected one.
+    let values = |block: &str, key: &str| -> Vec<String> {
+        entries(block, 8)
+            .into_iter()
+            .filter(|(name, _)| name == key)
+            .map(|(_, value)| value)
+            .collect()
+    };
+    assert_eq!(
+        values(root, "timeout-minutes"),
+        ["43"],
+        "root step keeps its derived bound"
+    );
+    let suite = step("Signed append suite, unprivileged (serial)");
+    assert!(suite.contains("\n          CARGO_TERM_COLOR=never cargo test --locked --features test-isolation --color never --test linux_business_signed_append \\\n            -- --test-threads=1 2>&1 | tee signed-append-test.log\n"),
+        "signed append step writes its full output to its evidence log");
+    // Most graphs in this suite run the fake signer as a thread of the test
+    // process; under root that full-capability peer fails the capability-dropped
+    // writer's /proc/<pid>/exe read, so the suite must never run elevated.
+    assert!(
+        !suite.contains("sudo") && !suite.contains("SANCTUARY_EXPECT_PRIVILEGED_LINUX"),
+        "signed append step runs unprivileged, with no privileged expectation"
+    );
+    assert!(suite.contains("          grep -Eq '^test result. ok. 388 passed; 0 failed; 10 ignored;' signed-append-test.log || {\n            echo \"FAIL: the signed append suite did not report exactly 388 passed, 0 failed, 10 ignored\"\n            exit 1\n          }\n"),
+        "signed append step requires the exact count from its evidence log");
+    let upload = step("Retain Linux integration and real-systemd evidence logs");
+    let upload_paths: Vec<&str> = upload
+        .split_once("\n          path: |\n")
+        .map(|(_, list)| {
+            list.lines()
+                .take_while(|line| line.starts_with("            "))
+                .map(str::trim)
+                .filter(|path| !path.starts_with('#'))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        upload_paths.contains(&"castle-wall-daemon/cargo-test.log")
+            && upload_paths.contains(&"castle-wall-daemon/signed-append-test.log"),
+        "evidence upload retains the root and signed append logs"
+    );
+    // Each log is written relative to its step's working directory, so the
+    // uploaded path must be that directory joined to the log name.
+    for (block, log) in [(root, "cargo-test.log"), (suite, "signed-append-test.log")] {
+        let directories = values(block, "working-directory");
+        let resolved: Vec<String> = directories
+            .iter()
+            .map(|directory| format!("{directory}/{log}"))
+            .collect();
+        assert!(
+            resolved.len() == 1 && upload_paths.contains(&resolved[0].as_str()),
+            "evidence upload path resolves under the step's working directory: {resolved:?} in {upload_paths:?}"
+        );
+    }
+    assert_eq!(
+        values(suite, "working-directory"),
+        ["castle-wall-daemon"],
+        "signed append step runs in the daemon crate"
+    );
+    assert_eq!(
+        values(upload, "if"),
+        ["always()"],
+        "evidence upload runs after a failed, timed-out or cancelled step"
+    );
+    assert_eq!(
+        values(suite, "timeout-minutes"),
+        ["55"],
+        "signed append step keeps its derived bound"
+    );
+    // A step-level condition or error override would let either half stop
+    // gating while every text pin above still passes.
+    for (name, block) in [("root", root), ("signed append", suite)] {
+        let step_keys = keys(block, 8);
+        assert!(
+            !step_keys
+                .iter()
+                .any(|key| key == "if" || key == "continue-on-error"),
+            "{name} step carries no step-level condition or error override: {step_keys:?}"
+        );
+    }
+    let job_start = workflow
+        .find("\n  castle-wall-linux-integration:\n")
+        .expect("Linux integration job");
+    let job_rest = &workflow[job_start + 1..];
+    let job_end = job_rest
+        .match_indices("\n  ")
+        .map(|(index, _)| index)
+        .find(|index| !job_rest[index + 3..].starts_with([' ', '#', '\n']))
+        .unwrap_or(job_rest.len());
+    let job_keys = keys(&job_rest[..job_end], 4);
+    assert!(
+        job_keys.contains(&"steps".to_string())
+            && !job_keys
+                .iter()
+                .any(|key| key == "if" || key == "continue-on-error"),
+        "Linux integration job carries no condition or error override: {job_keys:?}"
+    );
+    // A skipped dependency skips this job, and a skipped job reads as passing
+    // for a required check, so the job depends on no other job.
+    assert!(
+        !job_keys.iter().any(|key| key == "needs"),
+        "Linux integration job depends on no other job: {job_keys:?}"
+    );
+    // The root step leaves root-owned files in target/, which an unprivileged
+    // cargo cannot update, so the unprivileged suite runs first.
+    assert!(
+        workflow
+            .find("- name: Signed append suite, unprivileged")
+            .unwrap()
+            < workflow
+                .find("- name: cargo test (lib + integration")
+                .unwrap(),
+        "the whole suite runs before the root step that skips it"
     );
 }

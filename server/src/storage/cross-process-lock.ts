@@ -492,6 +492,17 @@ export interface MasterWriteBarrierOptions {
    * Unset (default): rethrow the capability error (fail closed).
    */
   degradeOnEnvironmentalLoss?: "read-only" | "inert";
+  /**
+   * Exclusive side only ({@link withExclusiveMasterRotationBarrier}). When the
+   * barrier has no kernel coordinates (a storage backend without filesystem
+   * capabilities), the default runs the operation with a no-op held check.
+   * `true` refuses with a `capability` error before the operation runs, for a
+   * caller whose safety rests on proven exclusion of every live custody
+   * holder. Unset (default): unchanged behavior for every existing caller.
+   * The shared side ({@link acquireMasterWriteBarrier}) ignores this option
+   * entirely; setting it there changes nothing.
+   */
+  requireKernelAdmission?: boolean;
   /** TEST ONLY: force the owner-identity check without a real uid change. */
   __testGetuid?: () => number | undefined;
 }
@@ -1901,6 +1912,14 @@ export async function withExclusiveMasterRotationBarrier<T>(
     host,
   );
   if (coordinates === null) {
+    // Null coordinates prove no exclusion at all; a caller that relies on the exclusive side to
+    // keep every bridge, rotation and import out must refuse here rather than run unbarriered.
+    if (options.requireKernelAdmission === true) {
+      throw new CrossProcessLockError(
+        "exclusive master-rotation barrier has no kernel coordinates for this storage; refusing without admission",
+        "capability",
+      );
+    }
     return exclusiveMasterBarrierScope.run(
       { storage, assertHeld: () => undefined },
       operation,
@@ -2762,7 +2781,7 @@ export function auditGuardDarwinUserTempDir(): Promise<string> {
  * overflow where `/tmp` would not. Must match the socket-path cap enforced at
  * bind time (search KERNEL_SOCKET_PATH_MAX_BYTES).
  */
-function custodyLockRootFits(root: string): boolean {
+export function custodyLockRootFits(root: string): boolean {
   return (
     Buffer.byteLength(root) + 1 + CUSTODY_LOCK_MAX_ENTRY_BYTES <=
     KERNEL_SOCKET_PATH_MAX_BYTES

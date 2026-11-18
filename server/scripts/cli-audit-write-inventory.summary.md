@@ -6,9 +6,9 @@ Generated: 2026-09-03T19:48:36.443Z
 
 | Metric | Count |
 |--------|-------|
-| Total CLI subcommands inventoried | 82 |
-| Mutators | 41 |
-| Read-only | 41 |
+| Total CLI subcommands inventoried | 85 |
+| Mutators | 42 |
+| Read-only | 43 |
 | Pure-UI | 0 |
 | **Mutators that do NOT audit (Batch 5b targets)** | **1** |
 | Uncertain (operator review needed) | 0 |
@@ -63,6 +63,9 @@ Generated: 2026-09-03T19:48:36.443Z
 | `sanctuary file-grant list` | mutator | yes | src/cli/file-grant.ts | 203 |
 | `sanctuary file-grant mint` | mutator | yes | src/cli/file-grant.ts | 197 |
 | `sanctuary file-grant revoke` | mutator | yes | src/cli/file-grant.ts | 209 |
+| `sanctuary hermes memory-delete` | mutator | yes | src/cli/hermes-memory.ts | 377 |
+| `sanctuary hermes memory-report` | read-only | n/a | src/cli/hermes-memory.ts | 361 |
+| `sanctuary hermes memory-show` | read-only | n/a | src/cli/hermes-memory.ts | 372 |
 | `sanctuary honeypot compile` | read-only | n/a | src/honeypot/cli.ts | 138 |
 | `sanctuary honeypot credential-traps` | read-only | n/a | src/honeypot/cli.ts | 274 |
 | `sanctuary honeypot deploy` | mutator | yes | src/honeypot/cli.ts | 187 |

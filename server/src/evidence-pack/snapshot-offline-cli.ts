@@ -3,9 +3,12 @@ import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, opendir, realpath, type FileHandle } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { verify } from "../core/identity.js";
-import { verifySnapshot } from "./snapshot-verify.js";
-import { validateSnapshotPins } from "./snapshot-trust.js";
+import { verifySnapshotByFormat } from "./snapshot-verify.js";
+import * as B from "./split-statement-contract.js";
+import {unavailableChain} from "./split-statement-nested.js";
 import * as C from "./snapshot-contract.js";
+// Both held-file boundaries must match parseManifestEnvelope in snapshot-dispatch.ts before payload reads.
+import * as D from "./snapshot-dispatch.js";
 declare const __SANCTUARY_SOURCE_SHA__: string;
 declare const __EVIDENCE_PACK_VERSION__: string;
 // Must match definitions in tsup.evidence-pack.config.ts and the package version read by build-evidence-pack.mjs.
@@ -65,14 +68,14 @@ export async function captureOfflineSnapshot(path: string, packKey: string, expe
       C.requireSnapshot(bytesRead === lst.size, C.HARD.snapshot_changed); file.bytes = buffer.subarray(0, bytesRead); file.metadata = metadataNames(filePath, process.platform, await fd.stat({ bigint: true })); return file;
     }
     const manifestName = names.find(n => n.equals(Buffer.from(C.MANIFEST_FILENAME))); C.requireSnapshot(manifestName, C.HARD.file_set_mismatch);
-    const mf = await capture(manifestName, C.MAX_MANIFEST_BYTES); const raw = C.parseManifestEnvelope(mf.bytes);
+    const mf = await capture(manifestName, C.MAX_MANIFEST_BYTES); const raw = D.parseManifestEnvelope(mf.bytes);
     // Authenticate names and exact snapshot selection before resolving any manifest-listed file.
     phase(C.STATES.MANIFEST_AUTHENTICATED);
-    C.requireSnapshot(verify(C.manifestSigningBytes(raw), C.base64(raw.manifest_signature, C.SIGNATURE_BYTES), C.publicKey(packKey)), C.HARD.manifest_signature_invalid);
+    C.requireSnapshot(verify(D.manifestSigningBytes(raw), C.base64(raw.manifest_signature, C.SIGNATURE_BYTES), C.publicKey(packKey)), C.HARD.manifest_signature_invalid);
     phase(C.STATES.EXPECTED_SNAPSHOT);
     C.requireSnapshot(C.manifestDigest(mf.bytes) === expectedDigest, C.HARD.manifest_digest_mismatch);
     phase(C.STATES.FILE_SET_AUTHENTICATED);
-    const manifest = C.parseManifest(raw);
+    const manifest = D.parseManifest(raw);
     C.cap(mf.bytes.length + manifest.files.reduce((sum, row) => sum + row.size_bytes, 0), C.MAX_PACK_BYTES);
     const expected = [C.MANIFEST_FILENAME, ...manifest.files.map(f => f.filename)].map(n => Buffer.from(n).toString("hex")).sort();
     C.requireSnapshot(JSON.stringify(names.map(n => n.toString("hex")).sort()) === JSON.stringify(expected), names.some(n => C.OS_METADATA.test(n.toString())) ? C.HARD.unlisted_os_metadata : C.HARD.file_set_mismatch);
@@ -123,7 +126,8 @@ export function parseOfflineKey(bytes: Uint8Array): string {
     throw new C.SnapshotError(C.HARD.pin_invalid);
   }
 }
-function captureFailure(error: unknown, state: C.ProtocolState): C.VerificationResult {
+function captureFailure(error: unknown, state: C.ProtocolState, split=false): C.VerificationResult | B.Result {
+  if(split)return B.parseResult({format:B.RESULT_FORMAT,contract:B.CONTRACT,status:"FAIL",exit_code:C.EXIT_FAIL,accepted:false,snapshot_integrity:C.INTEGRITY.unverified,export_id:null,manifest_digest:null,verifier_source_revision:OFFLINE_REVISION,findings:[{code:error instanceof B.SplitError||error instanceof C.SnapshotError?error.code:"io_error",state,filename:null}],findings_total:1,findings_truncated:false,partial_reasons:[],chains:[unavailableChain("operator","missing_history"),unavailableChain("daemon","missing_history")],transparency_assignments:[],nested:{operator:null,daemon:null,transparency:null},not_checked:C.NOT_CHECKED});
   return { format: C.RESULT_FORMAT, status: C.STATUS.FAIL, exit_code: C.EXIT_FAIL, accepted: false, snapshot_integrity: C.INTEGRITY.unverified, export_id: null, manifest_digest: null, verifier_source_revision: OFFLINE_REVISION, findings: [{ code: error instanceof C.SnapshotError ? error.code : C.HARD.io_error, state, filename: null }], partial_reasons: [], nested: { audit: null, transparency: null }, not_checked: C.NOT_CHECKED };
 }
 export async function runOfflineCommand(argv: string[], io: OfflineIO = offlineIO): Promise<number> {
@@ -134,14 +138,21 @@ export async function runOfflineCommand(argv: string[], io: OfflineIO = offlineI
     let parsed: ReturnType<typeof parseOfflineArguments>;
     try { parsed = parseOfflineArguments(argv); } catch { await io.stderr(C.HUMAN.USAGE_ERROR + C.LF + HELP); return C.EXIT_USAGE; }
     const { flags, json } = parsed; let state: C.ProtocolState = C.STATES.PIN_INPUTS;
-    let result: C.VerificationResult;
+    let result: C.VerificationResult | B.Result;let split=false;
     try {
-      const pins = { packKey: parseOfflineKey(await readPublicFile(flags["--public-key-file"], C.MAX_TRUST_BYTES)), descriptorBytes: await readPublicFile(flags["--trust-descriptor-file"], C.MAX_TRUST_BYTES), expectedManifestDigest: flags["--expect-manifest-digest"] };
-      validateSnapshotPins(pins);
+      let packKey:string|undefined,pinFailure:unknown;
+      try {packKey=parseOfflineKey(await readPublicFile(flags["--public-key-file"],C.MAX_TRUST_BYTES));}catch(error){pinFailure=error;}
+      let descriptorBytes:Uint8Array;
+      try {descriptorBytes=await readPublicFile(flags["--trust-descriptor-file"],C.MAX_TRUST_BYTES);}catch(error){throw pinFailure??error;}
+      // The independent descriptor selects the failure schema even when authority or capture checks refuse.
+      try {const value=C.parseSnapshotJSON(descriptorBytes,C.MAX_TRUST_BYTES);split=value!==null&&typeof value==="object"&&!Array.isArray(value)&&(value as Record<string,unknown>).format===B.TRUST_FORMAT;}catch { /* Malformed descriptors preserve V0 pin mapping. */ }
+      if(pinFailure)throw pinFailure;
+      const pins = { packKey:packKey!, descriptorBytes, expectedManifestDigest: flags["--expect-manifest-digest"] };
+      D.validatePins(pins);
       state = C.STATES.MANIFEST_BYTES;
-      result = verifySnapshot(await captureOfflineSnapshot(flags["--pack"], pins.packKey, pins.expectedManifestDigest, next => { state = next; }), pins, OFFLINE_REVISION);
-    } catch (error) { result = captureFailure(error, state); }
-    await io.stdout(json ? JSON.stringify(result) + C.LF : C.HUMAN[result.status] + C.LF + [...result.findings.map(finding => finding.code), ...result.partial_reasons].join(C.LF) + C.LF);
+      result = verifySnapshotByFormat(await captureOfflineSnapshot(flags["--pack"], pins.packKey, pins.expectedManifestDigest, next => { state = next; }), pins, OFFLINE_REVISION);
+    } catch (error) { result = captureFailure(error, state, split); }
+    await io.stdout(json ? JSON.stringify(result) + C.LF : D.humanResult(result));
     return result.exit_code;
   } catch { return C.EXIT_FAIL; }
 }

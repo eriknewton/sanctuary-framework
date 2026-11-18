@@ -63,7 +63,7 @@ TOOL_SCHEMAS = [
     {"name": "protection_rules", "description": "Requests are refused.", "parameters": {
         "type": "object", "properties": {}, "additionalProperties": False}},
 ]
-REMEMBER_SCHEMA = {"name": "remember", "description": "Save a memory persistently in Sanctuary.",
+REMEMBER_SCHEMA = {"name": "remember", "description": "Save a memory persistently in Sanctuary. Never say something was saved unless this returned saved.",
                    "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}
 SECONDS_PER_MS = 1 / 1000  # Monotonic clocks use seconds; contracts use milliseconds.
 
@@ -180,6 +180,7 @@ class _Call:
         self.sent = False
         self.sent_at = None
         self.abandoned = False
+        self.bounded = False
         self.result = OUTCOMES["unavailable"]
 
 
@@ -224,7 +225,7 @@ class Client:
             self._start_worker()
             self.condition.notify_all()
 
-    def call(self, name, args, *, deadline=None):
+    def call(self, name, args, *, deadline=None, bound_send=False):
         call = None
         try:
             deadline = deadline if deadline is not None else time.monotonic() + self.tool_seconds
@@ -232,12 +233,11 @@ class Client:
                 return OUTCOMES["denied"]
             if name == "memory_insert" and not isinstance(args.get("text"), str):
                 return OUTCOMES["denied"]
-            # Reserve the shim's 128-character id allowance before admission so oversized calls never spawn.
-            probe = {"jsonrpc": "2.0", "id": "0" * 128, "method": "tools/call", "params": {"name": name, "arguments": args}}
-            encoded = self._encode(probe)
+            encoded = call_line(name, args)
             if len(encoded) > MAX_STDIO_LINE_BYTES:
                 return OUTCOMES["denied"]
             call = _Call(name, json.loads(encoded)["params"]["arguments"], deadline)
+            call.bounded = bound_send
             with self.condition:
                 # A fixed FIFO waiting cap keeps repeated timed-out admission waves bounded.
                 if self.stopped or len(self.queue) >= MAX_QUEUED_CALLS or time.monotonic() >= call.deadline:
@@ -249,14 +249,17 @@ class Client:
             with self.condition:
                 if call.done.is_set():
                     return call.result
-                # A claimed send settles its byte accounting before the caller can classify it.
-                self.condition.wait_for(lambda: call.state != "sending")
+                # A claimed send settles its byte accounting before the caller can classify it, unless the caller
+                # bounds its whole wait at the deadline; a send still claimed then may already have delivered bytes,
+                # so it is classified as sent and an insert is never reported as not done.
+                settled = self.condition.wait_for(lambda: call.state != "sending",
+                                                  max(0, call.deadline - time.monotonic()) if bound_send else None)
                 if call.done.is_set():
                     return call.result
                 call.abandoned = True
                 if call in self.queue:
                     self.queue.remove(call)
-                return uncertain(name, call.sent)
+                return uncertain(name, call.sent or not settled)
         except (TypeError, ValueError, OverflowError, RecursionError):
             return OUTCOMES["denied"] if call is None else uncertain(name, call.sent)
         except Exception:
@@ -326,7 +329,9 @@ class Client:
         with self.condition:
             self.pending = pending
         self._write(self._encode({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}), deadline, call)
-        if call is not None and call.sent_at is not None:
+        # A bounded call's caller is gone at its deadline, so its reply wait ends there too: a send made late in the
+        # window never holds the connection, and the next call behind it, past the deadline its caller was given.
+        if call is not None and call.sent_at is not None and not call.bounded:
             deadline = call.sent_at + self.tool_seconds
         if not event.wait(max(0, deadline - time.monotonic())) or pending["reply"] is None:
             raise OSError("unavailable")
@@ -568,6 +573,19 @@ class Client:
             with suppress(Exception):
                 if self.worker is not None and self.worker is not threading.current_thread():
                     self.worker.join(self.exit_seconds)
+
+
+def call_line(name, args):
+    """Encode the request line a call would send; Client.call and the provider's capture size skip share this one check."""
+    # Reserve the shim's 128-character id allowance before admission so oversized calls never spawn.
+    return Client._encode({"jsonrpc": "2.0", "id": "0" * 128, "method": "tools/call", "params": {"name": name, "arguments": args}})
+
+
+def fits_line(name, args):
+    try:
+        return len(call_line(name, args)) <= MAX_STDIO_LINE_BYTES
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return False
 
 
 _client = None

@@ -95,6 +95,15 @@ export interface HermesBridgeAuditRecord {
   readonly reason?: string;
 }
 
+/**
+ * The audit principal string the bridge writes as `agent_id` for one agent id.
+ * One source for the bridge's own rows and for every reader that matches them.
+ */
+export function hermesBridgeAuditPrincipal(agentId: string): string {
+  // Must match the agent: form of callerIdentity in server/src/router.ts.
+  return `agent:${agentId}`;
+}
+
 export interface HermesBridgeCorePorts {
   readonly writeFrame: (input: NodeToRelayInput) => void;
   /**
@@ -780,6 +789,9 @@ export class HermesBridgeCore {
     );
   }
 
+  // Must match buildMemoryReport in server/src/cli/hermes-memory.ts: admitInsert issues each entry id once per
+  // process; assertAllowedToCommit sets commitIds from the admission context, and auditRefusedAdmission and
+  // auditUnconfirmed emit those ids only after durable admission (admissionDurable or hookAllowed).
   private auditRefusedAdmission(slot: InsertSlot): void {
     if (slot.refusedAfterAdmission === undefined || slot.refusalAudited ||
         !slot.admissionDurable) return;
@@ -797,8 +809,7 @@ export class HermesBridgeCore {
 
   private auditPrincipal(): { agent_id: string; requester_verified: false } {
     return {
-      // Must match the agent: form of callerIdentity in server/src/router.ts.
-      agent_id: `agent:${this.ports.agentId}`,
+      agent_id: hermesBridgeAuditPrincipal(this.ports.agentId),
       // The agent id is relay-pinned and uid-checked; the calling process, session and turn are not verified.
       requester_verified: false,
     };

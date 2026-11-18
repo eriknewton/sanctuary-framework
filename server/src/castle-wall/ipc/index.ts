@@ -27,3 +27,6 @@ export type {
 
 export type { ParseStep } from "./framing.js";
 export { frame, parseFrame, parseSingleFrame, MAX_FRAME_BYTES } from "./framing.js";
+
+export {CAP_BUSINESS_DELIVERY} from "./messages.js";
+export type {BusinessDrainResponse, BusinessDeliveryAckResponse} from "./messages.js";

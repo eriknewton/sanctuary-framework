@@ -275,6 +275,25 @@ pub enum IpcMessage {
     /// `after_seq`. Capped at `max_events`. Per scope-lock §8 hybrid pull
     /// model: main drives the pace; daemon never pushes audits unsolicited
     /// once the IPC link is healthy.
+    #[serde(rename = "business_drain_request")]
+    BusinessDrainRequest { request_id: String },
+    #[serde(rename = "business_drain_response")]
+    BusinessDrainResponse {
+        request_id: String,
+        event: Option<BusinessDrainEvent>,
+        error: Option<String>,
+    },
+    #[serde(rename = "business_delivery_ack")]
+    BusinessDeliveryAck {
+        request_id: String,
+        ack: serde_json::Value,
+    },
+    #[serde(rename = "business_delivery_ack_response")]
+    BusinessDeliveryAckResponse {
+        request_id: String,
+        ack: serde_json::Value,
+        ok: bool,
+    },
     #[serde(rename = "audit_drain_request")]
     AuditDrainRequest {
         request_id: String,
@@ -537,3 +556,20 @@ mod tests {
         }
     }
 }
+
+/// Exact Business event shape; must match event in signing/business-append-contract.json.
+/// Raw signature fields serialize explicit nulls because this stream carries exact signed envelopes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusinessDrainEvent {
+    pub seq: u64,
+    pub captured_at_unix_ms: u64,
+    pub prior_sha256_hex: Option<String>,
+    pub event_canonical_json: String,
+    pub critical: bool,
+    pub business_envelope: String,
+    pub producer_signature_b64url: Option<String>,
+    pub producer_key_id: Option<String>,
+}
+/// Must match CAP_BUSINESS_DELIVERY in server/src/castle-wall/ipc/messages.ts.
+pub const CAP_BUSINESS_DELIVERY: &str = "business_delivery_v1";

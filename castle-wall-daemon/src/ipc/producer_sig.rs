@@ -113,6 +113,8 @@ pub fn producer_signing_bytes(
 /// for the daemon's lifetime; the seed is never serialized back out except to
 /// the root-owned key file at first-boot generation.
 pub struct ProducerSigner {
+    #[cfg(feature = "test-isolation")]
+    raw_sign_calls: std::sync::atomic::AtomicUsize,
     signing_key: SigningKey,
 }
 
@@ -223,14 +225,22 @@ impl ProducerSigner {
         // Always (re)publish the public half so it stays consistent with the
         // private key currently in use.
         write_public_key(pub_path, &signing_key)?;
-        Ok(Self { signing_key })
+        Ok(Self {
+            signing_key,
+            #[cfg(feature = "test-isolation")]
+            raw_sign_calls: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     /// Construct directly from an in-memory signing key (tests).
     // Shipped builds cannot construct a producer from an unselected raw seed.
     #[cfg(feature = "legacy-raw-producer")]
     pub fn from_signing_key(signing_key: SigningKey) -> Self {
-        Self { signing_key }
+        Self {
+            signing_key,
+            #[cfg(feature = "test-isolation")]
+            raw_sign_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     /// Sign one drained enforcement event, returning the base64url-no-pad
@@ -241,9 +251,19 @@ impl ProducerSigner {
         captured_at_unix_ms: u64,
         seq: u64,
     ) -> String {
+        #[cfg(feature = "test-isolation")]
+        self.raw_sign_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let bytes = producer_signing_bytes(event_canonical_json, captured_at_unix_ms, seq);
         let sig = self.signing_key.sign(&bytes);
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+    }
+
+    /// Isolated callers observe actual raw signing at this instance's production call boundary.
+    #[cfg(feature = "test-isolation")]
+    pub fn raw_sign_calls_for_test(&self) -> usize {
+        self.raw_sign_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The base64url-no-pad verifying (public) key, for diagnostics/tests.

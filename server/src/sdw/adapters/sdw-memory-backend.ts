@@ -125,6 +125,8 @@ export const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
 // Exported: `sdw/memory-tools.ts` derives the memory_search needle byte cap
 // from this so the tool boundary and the store agree on "one chunk of text".
 export const DEFAULT_MAX_CHUNK_CHARS = 8192;
+/** A shipped Hermes save fits one public frame at DEFAULT_MAX_CHUNK_CHARS, so its passage has at most this many chunks. */
+export const HERMES_SAVE_MAX_CHUNKS = Math.ceil(MAX_PUBLIC_FRAME_BYTES / DEFAULT_MAX_CHUNK_CHARS);
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
 // Exported: `sdw/memory-tools.ts` applies the same default at the tool
 // boundary so an unattended memory_search never reaches the adapter unbounded.
@@ -270,6 +272,42 @@ export interface HermesBridgeCommitCheck {
   /** Shutdown, relay EOF, or equivalent bridge cancellation while waiting on the corpus lock. */
   readonly abortSignal?: AbortSignal;
   assertAllowedToCommit(context: HermesBridgeCommitContext): Promise<void>;
+}
+
+/** Decrypted document-record metadata that the owner verbs may show without the passage text. */
+export interface SdwMemoryOwnerRecordMetadata {
+  readonly passage_id: string;
+  readonly created_at: string;
+  readonly tags: readonly string[];
+  readonly byte_length: number | null;
+}
+
+/**
+ * Owner-side, three-valued inspection of one passage. `present` requires a
+ * decrypted text whose content hash and local provenance both verify;
+ * everything that cannot prove presence or absence is `indeterminate`.
+ */
+export type SdwMemoryOwnerInspection =
+  | { readonly state: "absent" }
+  | { readonly state: "indeterminate"; readonly reason: string; readonly metadata: SdwMemoryOwnerRecordMetadata | null }
+  | { readonly state: "present"; readonly text: string; readonly metadata: SdwMemoryOwnerRecordMetadata };
+
+/** One raw corpus record of a passage by storage key: the sha256 of its still-encrypted bytes, or null when absent. */
+export interface SdwMemoryRawRecordDigest {
+  readonly key: string;
+  readonly sha256: string | null;
+}
+
+/**
+ * Read-only digests of every raw record a delete touches: the document, each chunk the document lists,
+ * the provenance companion and the status record. `complete` is false when the decoded document lists more
+ * chunks than HERMES_SAVE_MAX_CHUNKS, or when no document is left to list them; an incomplete snapshot never
+ * compares equal. A read that throws is never recorded as incomplete: it propagates.
+ */
+export interface SdwMemoryPassageRawSnapshot {
+  readonly documentKey: string;
+  readonly complete: boolean;
+  readonly records: readonly SdwMemoryRawRecordDigest[];
 }
 
 export type SdwMemoryBackendAdapterModeOptions =
@@ -968,6 +1006,132 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     if (!eligibility.eligible) throw new SdwValidationError("auth_failed", "Hermes save signer refused");
     await this.readPassageText(document);
     return "completed";
+  }
+
+  /** The adapter's own document id for a passage in this owner scope; owner checks compare audit rows against it. */
+  ownerDocumentId(passageId: string): string {
+    return this.documentId(passageId);
+  }
+
+  /** Presence of the raw, still-encrypted document record: the visibility commit point, read without decrypting. */
+  async hasRawDocumentRecord(passageId: string): Promise<boolean> {
+    return await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(this.documentId(passageId))) !== null;
+  }
+
+  /**
+   * Owner inspection that never quarantines and never writes. Unlike getPassage,
+   * a provenance failure is reported, not persisted: the owner verbs run over a
+   * read-only guard and must leave the corpus byte-identical. Any throw, status
+   * record, missing or failing provenance, refused signer or decrypt failure is
+   * `indeterminate`, never `absent`, because none of them proves the passage gone.
+   */
+  async inspectPassageReadOnly(passageId: string): Promise<SdwMemoryOwnerInspection> {
+    const documentId = this.documentId(passageId);
+    if (await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId)) === null) {
+      return { state: "absent" };
+    }
+    let document: SdwDocumentRecord | null;
+    try {
+      document = await this.corpus.getDocument(documentId);
+    } catch {
+      return { state: "indeterminate", reason: "document_unreadable", metadata: null };
+    }
+    if (document === null) return { state: "indeterminate", reason: "document_changed", metadata: null };
+    const metadata = this.ownerRecordMetadata(document);
+    const indeterminate = (reason: string): SdwMemoryOwnerInspection => ({ state: "indeterminate", reason, metadata });
+    try {
+      if (await this.resolveMemoryIntegrityState() === "state_MARKER_ABSENT_POST_COMPLETE") return indeterminate("integrity_state");
+      // Any status record is treated as quarantine here; re-deciding it would be a write.
+      if (await this.corpus.getProvenanceStatusRaw(documentId) !== null) return indeterminate("quarantined");
+      const provenance = await this.corpus.getProvenanceRaw(documentId);
+      if (provenance === null) return indeterminate("unsigned");
+      const verified = this.verifyCompanion(document, provenance.record.companion);
+      if (!verified.ok) return indeterminate("provenance_unverified");
+      const eligibility = await evaluateMemoryProvenanceSignerEligibility({
+        companion: verified.value,
+        resolveSignerPublicKey: (identityId, did) => this.resolveSignerPublicKey(identityId, did),
+        badSignerAuthority: this.badSignerAuthority,
+      });
+      if (!eligibility.eligible) return indeterminate("signer_refused");
+      const text = await this.readPassageText(document);
+      if (await this.resolveMemoryIntegrityState() === "state_MARKER_ABSENT_POST_COMPLETE") return indeterminate("integrity_state");
+      return { state: "present", text, metadata: { ...metadata, byte_length: Buffer.byteLength(text, "utf8") } };
+    } catch {
+      return indeterminate("read_failed");
+    }
+  }
+
+  /**
+   * Snapshot a passage's raw records for comparison after a failed delete. It only reads, and it is
+   * bounded by HERMES_SAVE_MAX_CHUNKS: a document listing more chunks than one Hermes save can hold
+   * is recorded as incomplete instead of read, so the snapshot never costs more than one save's reads.
+   */
+  async snapshotPassageRawRecords(passageId: string): Promise<SdwMemoryPassageRawSnapshot> {
+    const documentId = this.documentId(passageId);
+    // A document read that throws or does not decode propagates, so the caller refuses before the delete's intent
+    // row rather than carrying a hidden I/O error into the delete. A document already gone has no chunks to list and
+    // gives an incomplete snapshot; the delete then finds nothing and records not_found.
+    const chunkCount = (await this.corpus.getDocumentRaw(documentId))?.record.chunk_count ?? null;
+    const complete = chunkCount !== null && chunkCount <= HERMES_SAVE_MAX_CHUNKS;
+    const keys = [documentKey(documentId), documentProvenanceKey(documentId), documentProvenanceStatusKey(documentId)];
+    for (let ordinal = 0; complete && ordinal < chunkCount!; ordinal++) {
+      keys.push(documentChunkKey(documentId, padChunkOrdinal(ordinal), chunkId(ordinal)));
+    }
+    return { documentKey: keys[0]!, complete, records: await this.rawRecordDigests(keys) };
+  }
+
+  /**
+   * Re-read exactly the snapshot's keys. Equal means every record is byte-identical to the snapshot;
+   * document_absent means the visibility commit point is gone; anything else is changed.
+   */
+  async compareWithPassageRawSnapshot(snapshot: SdwMemoryPassageRawSnapshot): Promise<"equal" | "document_absent" | "changed"> {
+    const reread = await this.rawRecordDigests(snapshot.records.map(record => record.key));
+    if (reread[0]?.key === snapshot.documentKey && reread[0].sha256 === null) return "document_absent";
+    const equal = snapshot.complete && reread.every((record, index) => record.sha256 === snapshot.records[index]!.sha256);
+    return equal ? "equal" : "changed";
+  }
+
+  private async rawRecordDigests(keys: readonly string[]): Promise<SdwMemoryRawRecordDigest[]> {
+    const digests: SdwMemoryRawRecordDigest[] = [];
+    for (const key of keys) {
+      const raw = await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, key);
+      digests.push({ key, sha256: raw === null ? null : Buffer.from(hash(raw)).toString("hex") });
+    }
+    return digests;
+  }
+
+  /**
+   * Decrypt only the owner scope's document records (no chunks, no provenance),
+   * bounded by the corpus scan cap. Unreadable records are counted, never
+   * skipped silently, and never decided as quarantined.
+   */
+  async listOwnerRecordMetadata(): Promise<{
+    readonly records: readonly SdwMemoryOwnerRecordMetadata[];
+    readonly unreadable: number;
+    readonly truncated: boolean;
+  }> {
+    const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
+    const truncated = entries.length > this.corpusScanCap;
+    const records: SdwMemoryOwnerRecordMetadata[] = [];
+    let unreadable = 0;
+    for (const entry of truncated ? entries.slice(0, this.corpusScanCap) : entries) {
+      try {
+        const document = await this.corpus.getDocument(entry.key.slice("doc.".length));
+        if (document !== null) records.push(this.ownerRecordMetadata(document));
+      } catch {
+        unreadable += 1;
+      }
+    }
+    return { records, unreadable, truncated };
+  }
+
+  private ownerRecordMetadata(document: SdwDocumentRecord): SdwMemoryOwnerRecordMetadata {
+    return {
+      passage_id: this.passageIdOf(document.document_id),
+      created_at: document.created_at,
+      tags: document.tags ?? [],
+      byte_length: document.byte_length ?? null,
+    };
   }
 
   async getPassage(passageId: string): Promise<MemoryPassage | null> {
@@ -2387,8 +2551,7 @@ export async function readHermesSaveIntent(options: {
   if (typeof documentId !== "string" || !isSdwIdentifier(documentId) || !documentId.startsWith(prefix) || !isSdwIdentifier(documentId.slice(prefix.length))) throw invalid();
   const chunkKeys = record.state.next_steps;
   // A shipped save fits one public frame and uses DEFAULT_MAX_CHUNK_CHARS; recovery work cannot exceed that bound.
-  const maxChunks = Math.ceil(MAX_PUBLIC_FRAME_BYTES / DEFAULT_MAX_CHUNK_CHARS);
-  if (!Array.isArray(chunkKeys) || chunkKeys.length < 1 || chunkKeys.length > maxChunks) throw invalid();
+  if (!Array.isArray(chunkKeys) || chunkKeys.length < 1 || chunkKeys.length > HERMES_SAVE_MAX_CHUNKS) throw invalid();
   // Authenticated intent bytes authorize only this document's contiguous chunk keys, never arbitrary storage keys.
   for (const [ordinal, key] of chunkKeys.entries()) {
     if (key !== documentChunkKey(documentId, padChunkOrdinal(ordinal), chunkId(ordinal))) throw invalid();

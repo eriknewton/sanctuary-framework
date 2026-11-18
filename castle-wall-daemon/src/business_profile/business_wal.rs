@@ -1,7 +1,7 @@
 //! Exact business envelopes in an isolated held store. Installed root selection remains disabled.
 use super::{
     activation_anchor as anchor,
-    append_clients::{DrainObservation, DrainReleaseFact, FrozenMutation},
+    append_clients::{CommitHold, DrainObservation, DrainReleaseFact, FrozenMutation},
     append_contract, drain_protocol, drain_store, records, records_schema, writer_protocol,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -61,6 +61,29 @@ fn allocation(name: &str) -> u64 {
 const LOCK: &str = "business-wal.lock";
 const CHECKPOINT: &str = "checkpoint.json";
 const STAGING: &str = "publication.stage";
+const JOURNAL: &str = "publication.journal";
+const JOURNAL_STAGE: &str = "journal.stage";
+// Eleven bounded fields plus the checksum wrapper fit 1024 bytes: target <=29,
+// four digests <=71 each, four decimal u64s <=20 each and fixed syntax <=201.
+const JOURNAL_MAX_BYTES: usize = 1024;
+const JOURNAL_RESERVE: u64 = 2 * JOURNAL_MAX_BYTES as u64;
+const _: () = assert!(JOURNAL_RESERVE <= 3264);
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationJournal {
+    version: u8,
+    target: String,
+    length: u64,
+    checksum: String,
+    predecessor: Option<String>,
+    checkpoint_checksum: Option<String>,
+    root_device: u64,
+    root_inode: u64,
+    lock_inode: u64,
+    control: bool,
+    retire: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     Root,
@@ -87,6 +110,8 @@ pub struct BusinessSequence(pub u64);
 pub struct StorageCursor(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalStep {
+    JournalPrepare,
+    JournalDurable,
     StageCreate,
     Write,
     FileSync,
@@ -185,6 +210,11 @@ struct Checkpoint {
     originals: Option<Identity>,
     next_cursor: u64,
 }
+/// An owned readback for ordinary reconciliation. Only the locked WAL constructs it.
+pub struct OrdinaryWalCheckpoint {
+    pub(crate) value: Value,
+    pub(crate) observed: u64,
+}
 pub struct CheckpointSeed {
     anchor: Value,
     join_bytes: Vec<u8>,
@@ -205,7 +235,7 @@ impl CheckpointSeed {
 /// This dependency is a trusted durable business sink, not an IPC ACK parser.
 /// It returns only after exact E, projection, join checkpoint and identity are atomically persisted and read back.
 /// Must match BusinessDurableSink in server/src/castle-wall/runtime/business-record-consumer.ts.
-mod sink_seal {
+pub(crate) mod sink_seal {
     pub trait Sealed {}
     // Isolated fixtures supply synthetic durable sinks; installed composition has no implementor yet.
     #[cfg(feature = "test-isolation")]
@@ -244,14 +274,20 @@ impl<T: TrustedBusinessSink> BusinessSinkAdapter<T> {
             pending: None,
         }
     }
-    pub fn deliver(&mut self, envelope: &DeliveryToken) -> Result<TsReleaseFact> {
-        // The token proves that W's previous delivery fact and cursor were read back.
-        let envelope = envelope.envelope();
-        let identity = Identity::from_envelope(envelope)?;
+    /// Offer one exact token without waiting for a peer; the caller polls outside the WAL worker.
+    pub fn offer(&mut self, token: &DeliveryToken) -> Result<()> {
+        let envelope = token.envelope();
+        Identity::from_envelope(envelope)?;
         if self.pending.as_ref().is_some_and(|b| b != envelope) {
             return Err(Refusal::Held);
         }
         self.pending = Some(envelope.to_vec());
+        Ok(())
+    }
+    /// Poll the trusted sink after offer. Only its durable correlated acceptance mints a fact.
+    pub fn complete(&mut self) -> Result<TsReleaseFact> {
+        let envelope = self.pending.as_ref().ok_or(Refusal::Missing)?;
+        let identity = Identity::from_envelope(envelope)?;
         let ack = self.sink.accept_durably(envelope)?;
         if !append_contract::shape("ack", &ack) || ack["identity"] != identity.value()? {
             return Err(Refusal::Conflict);
@@ -259,6 +295,69 @@ impl<T: TrustedBusinessSink> BusinessSinkAdapter<T> {
         self.pending = None;
         Ok(TsReleaseFact { identity })
     }
+    /// Synchronous fixture compatibility; composition uses offer/complete outside the store slot.
+    pub fn deliver(&mut self, envelope: &DeliveryToken) -> Result<TsReleaseFact> {
+        self.offer(envelope)?;
+        self.complete()
+    }
+}
+/// A trusted native adapter offers bytes and polls authenticated durable acceptance without blocking W.
+/// Must match BusinessSinkAdapter's exact-identity contract; only local fact persistence belongs in the WAL slot.
+pub trait PolledBusinessSink: sink_seal::Sealed + Send {
+    fn offer(&mut self, exact_envelope: &[u8]) -> Result<()>;
+    fn poll(&mut self) -> Result<Option<Value>>;
+    /// The last polled ACK was refused and minted no fact; the wait stays pending for a correlated ACK.
+    fn refused(&mut self) -> Result<()>;
+}
+/// One bounded peer wait retains exact E independently of the serialized store executor.
+pub struct PolledSinkAdapter<T: PolledBusinessSink> {
+    sink: T,
+    pending: Option<Vec<u8>>,
+}
+impl<T: PolledBusinessSink> PolledSinkAdapter<T> {
+    /// The native composition supplies the sealed authenticated sink.
+    pub fn new(sink: T) -> Self {
+        Self {
+            sink,
+            pending: None,
+        }
+    }
+    /// Re-offer only the same owned token; a deadline does not permit another delivery.
+    pub fn offer(&mut self, token: &DeliveryToken) -> Result<()> {
+        if let Some(pending) = &self.pending {
+            return if pending == token.envelope() {
+                self.sink.offer(token.envelope())
+            } else {
+                Err(Refusal::Held)
+            };
+        }
+        Identity::from_envelope(token.envelope())?;
+        self.pending = Some(token.envelope().to_vec());
+        self.sink.offer(token.envelope())
+    }
+    /// Only a correlated durable acceptance can consume this wait into a release fact.
+    pub fn poll(&mut self) -> Result<Option<TsReleaseFact>> {
+        let Some(envelope) = &self.pending else {
+            return Ok(None);
+        };
+        let Some(ack) = self.sink.poll()? else {
+            return Ok(None);
+        };
+        let identity = Identity::from_envelope(envelope)?;
+        if !append_contract::shape("ack", &ack) || ack["identity"] != identity.value()? {
+            // pending is still held, so no fact exists for this ACK; a sink latch taken for it must not wedge the wait.
+            // Must match NativeSink::refused in business_delivery.rs.
+            self.sink.refused()?;
+            return Err(Refusal::Conflict);
+        }
+        // Must stay paired with the fact_pending guards in business_delivery.rs: consuming pending prevents a second fact.
+        self.pending = None;
+        Ok(Some(TsReleaseFact { identity }))
+    }
+}
+struct RecoveryRead<'a> {
+    observation: &'a DrainObservation,
+    clock: &'a super::writer_peer::Clock,
 }
 struct PendingPublication {
     name: String,
@@ -275,6 +374,7 @@ pub struct BusinessWal {
     usage: [u64; 2],
     entries: usize,
     opened_active: Option<u64>,
+    live_effect: Option<u64>,
     state: WalState,
     pending: Option<PendingPublication>,
 }
@@ -399,6 +499,25 @@ fn held_root(path: &Path, owner: u32) -> Result<File> {
     current.sync_all().map_err(|_| Refusal::Io)?;
     Ok(current)
 }
+/// Startup can settle exact retained evidence, but this result never contains a SIGN or effect capability.
+pub enum RecoveryAction {
+    Held(CommitHold),
+    Ready,
+    Retry(FrozenMutation),
+    Original {
+        sequence: BusinessSequence,
+        envelope: Vec<u8>,
+    },
+    Observe,
+}
+/// ORIGINAL retries derive their stable request identity from exact retained E across a restart.
+pub fn original_request_id(envelope: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"sanctuary-business-original-v1");
+    hash.update(envelope);
+    // The wire request id is the first 128 bits of a domain-separated exact-envelope digest.
+    hex::encode(&hash.finalize()[..16])
+}
 impl BusinessWal {
     pub fn open_isolated(
         path: &Path,
@@ -406,7 +525,19 @@ impl BusinessWal {
         hooks: Box<dyn WalHooks>,
         seed: Option<CheckpointSeed>,
     ) -> Result<Self> {
-        Self::open_accounted(path, owner, hooks, seed, [0, 0])
+        Self::open_accounted(path, owner, hooks, seed, [0, 0], None)
+    }
+    /// Recovery may retire only an independently confirmed never-reserved orphan under this lock.
+    pub fn open_recovering(
+        path: &Path,
+        owner: u32,
+        hooks: Box<dyn WalHooks>,
+        seed: Option<CheckpointSeed>,
+        observation: &DrainObservation,
+        clock: &super::writer_peer::Clock,
+    ) -> Result<Self> {
+        let evidence = RecoveryRead { observation, clock };
+        Self::open_accounted(path, owner, hooks, seed, [0, 0], Some(&evidence))
     }
     fn open_accounted(
         path: &Path,
@@ -414,6 +545,7 @@ impl BusinessWal {
         hooks: Box<dyn WalHooks>,
         seed: Option<CheckpointSeed>,
         occupied: [u64; 2],
+        recovery: Option<&RecoveryRead<'_>>,
     ) -> Result<Self> {
         let root = held_root(path, owner)?;
         // Lock acquisition precedes enumeration, staging inspection and checkpoint reads. The inode is never unlinked.
@@ -455,18 +587,20 @@ impl BusinessWal {
                 originals: None,
                 next_cursor: 1,
             }),
-            usage: occupied,
+            usage: [occupied[0] + JOURNAL_RESERVE, occupied[1] + JOURNAL_RESERVE],
             entries: 0,
             opened_active: None,
+            live_effect: None,
             state: WalState::Ready,
             pending: None,
         };
+        store.recover_journal(initial.as_ref(), recovery)?;
         let mut rows = BTreeMap::new();
         // The cap counts stored rows; lock, checkpoint and one staging file are the only fixed entries.
         let directory = std::fs::read_dir(format!("/proc/self/fd/{}", store.root.as_raw_fd()))
             .map_err(|_| Refusal::Root)?;
         for (index, entry) in directory.enumerate() {
-            if index >= BUSINESS_WAL_ENTRIES_MAX + 3 {
+            if index >= BUSINESS_WAL_ENTRIES_MAX + 5 {
                 return Err(Refusal::Capacity);
             }
             let name = entry
@@ -476,7 +610,7 @@ impl BusinessWal {
                 .map_err(|_| Refusal::Shape)?;
             match name.as_str() {
                 LOCK => {}
-                STAGING => return Err(Refusal::Held),
+                STAGING | JOURNAL | JOURNAL_STAGE => return Err(Refusal::Held),
                 CHECKPOINT => {
                     let bytes = store.read(CHECKPOINT, CHECKPOINT_MAX_BYTES)?;
                     store.checkpoint = unpack(&bytes, CHECKPOINT_MAX_BYTES)?;
@@ -502,20 +636,21 @@ impl BusinessWal {
             }
         }
         if created {
-            if store.entries != 0 || store.usage != [0, 0] {
+            if store.entries != 0 || store.usage != [JOURNAL_RESERVE, JOURNAL_RESERVE] {
                 return Err(Refusal::Conflict);
             }
             let initial = initial.ok_or(Refusal::Missing)?;
             store.validate_checkpoint(&initial)?;
             store.save_checkpoint(initial)?;
         } else {
-            if store.usage[1] == 0 {
+            if store.usage[1] == JOURNAL_RESERVE {
                 return Err(Refusal::Missing);
             }
             store.validate_checkpoint(&store.checkpoint)?;
         }
         store.capacity(0, Pool::Ordinary)?;
         store.capacity(0, Pool::Control)?;
+        store.retire_orphan(&mut rows, recovery)?;
         store.validate_rows(&rows)?;
         store.opened_active = store.checkpoint.active;
         if !created {
@@ -553,6 +688,61 @@ impl BusinessWal {
     }
     pub fn committed_anchor(&self) -> &Value {
         &self.checkpoint.anchor
+    }
+    /// Read the durable ordinary evidence on the store worker, outside the wall poll loop.
+    /// The completion stamp follows every disk read; report assembly uses the older D/WAL stamp.
+    pub fn ordinary_checkpoint(
+        &self,
+        clock: &super::writer_peer::Clock,
+    ) -> Result<OrdinaryWalCheckpoint> {
+        self.ready()?;
+        let durable: Checkpoint = unpack(
+            &self.read(CHECKPOINT, CHECKPOINT_MAX_BYTES)?,
+            CHECKPOINT_MAX_BYTES,
+        )?;
+        if canonical(&durable)? != canonical(&self.checkpoint)? || durable.active.is_some() {
+            return Err(Refusal::Held);
+        }
+        self.validate_checkpoint(&durable)?;
+        let committed = durable.anchor["committed_sequence"]
+            .as_u64()
+            .ok_or(Refusal::Shape)?;
+        let drained = durable.anchor["drained_sequence"]
+            .as_u64()
+            .ok_or(Refusal::Shape)?;
+        let count = committed.checked_sub(drained).ok_or(Refusal::Conflict)?;
+        if count > super::drain_store::D_UNDRAINED_MAX as u64 {
+            return Err(Refusal::Capacity);
+        }
+        let mut retained = Vec::with_capacity(count as usize);
+        for sequence in drained + 1..=committed {
+            let row = self.row(sequence)?;
+            self.validate_row(&row)?;
+            if row.effect_status.is_some() || row.commit.is_none() {
+                return Err(Refusal::Held);
+            }
+            let envelope = decode_bytes(
+                row.envelope.as_ref().ok_or(Refusal::Missing)?,
+                writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
+            )?;
+            let record = writer_protocol::decode_envelope(&envelope).map_err(|_| Refusal::Shape)?;
+            retained.push(json!({"sequence":sequence,"commitment":records::join_commitment(&record).ok_or(Refusal::Shape)?}));
+        }
+        let join = records::decode_join_state(&decode_bytes(
+            &durable.join_state,
+            records::JOIN_STATE_BYTES_MAX,
+        )?)
+        .ok_or(Refusal::Shape)?;
+        let value = json!({"committed_sequence":committed,"committed_digest":durable.anchor["committed_digest"],
+            "drained_sequence":drained,"drained_digest":durable.anchor["drained_digest"],
+            "join_state":join,"retained_originals":retained,"unresolved_intent":false});
+        if !append_contract::shape("wal_checkpoint", &value) {
+            return Err(Refusal::Shape);
+        }
+        Ok(OrdinaryWalCheckpoint {
+            value,
+            observed: clock().map_err(|_| Refusal::Io)?,
+        })
     }
     fn read(&self, name: &str, cap: usize) -> Result<Vec<u8>> {
         let file = open_at(&self.root, name, libc::O_RDONLY)?;
@@ -609,6 +799,8 @@ impl BusinessWal {
         let released = c.released.as_ref().map_or(0, |i| i.sequence);
         let delivered = c.delivered.as_ref().map_or(0, |i| i.sequence);
         let originals = c.originals.as_ref().map_or(0, |i| i.sequence);
+        // Either missing fact leaves its cursor behind, so released cannot pass delivered or originals.
+        // Paired with the exact-fact predicate `(Some(d), Some(ts))` in BusinessWal::compact_one in business_wal.rs.
         if released > delivered
             || released > originals
             || originals > committed
@@ -767,6 +959,363 @@ impl BusinessWal {
         }
         Ok(())
     }
+    fn remove_private(&self, name: &str) -> Result<()> {
+        let file = open_at(&self.root, name, libc::O_RDONLY)?;
+        private_file(&file, self.owner)?;
+        let leaf = CString::new(name).map_err(|_| Refusal::Root)?;
+        if unsafe { libc::unlinkat(self.root.as_raw_fd(), leaf.as_ptr(), 0) } != 0 {
+            return Err(Refusal::Io);
+        }
+        self.root.sync_all().map_err(|_| Refusal::Io)?;
+        if !matches!(
+            open_at(&self.root, name, libc::O_RDONLY),
+            Err(Refusal::Missing)
+        ) {
+            return Err(Refusal::Held);
+        }
+        Ok(())
+    }
+    fn clear_journal(&self) -> Result<()> {
+        self.remove_private(JOURNAL)
+    }
+    fn write_stage(&self, bytes: &[u8]) -> Result<()> {
+        let mut stage = open_at(
+            &self.root,
+            STAGING,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        )?;
+        set_private_mode(&stage)?;
+        private_file(&stage, self.owner)?;
+        stage.write_all(bytes).map_err(|_| Refusal::Io)?;
+        stage.sync_all().map_err(|_| Refusal::Io)
+    }
+    fn write_journal(
+        &mut self,
+        target: &str,
+        bytes: &[u8],
+        pool: Pool,
+        retire: bool,
+    ) -> Result<()> {
+        let root = self.root.metadata().map_err(|_| Refusal::Io)?;
+        let lock = self._lock.metadata().map_err(|_| Refusal::Io)?;
+        let predecessor = match self.read(target, allocation(target) as usize) {
+            Ok(previous) => Some(checksum(&previous).0),
+            Err(Refusal::Missing) => None,
+            Err(e) => return Err(e),
+        };
+        let journal = PublicationJournal {
+            version: 1,
+            target: target.into(),
+            length: bytes.len() as u64,
+            checksum: checksum(bytes).0,
+            predecessor,
+            checkpoint_checksum: self
+                .read(CHECKPOINT, CHECKPOINT_MAX_BYTES)
+                .ok()
+                .map(|b| checksum(&b).0),
+            root_device: root.dev(),
+            root_inode: root.ino(),
+            lock_inode: lock.ino(),
+            control: pool == Pool::Control,
+            retire,
+        };
+        let bytes = pack(&journal)?;
+        if bytes.len() > JOURNAL_MAX_BYTES {
+            return Err(Refusal::Capacity);
+        }
+        // Journal durability precedes every guarded mutation; its two copies are reserved in both reviewed pools.
+        self.hooks.before(WalStep::JournalPrepare)?;
+        let mut stage = open_at(
+            &self.root,
+            JOURNAL_STAGE,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        )?;
+        set_private_mode(&stage)?;
+        stage.write_all(&bytes).map_err(|_| Refusal::Io)?;
+        stage.sync_all().map_err(|_| Refusal::Io)?;
+        let from = CString::new(JOURNAL_STAGE).map_err(|_| Refusal::Root)?;
+        let to = CString::new(JOURNAL).map_err(|_| Refusal::Root)?;
+        if unsafe {
+            libc::renameat(
+                self.root.as_raw_fd(),
+                from.as_ptr(),
+                self.root.as_raw_fd(),
+                to.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(Refusal::Io);
+        }
+        self.root.sync_all().map_err(|_| Refusal::Io)?;
+        if self.read(JOURNAL, JOURNAL_MAX_BYTES)? != bytes {
+            return Err(Refusal::Conflict);
+        }
+        self.hooks.before(WalStep::JournalDurable)?;
+        Ok(())
+    }
+    fn recover_journal(
+        &mut self,
+        seed: Option<&Checkpoint>,
+        observation: Option<&RecoveryRead<'_>>,
+    ) -> Result<()> {
+        let journal: PublicationJournal = match self.read(JOURNAL, JOURNAL_MAX_BYTES) {
+            Ok(bytes) => unpack(&bytes, JOURNAL_MAX_BYTES)?,
+            Err(Refusal::Missing) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let root = self.root.metadata().map_err(|_| Refusal::Io)?;
+        let lock = self._lock.metadata().map_err(|_| Refusal::Io)?;
+        if journal.version != 1
+            || journal.root_device != root.dev()
+            || journal.root_inode != root.ino()
+            || journal.lock_inode != lock.ino()
+            || journal.length > allocation(&journal.target)
+            || !(journal.target == CHECKPOINT
+                || journal
+                    .target
+                    .strip_prefix("row-")
+                    .and_then(|s| s.strip_suffix(".json"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .is_some_and(|n| row_name(n) == journal.target))
+            || !drain_protocol::digest(&journal.checksum)
+        {
+            return Err(Refusal::Held);
+        }
+        // A bounded scan charges every existing source and staging copy before recovery mutates the directory.
+        let mut usage = [JOURNAL_RESERVE; 2];
+        let mut has_rows = false;
+        let entries = std::fs::read_dir(format!("/proc/self/fd/{}", self.root.as_raw_fd()))
+            .map_err(|_| Refusal::Root)?;
+        for (index, entry) in entries.enumerate() {
+            if index >= BUSINESS_WAL_ENTRIES_MAX + 5 {
+                return Err(Refusal::Capacity);
+            }
+            let name = entry
+                .map_err(|_| Refusal::Io)?
+                .file_name()
+                .into_string()
+                .map_err(|_| Refusal::Shape)?;
+            let file = open_at(&self.root, &name, libc::O_RDONLY)?;
+            private_file(&file, self.owner)?;
+            match name.as_str() {
+                LOCK | JOURNAL => {}
+                JOURNAL_STAGE => return Err(Refusal::Held),
+                STAGING => usage[usize::from(journal.control)] += allocation(&journal.target),
+                CHECKPOINT => usage[1] += allocation(CHECKPOINT),
+                _ => {
+                    has_rows = true;
+                    let row: Row = unpack(&self.read(&name, ROW_MAX_BYTES)?, ROW_MAX_BYTES)?;
+                    self.validate_row(&row)?;
+                    if name != row_name(row.sequence) {
+                        return Err(Refusal::Shape);
+                    }
+                    usage[usize::from(row.control)] += ROW_MAX_BYTES as u64;
+                }
+            }
+        }
+        if usage[0] > BUSINESS_WAL_MAX_BYTES || usage[1] > BUSINESS_WAL_CONTROL_MAX_BYTES {
+            return Err(Refusal::Capacity);
+        }
+        let target = match self.read(&journal.target, allocation(&journal.target) as usize) {
+            Ok(bytes) => Some(bytes),
+            Err(Refusal::Missing) => None,
+            Err(e) => return Err(e),
+        };
+        // An initialization journal cannot turn a compacted or populated layout back into genesis.
+        if journal.target == CHECKPOINT && journal.predecessor.is_none() && has_rows {
+            return Err(Refusal::Held);
+        }
+        let hash = target.as_ref().map(|b| checksum(b).0);
+        if !(journal.retire && target.is_none())
+            && hash != journal.predecessor
+            && hash.as_ref() != Some(&journal.checksum)
+        {
+            return Err(Refusal::Held);
+        }
+        if journal.retire {
+            let cp: Checkpoint = unpack(
+                &self.read(CHECKPOINT, CHECKPOINT_MAX_BYTES)?,
+                CHECKPOINT_MAX_BYTES,
+            )?;
+            self.validate_checkpoint(&cp)?;
+            if journal.checkpoint_checksum
+                != Some(checksum(&self.read(CHECKPOINT, CHECKPOINT_MAX_BYTES)?).0)
+                || Some(journal.target.clone())
+                    != cp.anchor["committed_sequence"]
+                        .as_u64()
+                        .and_then(|n| n.checked_add(1))
+                        .map(row_name)
+            {
+                return Err(Refusal::Held);
+            }
+            let observation = observation.ok_or(Refusal::Held)?;
+            if !Self::unreserved(&cp, observation) {
+                return Err(Refusal::Held);
+            }
+            if let Some(bytes) = target {
+                let row: Row = unpack(&bytes, ROW_MAX_BYTES)?;
+                self.check_orphan(&cp, &row)?;
+                self.remove_private(&journal.target)?;
+            }
+            return self.clear_journal();
+        }
+        let staged = match self.read(STAGING, allocation(&journal.target) as usize) {
+            Ok(bytes) => Some(bytes),
+            Err(Refusal::Missing) => None,
+            Err(e) => return Err(e),
+        };
+        let exact = |bytes: &Vec<u8>| {
+            bytes.len() as u64 == journal.length && checksum(bytes).0 == journal.checksum
+        };
+        let source = staged
+            .as_ref()
+            .filter(|b| exact(b))
+            .or_else(|| target.as_ref().filter(|b| exact(b)))
+            .cloned()
+            .or_else(|| {
+                if journal.target == CHECKPOINT && journal.predecessor.is_none() {
+                    seed.and_then(|c| pack(c).ok()).filter(exact)
+                } else {
+                    None
+                }
+            })
+            .ok_or(Refusal::Held)?;
+        if journal.target == CHECKPOINT {
+            if !journal.control {
+                return Err(Refusal::Held);
+            }
+            let next: Checkpoint = unpack(&source, CHECKPOINT_MAX_BYTES)?;
+            self.validate_checkpoint(&next)?;
+            if hash.as_ref() != Some(&journal.checksum) && next.active.is_some() {
+                // Unpublished intent activation grants no reservation authority; retain the old checkpoint for orphan retirement.
+                if staged.is_some() {
+                    self.remove_private(STAGING)?;
+                }
+                return self.clear_journal();
+            }
+        } else {
+            let row: Row = unpack(&source, ROW_MAX_BYTES)?;
+            self.validate_row(&row)?;
+            if row_name(row.sequence) != journal.target || row.control != journal.control {
+                return Err(Refusal::Held);
+            }
+        }
+        if staged.as_ref().is_some_and(|b| !exact(b)) {
+            let partial = staged.as_ref().ok_or(Refusal::Held)?;
+            // Only a strict prefix of the owned complete source is a recoverable partial stage.
+            if partial.len() >= source.len() || !source.starts_with(partial) {
+                return Err(Refusal::Conflict);
+            }
+            self.remove_private(STAGING)?;
+        }
+        if !staged.as_ref().is_some_and(exact) {
+            self.write_stage(&source)?;
+        }
+        // Complete owned stages are reverified and renamed, never truncated by a retry.
+        open_at(&self.root, STAGING, libc::O_RDONLY)?
+            .sync_all()
+            .map_err(|_| Refusal::Io)?;
+        let from = CString::new(STAGING).map_err(|_| Refusal::Root)?;
+        let to = CString::new(journal.target.as_str()).map_err(|_| Refusal::Root)?;
+        if unsafe {
+            libc::renameat(
+                self.root.as_raw_fd(),
+                from.as_ptr(),
+                self.root.as_raw_fd(),
+                to.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(Refusal::Io);
+        }
+        self.root.sync_all().map_err(|_| Refusal::Io)?;
+        if self.read(&journal.target, source.len())? != source {
+            return Err(Refusal::Conflict);
+        }
+        self.clear_journal()
+    }
+    fn unreserved(cp: &Checkpoint, evidence: &RecoveryRead<'_>) -> bool {
+        // Disk/journal evidence cannot renew D authority; retirement uses the original authenticated READ lease.
+        let fresh = (evidence.clock)()
+            .ok()
+            .and_then(|now| now.checked_sub(evidence.observation.observed()))
+            .is_some_and(|age| {
+                age < drain_protocol::D_LEASE_MS as u64 * super::writer_peer::NS_PER_MS
+            });
+        let d = evidence.observation.value();
+        fresh
+            && d["state"] == "PRESENT"
+            && d["uncertain"] == false
+            && d["latched"] == false
+            && d["anchor"] == cp.anchor
+            && cp.active.is_none()
+            && cp.anchor["reserved_sequence"] == cp.anchor["committed_sequence"]
+    }
+    fn check_orphan(&self, cp: &Checkpoint, row: &Row) -> Result<()> {
+        self.validate_row(row)?;
+        if Some(row.sequence)
+            != cp.anchor["committed_sequence"]
+                .as_u64()
+                .and_then(|n| n.checked_add(1))
+            || row.storage_cursor != cp.next_cursor
+            || cp.active.is_some()
+            || row.sign_may_have_been_sent
+            || row.envelope.is_some()
+            || row.commit.is_some()
+            || row.effect_status.is_some()
+            || row.d_fact.is_some()
+            || row.ts_fact.is_some()
+        {
+            return Err(Refusal::Held);
+        }
+        let reserve = FrozenMutation::checked(decode_bytes(
+            &row.reserve,
+            drain_protocol::D_REQUEST_MAX_BYTES,
+        )?)
+        .map_err(|_| Refusal::Shape)?;
+        if reserve.expected() != &cp.anchor {
+            return Err(Refusal::Held);
+        }
+        Ok(())
+    }
+    fn retire_orphan(
+        &mut self,
+        rows: &mut BTreeMap<u64, Row>,
+        observation: Option<&RecoveryRead<'_>>,
+    ) -> Result<()> {
+        let committed = self.checkpoint.anchor["committed_sequence"]
+            .as_u64()
+            .ok_or(Refusal::Shape)?;
+        if self.checkpoint.active.is_some() {
+            return Ok(());
+        }
+        let Some(row) = rows
+            .range(committed + 1..)
+            .next()
+            .map(|(_, row)| row.clone())
+        else {
+            return Ok(());
+        };
+        self.check_orphan(&self.checkpoint, &row)?;
+        if !Self::unreserved(&self.checkpoint, observation.ok_or(Refusal::Held)?) {
+            return Err(Refusal::Held);
+        }
+        let name = row_name(row.sequence);
+        let pool = if row.control {
+            Pool::Control
+        } else {
+            Pool::Ordinary
+        };
+        let bytes = self.read(&name, ROW_MAX_BYTES)?;
+        // Fresh independent D evidence proves no reservation; neither journal nor local row may authorize adoption.
+        self.write_journal(&name, &bytes, pool, true)?;
+        self.remove_private(&name)?;
+        self.clear_journal()?;
+        self.usage[pool_index(pool)] -= ROW_MAX_BYTES as u64;
+        self.entries -= 1;
+        rows.remove(&row.sequence);
+        Ok(())
+    }
     fn publish(&mut self, name: String, bytes: Vec<u8>, pool: Pool) -> Result<()> {
         self.ready()?;
         self.capacity(allocation(&name), pool)?;
@@ -788,6 +1337,9 @@ impl BusinessWal {
         });
         self.state = WalState::PublicationHeld;
         let result = (|| {
+            let pending = self.pending.as_ref().ok_or(Refusal::Held)?;
+            let (name, bytes, pool) = (pending.name.clone(), pending.bytes.clone(), pending.pool);
+            self.write_journal(&name, &bytes, pool, false)?;
             self.hooks.before(WalStep::StageCreate)?;
             let mut stage = open_at(
                 &self.root,
@@ -828,6 +1380,7 @@ impl BusinessWal {
         if self.read(&pending.name, pending.bytes.len())? != pending.bytes {
             return Err(Refusal::Conflict);
         }
+        self.clear_journal()?;
         self.complete_publication()
     }
     /// Reconcile only the exact owned publication. No new request, cursor or permission is inferred.
@@ -863,8 +1416,20 @@ impl BusinessWal {
             stage.write_all(&bytes).map_err(|_| Refusal::Io)?;
         }
         let pending = self.pending.as_ref().ok_or(Refusal::Held)?;
-        if self.read(STAGING, pending.bytes.len())? != pending.bytes {
-            return Err(Refusal::Conflict);
+        let staged = self.read(STAGING, pending.bytes.len())?;
+        if staged != pending.bytes {
+            if staged.len() >= pending.bytes.len() || !pending.bytes.starts_with(&staged) {
+                return Err(Refusal::Conflict);
+            }
+            let bytes = pending.bytes.clone();
+            // The durable journal and retained exact source distinguish an owned partial write from foreign bytes.
+            let journal: PublicationJournal =
+                unpack(&self.read(JOURNAL, JOURNAL_MAX_BYTES)?, JOURNAL_MAX_BYTES)?;
+            if journal.checksum != checksum(&bytes).0 {
+                return Err(Refusal::Conflict);
+            }
+            self.remove_private(STAGING)?;
+            self.write_stage(&bytes)?;
         }
         self.hooks.before(WalStep::FileSync)?;
         open_at(&self.root, STAGING, libc::O_RDONLY)?
@@ -926,6 +1491,12 @@ impl BusinessWal {
         }
         let b = records::decode(body).ok_or(Refusal::Shape)?;
         let sequence = b["sequence"].as_u64().ok_or(Refusal::Shape)?;
+        // Admission checks the complete shared join against durable relying state before RESERVE or SIGN.
+        // The shape-only placeholder is discarded and never treated as a signature or persisted commitment.
+        let unsigned = writer_protocol::envelope(body, &[0; 64]).map_err(|_| Refusal::Shape)?;
+        let unsigned = writer_protocol::decode_envelope(&unsigned).map_err(|_| Refusal::Shape)?;
+        let join = records::decode_join_state(&self.committed_join()?).ok_or(Refusal::Shape)?;
+        records::advance(&join, &unsigned).map_err(|_| Refusal::Authority)?;
         if reserve.expected() != &self.checkpoint.anchor
             || Some(sequence)
                 != self.checkpoint.anchor["committed_sequence"]
@@ -972,6 +1543,7 @@ impl BusinessWal {
         c.active = Some(sequence);
         c.next_cursor = c.next_cursor.checked_add(1).ok_or(Refusal::Capacity)?;
         self.save_checkpoint(c)?;
+        self.live_effect = Some(sequence);
         Ok(BusinessSequence(sequence))
     }
     fn active(&self) -> Result<Row> {
@@ -1090,6 +1662,35 @@ impl BusinessWal {
         checkpoint.anchor = expected;
         self.save_checkpoint(checkpoint)
     }
+    /// Only the current live append can consume its durable unknown marker completion.
+    pub(crate) fn mark_effect_unknown(
+        &mut self,
+        sequence: BusinessSequence,
+    ) -> Result<super::effect_permit::MarkerCompletion> {
+        self.ready()?;
+        let mut row = self.row(sequence.0)?;
+        if self.live_effect != Some(sequence.0)
+            || row.effect_status.is_some()
+            || self.checkpoint.anchor["committed_sequence"] != sequence.0
+            || self.checkpoint.active.is_some()
+        {
+            return Err(Refusal::Held);
+        }
+        let envelope = decode_bytes(
+            row.envelope.as_ref().ok_or(Refusal::Missing)?,
+            writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
+        )?;
+        let identity = Identity::from_envelope(&envelope)?;
+        // Persist/read back the existing current-format unknown marker before releasing the live-only completion.
+        row.effect_status = Some("unknown".into());
+        self.live_effect = None;
+        self.save_row(&row)?;
+        Ok(super::effect_permit::MarkerCompletion::from_wal(
+            sequence.0,
+            identity.commitment,
+            identity.envelope_sha256,
+        ))
+    }
     pub fn next_delivery(&self) -> Result<Option<(BusinessSequence, DeliveryToken)>> {
         self.ready()?;
         let next = self
@@ -1120,8 +1721,9 @@ impl BusinessWal {
     pub fn persist_ts_fact(
         &mut self,
         sequence: BusinessSequence,
-        fact: TsReleaseFact,
+        fact: impl std::borrow::Borrow<TsReleaseFact>,
     ) -> Result<()> {
+        let fact = fact.borrow();
         self.ready()?;
         let mut row = self.row(sequence.0)?;
         let expected = self
@@ -1143,7 +1745,7 @@ impl BusinessWal {
         self.save_row(&row)?;
         // Must match BusinessDeliveryAck's W barrier: n+1 is unavailable until both fact and cursor read back.
         let mut c = self.checkpoint.clone();
-        c.delivered = Some(fact.identity);
+        c.delivered = Some(fact.identity.clone());
         self.save_checkpoint(c)
     }
     pub fn persist_d_fact(
@@ -1193,6 +1795,8 @@ impl BusinessWal {
             return Ok(false);
         }
         let row = self.row(sequence)?;
+        // On reachable paths the cursor-order checks dominate a missing fact; keep both barriers.
+        // Paired with `released > delivered || released > originals` in BusinessWal::validate_checkpoint in business_wal.rs.
         let (Some(d), Some(ts)) = (&row.d_fact, &row.ts_fact) else {
             return Ok(false);
         };
@@ -1228,6 +1832,148 @@ impl BusinessWal {
     pub fn storage_cursor(&self, sequence: BusinessSequence) -> Result<StorageCursor> {
         Ok(StorageCursor(self.row(sequence.0)?.storage_cursor))
     }
+    /// Settlement reads the durable active-intent bit on the owned worker before selecting a reconnect continuation.
+    pub(crate) fn settlement_active(&self) -> Result<bool> {
+        self.ready()?;
+        let durable: Checkpoint = unpack(
+            &self.read(CHECKPOINT, CHECKPOINT_MAX_BYTES)?,
+            CHECKPOINT_MAX_BYTES,
+        )?;
+        // Local confirmation is proved by exact durable checkpoint bytes, never inferred from a D ACK.
+        if canonical(&durable)? != canonical(&self.checkpoint)? {
+            return Err(Refusal::Held);
+        }
+        Ok(durable.active.is_some())
+    }
+    /// Reconcile a fresh authenticated producer view with loaded exact bytes without granting a new effect.
+    pub fn recovery_action(
+        &mut self,
+        observation: &DrainObservation,
+        clock: &super::writer_peer::Clock,
+    ) -> Result<RecoveryAction> {
+        self.ready()?;
+        let now = clock().map_err(|_| Refusal::Deadline)?;
+        if now < observation.observed()
+            || now - observation.observed()
+                >= drain_protocol::D_LEASE_MS as u64 * super::writer_peer::NS_PER_MS
+        {
+            return Err(Refusal::Deadline);
+        }
+        let value = observation.value();
+        if value["state"] != "PRESENT" || value["uncertain"] != false {
+            return Err(Refusal::Authority);
+        }
+        if self.checkpoint.active.is_some() {
+            let row = self.active()?;
+            // Outstanding-at-open bodies never acquire first-SIGN authority. Missing exact E remains held for recovery.
+            let envelope = decode_bytes(
+                row.envelope.as_ref().ok_or(Refusal::Held)?,
+                writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
+            )?;
+            if row.commit.is_none() {
+                let reserve = FrozenMutation::checked(decode_bytes(
+                    &row.reserve,
+                    drain_protocol::D_REQUEST_MAX_BYTES,
+                )?)
+                .map_err(|_| Refusal::Shape)?;
+                if !observation.confirms(&reserve) {
+                    return Err(Refusal::Held);
+                }
+                let identity = Identity::from_envelope(&envelope)?;
+                let mut next = reserve.next().clone();
+                next["committed_sequence"] = json!(identity.sequence);
+                next["committed_digest"] = json!(identity.commitment);
+                next["reserved_body_digest"] = Value::Null;
+                let body = decode_bytes(&row.body, records_schema::MAX_BYTES)?;
+                let mut hash = Sha256::new();
+                hash.update(b"sanctuary-business-commit-v1");
+                hash.update(&envelope);
+                // A first COMMIT is frozen durably before send; retries thereafter use these exact stored bytes.
+                let id = hex::encode(&hash.finalize()[..16]);
+                let proposal = super::append_actor::mutation(
+                    &id,
+                    "COMMIT",
+                    reserve.next(),
+                    &next,
+                    &body,
+                    &envelope,
+                )?;
+                self.freeze_commit(&proposal)?;
+                return Ok(RecoveryAction::Observe);
+            }
+            let commit = FrozenMutation::checked(decode_bytes(
+                row.commit.as_ref().ok_or(Refusal::Held)?,
+                drain_protocol::D_REQUEST_MAX_BYTES,
+            )?)
+            .map_err(|_| Refusal::Shape)?;
+            let reserve = FrozenMutation::checked(decode_bytes(
+                &row.reserve,
+                drain_protocol::D_REQUEST_MAX_BYTES,
+            )?)
+            .map_err(|_| Refusal::Shape)?;
+            let body = decode_bytes(&row.body, records_schema::MAX_BYTES)?;
+            if let Some(report) = CommitHold::changed_predecessor(
+                observation,
+                &reserve,
+                &commit,
+                &body,
+                "startup READ",
+            ) {
+                // Loaded requests remain exact; a changed predecessor cannot license a drain or a replacement CAS.
+                return Ok(RecoveryAction::Held(report));
+            }
+            if value["latched"] != false {
+                return Err(Refusal::Held);
+            }
+            if !row.sign_may_have_been_sent || envelope.is_empty() {
+                return Err(Refusal::Held);
+            }
+            if observation.confirms(&commit) {
+                self.confirm_commit(observation)?;
+                return Ok(RecoveryAction::Observe);
+            }
+            if &value["anchor"] == commit.expected() {
+                return Ok(RecoveryAction::Retry(commit));
+            }
+            return Err(Refusal::Held);
+        }
+        if value["latched"] != false {
+            return Err(Refusal::Held);
+        }
+        // Only this no-active-intent branch may produce ORIGINAL; draining a frozen COMMIT would stale its predecessor, with no proved renewal.
+        let next = self
+            .checkpoint
+            .originals
+            .as_ref()
+            .map_or(0, |i| i.sequence)
+            .checked_add(1)
+            .ok_or(Refusal::Capacity)?;
+        let committed = self.checkpoint.anchor["committed_sequence"]
+            .as_u64()
+            .ok_or(Refusal::Shape)?;
+        if next <= committed {
+            let row = self.row(next)?;
+            let envelope = decode_bytes(
+                row.envelope.as_ref().ok_or(Refusal::Held)?,
+                writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
+            )?;
+            let identity = Identity::from_envelope(&envelope)?;
+            let mut accepted = self.checkpoint.anchor.clone();
+            accepted["drained_sequence"] = json!(next);
+            accepted["drained_digest"] = json!(identity.commitment);
+            // Lost ORIGINAL_ACK permits only exact replay at the immediate head, never a later-cursor release inference.
+            if value["anchor"] != self.checkpoint.anchor && value["anchor"] != accepted {
+                return Err(Refusal::Held);
+            }
+            return Ok(RecoveryAction::Original {
+                sequence: BusinessSequence(next),
+                envelope,
+            });
+        }
+        // A drain under a frozen COMMIT would stale its predecessor, and no proved renewal exists.
+        self.refresh_drained(observation)?;
+        Ok(RecoveryAction::Ready)
+    }
     pub fn active_body_digest(&self) -> Result<BodyDigest> {
         Ok(BodyDigest(self.active()?.body_digest))
     }
@@ -1244,6 +1990,18 @@ impl BusinessWal {
 #[cfg(feature = "test-isolation")]
 pub mod test_support {
     use super::*;
+    /// Exercise the same live marker completion without constructing one from test data.
+    pub fn mark_effect(
+        wal: &mut BusinessWal,
+        sequence: BusinessSequence,
+    ) -> Result<super::super::effect_permit::MarkerCompletion> {
+        wal.mark_effect_unknown(sequence)
+    }
+    /// Return the reviewed metadata reservation for independent pool accounting assertions.
+    pub fn journal_reserve() -> u64 {
+        JOURNAL_RESERVE
+    }
+
     /// Reopen with isolated occupancy representing other retained rows in the same pools.
     pub fn reopen_accounted(
         path: &Path,
@@ -1251,7 +2009,36 @@ pub mod test_support {
         hooks: Box<dyn WalHooks>,
         occupied: [u64; 2],
     ) -> Result<BusinessWal> {
-        BusinessWal::open_accounted(path, owner, hooks, None, occupied)
+        // The injected total already includes fixed journal reservation; avoid charging it twice on reopen.
+        BusinessWal::open_accounted(
+            path,
+            owner,
+            hooks,
+            None,
+            [
+                occupied[0].saturating_sub(JOURNAL_RESERVE),
+                occupied[1].saturating_sub(JOURNAL_RESERVE),
+            ],
+            None,
+        )
+    }
+    /// Combine bounded occupancy with the same authenticated orphan-retirement authority used at startup.
+    pub fn reopen_recovering_accounted(
+        path: &Path,
+        owner: u32,
+        hooks: Box<dyn WalHooks>,
+        occupied: [u64; 2],
+        observation: &DrainObservation,
+        clock: &super::super::writer_peer::Clock,
+    ) -> Result<BusinessWal> {
+        BusinessWal::open_accounted(
+            path,
+            owner,
+            hooks,
+            None,
+            occupied.map(|bytes| bytes.saturating_sub(JOURNAL_RESERVE)),
+            Some(&RecoveryRead { observation, clock }),
+        )
     }
     /// Isolated accounting boundary stimulus; it cannot select an installed root.
     pub fn accounting(wal: &mut BusinessWal, ordinary: u64, control: u64, entries: usize) {

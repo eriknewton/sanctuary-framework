@@ -1,6 +1,7 @@
 // fail-before-exempt: test lifecycle for the recovery custody check; behavior unchanged
 import { channel } from "node:diagnostics_channel";
 import * as custodyModule from "../../src/core/master-custody.js";
+import * as custodyCredentialModule from "../../src/wrap/custody-credential.js";
 import * as lockModule from "../../src/storage/cross-process-lock.js";
 import { Server } from "node:net";
 import { existsSync } from "node:fs";
@@ -799,6 +800,9 @@ describe("Hermes save operator recovery", () => {
   it.each([false, true])("appends release failure after the callback refuses missing credentials (apply=%s)", async apply => {
     const f = await fixture();
     const failure = new CrossProcessLockError("custody lock listener close failed", "io");
+    // No explicit source and no host-local credential that opens the fortress: the callback refuses.
+    vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential")
+      .mockResolvedValue({ kind: "fail-closed", message: "keychain locked fixture", report: {} as never });
     let err = "";
     const { result, observedFailure } = await withRecoveryLease(() => runHermesRecoverSave({
       argv: ["recover-save", "--fortress", f.fortress, ...(apply ? ["--apply"] : [])], env: { HOME: f.home },
@@ -807,7 +811,7 @@ describe("Hermes save operator recovery", () => {
     }), { releaseFailure: failure });
     expect(observedFailure).toBe(failure);
     expect(result).toBe(1); // Both refusal and failed release require failure status.
-    expect(err).toBe("Recovery requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n" +
+    expect(err).toBe("Recovery requires this Mac's keychain item or stored passphrase, SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n" +
       "Fortress custody could not be released cleanly; any work the command already reported as complete was committed.\n");
   });
 
@@ -872,6 +876,114 @@ describe("Hermes save operator recovery", () => {
     const f = await fixture();
     if (state !== "absent") await save(f, "target", SAVE_TEXT, state);
     expect(await direct(f, false, json)).toEqual({ code: 0, out: output, err: "" }); // Zero is successful report and release.
+  });
+
+  it("opens the fortress with host-local custody when no explicit source is given", async () => {
+    const f = await fixture();
+    const resolve = vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential");
+    const unlock = vi.spyOn(custodyModule, "unlockExistingMasterReadOnly");
+    let out = "";
+    let err = "";
+    const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress], env: { HOME: f.home },
+      stdout: { write: value => { out += String(value); return true; } }, stderr: { write: value => { err += String(value); return true; } } });
+    expect({ code, out, err }).toEqual({ code: 0, out: "nothing to recover\n", err: "" });
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(unlock.mock.calls[0]![1]).toMatchObject({ passphrase: PASS });
+  });
+
+  it("keeps explicit passphrase sources unchanged and does not consult host-local custody for them", async () => {
+    const f = await fixture();
+    const resolve = vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential");
+    expect(await direct(f, false)).toEqual({ code: 0, out: "nothing to recover\n", err: "" });
+    let out = "";
+    const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress, "--passphrase", PASS], env: { HOME: f.home },
+      stdout: { write: value => { out += String(value); return true; } }, stderr: { write: () => true } });
+    expect({ code, out }).toEqual({ code: 0, out: "nothing to recover\n" });
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("refuses a recovery key offered beside a host-local credential, before the command's own unlock", async () => {
+    const f = await fixture();
+    // The resolver verifies its candidate by unlocking; the command's own unlock is the one that must not run.
+    const unlock = vi.spyOn(custodyModule, "unlockExistingMasterReadOnly");
+    const resolve = vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential");
+    let err = "";
+    const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress],
+      env: { HOME: f.home, SANCTUARY_RECOVERY_KEY: "recovery fixture value" },
+      stdout: { write: () => { throw new Error("Refusal must not write stdout"); } }, stderr: { write: value => { err += String(value); return true; } } });
+    expect(code).toBe(1);
+    expect(err).toBe("A keychain item or stored passphrase already opens this fortress; unset SANCTUARY_RECOVERY_KEY. Nothing was changed.\n");
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(unlock.mock.calls.some(call => "recoveryKey" in call[1])).toBe(false);
+    // The single unlock is the resolver verifying the stored passphrase; the command added none.
+    expect(unlock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses an environment recovery key when no host-local credential opens the fortress", async () => {
+    const f = await fixture();
+    vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential")
+      .mockResolvedValue({ kind: "fail-closed", message: "keychain locked fixture", report: {} as never });
+    const unlock = vi.spyOn(custodyModule, "unlockExistingMasterReadOnly").mockRejectedValue(new Error("wrong recovery key fixture"));
+    const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress],
+      env: { HOME: f.home, SANCTUARY_RECOVERY_KEY: "recovery fixture value" }, stdout: { write: () => true }, stderr: { write: () => true } });
+    expect(code).toBe(1);
+    expect(unlock.mock.calls[0]![1]).toMatchObject({ recoveryKey: "recovery fixture value" });
+  });
+
+  it("refuses a virgin fortress without minting custody", async () => {
+    const f = await fixture();
+    vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential").mockResolvedValue({ kind: "virgin" });
+    const unlock = vi.spyOn(custodyModule, "unlockExistingMasterReadOnly");
+    let err = "";
+    const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress], env: { HOME: f.home },
+      stdout: { write: () => true }, stderr: { write: value => { err += String(value); return true; } } });
+    expect(code).toBe(1);
+    expect(err).toBe("This fortress has no custody to open; nothing was changed.\n");
+    expect(unlock).not.toHaveBeenCalled();
+  });
+
+  it.each(["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"])("over SSH (%s) with no explicit source refuses without asking the keychain", async name => {
+    const f = await fixture();
+    const resolve = vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential");
+    const unlock = vi.spyOn(custodyModule, "unlockExistingMasterReadOnly");
+    let err = "";
+    const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress], env: { HOME: f.home, [name]: "203.0.113.9 22" },
+      stdout: { write: () => { throw new Error("Refusal must not write stdout"); } }, stderr: { write: value => { err += String(value); return true; } } });
+    expect(code).toBe(1);
+    expect(err).toContain("Over SSH, recover-save needs --passphrase, SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY");
+    expect(err).toContain("run it at the Mac's own keyboard");
+    expect(resolve).not.toHaveBeenCalled();
+    expect(unlock).not.toHaveBeenCalled();
+  });
+
+  it.each(["passphrase", "recovery-key"] as const)("over SSH an explicit %s proceeds as before host-local custody, without asking the keychain", async kind => {
+    const f = await fixture();
+    const resolve = vi.spyOn(custodyCredentialModule, "resolveHostLocalBootCredential");
+    // The recovery key arm stops at its unlock; reaching it with that key is the behavior under test.
+    const unlock = kind === "recovery-key"
+      ? vi.spyOn(custodyModule, "unlockExistingMasterReadOnly").mockRejectedValue(new Error("wrong recovery key fixture"))
+      : vi.spyOn(custodyModule, "unlockExistingMasterReadOnly");
+    let out = "";
+    const code = await runHermesRecoverSave({
+      argv: ["recover-save", "--fortress", f.fortress, ...(kind === "passphrase" ? ["--passphrase", PASS] : [])],
+      env: { HOME: f.home, SSH_TTY: "/dev/ttys004", ...(kind === "recovery-key" ? { SANCTUARY_RECOVERY_KEY: "recovery fixture value" } : {}) },
+      stdout: { write: value => { out += String(value); return true; } }, stderr: { write: () => true } });
+    expect(resolve).not.toHaveBeenCalled();
+    if (kind === "passphrase") {
+      expect({ code, out }).toEqual({ code: 0, out: "nothing to recover\n" });
+      expect(unlock.mock.calls[0]![1]).toMatchObject({ passphrase: PASS });
+    } else {
+      expect(code).toBe(1);
+      expect(unlock).toHaveBeenCalledOnce();
+      expect(unlock.mock.calls[0]![1]).toMatchObject({ recoveryKey: "recovery fixture value" });
+    }
+  });
+
+  it.each([false, true])("asks the exclusive barrier for kernel admission (apply=%s)", async apply => {
+    const f = await fixture();
+    const barrier = vi.spyOn(lockModule, "withExclusiveMasterRotationBarrier");
+    expect((await direct(f, apply)).code).toBe(0);
+    expect(barrier.mock.calls[0]![4]).toEqual({ timeoutMs: 0, requireKernelAdmission: true });
   });
 
   it("refuses report while a live custody holder owns the fortress", async () => {
