@@ -1201,9 +1201,16 @@ fn signed_append_workflow_selection_has_exact_count() {
         ["43"],
         "root step keeps its derived bound"
     );
-    let suite = step("Signed append suite, as root (serial)");
-    assert!(suite.contains("sudo -E env \"PATH=$PATH\" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation --color never --test linux_business_signed_append \\\n            -- --test-threads=1 2>&1 | tee signed-append-test.log\n"),
+    let suite = step("Signed append suite, unprivileged (serial)");
+    assert!(suite.contains("\n          CARGO_TERM_COLOR=never cargo test --locked --features test-isolation --color never --test linux_business_signed_append \\\n            -- --test-threads=1 2>&1 | tee signed-append-test.log\n"),
         "signed append step writes its full output to its evidence log");
+    // Most graphs in this suite run the fake signer as a thread of the test
+    // process; under root that full-capability peer fails the capability-dropped
+    // writer's /proc/<pid>/exe read, so the suite must never run elevated.
+    assert!(
+        !suite.contains("sudo") && !suite.contains("SANCTUARY_EXPECT_PRIVILEGED_LINUX"),
+        "signed append step runs unprivileged, with no privileged expectation"
+    );
     assert!(suite.contains("          grep -Eq '^test result. ok. 388 passed; 0 failed; 10 ignored;' signed-append-test.log || {\n            echo \"FAIL: the signed append suite did not report exactly 388 passed, 0 failed, 10 ignored\"\n            exit 1\n          }\n"),
         "signed append step requires the exact count from its evidence log");
     let upload = step("Retain Linux integration and real-systemd evidence logs");
@@ -1220,7 +1227,7 @@ fn signed_append_workflow_selection_has_exact_count() {
     assert!(
         upload_paths.contains(&"castle-wall-daemon/cargo-test.log")
             && upload_paths.contains(&"castle-wall-daemon/signed-append-test.log"),
-        "evidence upload retains the signed append root log"
+        "evidence upload retains the root and signed append logs"
     );
     // Each log is written relative to its step's working directory, so the
     // uploaded path must be that directory joined to the log name.
@@ -1250,7 +1257,6 @@ fn signed_append_workflow_selection_has_exact_count() {
         ["55"],
         "signed append step keeps its derived bound"
     );
-    assert!(suite.contains("SANCTUARY_EXPECT_PRIVILEGED_LINUX: \"1\""));
     // A step-level condition or error override would let either half stop
     // gating while every text pin above still passes.
     for (name, block) in [("root", root), ("signed append", suite)] {
@@ -1285,13 +1291,15 @@ fn signed_append_workflow_selection_has_exact_count() {
         !job_keys.iter().any(|key| key == "needs"),
         "Linux integration job depends on no other job: {job_keys:?}"
     );
+    // The root step leaves root-owned files in target/, which an unprivileged
+    // cargo cannot update, so the unprivileged suite runs first.
     assert!(
         workflow
-            .find("- name: cargo test (lib + integration")
+            .find("- name: Signed append suite, unprivileged")
             .unwrap()
             < workflow
-                .find("- name: Signed append suite, as root")
+                .find("- name: cargo test (lib + integration")
                 .unwrap(),
-        "the whole suite runs after the root step that skips it"
+        "the whole suite runs before the root step that skips it"
     );
 }
