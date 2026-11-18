@@ -1,7 +1,7 @@
 import {expect,it,vi} from "vitest";
 import * as fs from "node:fs/promises";
 import {join,resolve} from "node:path";
-import {splitFixtureByteInventory} from "./split-statement-fixtures.js";
+import {splitFixtureByteInventory} from "./split-statement-inventory.js";
 import {disposePhysicalFixture} from "./split-statement-dispose.js";
 
 vi.mock("node:fs/promises",async importOriginal=>{
@@ -31,6 +31,8 @@ it("requires inventory paths to retain descriptor identity",async()=>{
   try {
     await fs.writeFile(path,"original");
     await expect(splitFixtureByteInventory(root)).rejects.toThrow("inventory path identity differs");
-    expect(scheduled).toBe(true);
-  } finally {openSpy.mockImplementation(originalOpen);await disposePhysicalFixture(root);}
+  } finally {
+    openSpy.mockImplementation(originalOpen);
+    try {await disposePhysicalFixture(root);} finally {expect(scheduled).toBe(true);}
+  }
 });
