@@ -13,9 +13,8 @@
   <meta property="og:url" content="{{ page.url | absolute_url }}">
   <meta property="og:site_name" content="Sanctuary Protocol">
 
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+  <!-- Self-hosted fonts: the site loads nothing from third parties (footer promise on docs/index.html). -->
+  <link rel="stylesheet" href="{{ '/assets/home/fonts.css' | relative_url }}">
 
   <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
 
@@ -71,8 +70,8 @@
       <div class="footer__col">
         <h5>Architecture</h5>
         <ul>
-          <li><a href="{{ '/' | relative_url }}#layers">Castle Architecture</a></li>
-          <li><a href="{{ '/' | relative_url }}#harnesses">Harness support</a></li>
+          <li><a href="{{ '/' | relative_url }}#h-answer">How it works</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework#readme">Harness support</a></li>
           <li><a href="{{ '/blog/' | relative_url }}">Journal</a></li>
         </ul>
       </div>
