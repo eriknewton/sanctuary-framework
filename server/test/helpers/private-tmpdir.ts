@@ -6,7 +6,10 @@
  * candidate build script, and any child process, which inherits the variable) creates its
  * folders inside that root; the teardown phase of a file-level `aroundAll` restores `TMPDIR` and
  * removes the root. That phase runs when a test failed or timed out and when a `beforeAll` or an
- * `afterAll` of the file threw, and the file still reports its own error. It runs after every
+ * `afterAll` of the file threw, and the file still reports its own error. Bound: a file that fails
+ * while it is being collected (a throwing `describe` body or a failing import after this one) never
+ * enters the hook, so its root stays behind and `TMPDIR` stays redirected for that worker. The
+ * teardown phase runs after every
  * `afterAll`, every beforeAll-returned cleanup and the file-scoped fixture teardown, so a fixture
  * that unlinks a path inside the root at teardown still finds it (an early removal fails that
  * teardown with ENOENT). test/setup/master-write-leases.ts registers its `aroundAll` from a setup

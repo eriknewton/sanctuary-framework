@@ -14,8 +14,8 @@ export type WitnessScenario = (typeof WITNESS_SCENARIOS)[number];
 
 /** The error each scenario's hook throws; the parent test finds it in the child's report. */
 export const FIXTURE_ERROR_MESSAGE: Record<WitnessScenario, string> = {
-  "a later beforeAll throws": "witness fixture beforeAll failure",
-  "an afterAll throws": "witness fixture afterAll failure",
+  "a later beforeAll throws": "private-tmpdir witness sentinel one",
+  "an afterAll throws": "private-tmpdir witness sentinel two",
 };
 
 /** Written by the fixture at import time: the private root the helper created for the fixture file. */
