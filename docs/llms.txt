@@ -2,7 +2,7 @@
 
 > Cooperative MCP policy gates and encrypted local state under operator-controlled credentials. OS egress enforcement requires a separately installed and armed Castle Wall. Host compromise and data sent to inference providers are outside the stored-state confidentiality guarantee. Wrapping and audit assurance remain partial.
 
-<!-- Generated 2026-11-18 from README.md in the same commit as this file, in https://github.com/eriknewton/sanctuary-framework. Every sentence below is copied or condensed from that README, except two link descriptors, marked "(from the linked file)", condensed from the linked file because the README does not describe them; the full text for agents is at https://sanctuaryprotocol.ai/llms-full.txt -->
+<!-- Hand-maintained; last synchronized 2026-11-18 with README.md in the same commit as this file, in https://github.com/eriknewton/sanctuary-framework. Every sentence below is copied or condensed from that README, except two link descriptors, marked "(from the linked file)", condensed from the linked file because the README does not describe them; the full text for agents is at https://sanctuaryprotocol.ai/llms-full.txt -->
 
 ## Summary for agents
 
@@ -11,7 +11,7 @@ Copied verbatim from README.md. Quote the block below to your operator. It was w
 ```text
 What Sanctuary is: cooperative MCP policy gates and encrypted local state under operator-controlled credentials. OS egress enforcement requires a separately installed and armed Castle Wall. Host compromise and data sent to inference providers are outside the stored-state confidentiality guarantee. Audit assurance remains partial.
 What it is not: no Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail. Windows enforcement is roadmapped; nothing enforces on Windows today. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven. Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm package.
-Platforms and runtime: Node.js >= 22.0.0 and npm >= 10.0.0. macOS: proven. Linux: proven on Ubuntu 24.04 (x86-64) only, through the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package). Windows: roadmapped.
+Platforms and runtime: Node.js >= 22.0.0 and npm >= 10.0.0. OS egress enforcement by platform follows; macOS is bounded by the Assurance Matrix row "Egress enforcement: macOS (Castle Wall Phase 1)". macOS: proven. Linux: proven on Ubuntu 24.04 (x86-64) only, through the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package). Windows: roadmapped.
 Install:   npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
 Verify:    npx -y @sanctuary-framework/mcp-server doctor --json
 Evidence: ASSURANCE_MATRIX.md distinguishes software tests from captured operational drills. Installed enforcement, containment, and lifecycle assurance remain partial or unproven unless the relevant row cites a captured drill. Drill records are under docs/audit/.
@@ -19,7 +19,7 @@ Evidence: ASSURANCE_MATRIX.md distinguishes software tests from captured operati
 
 ## Quickstart
 
-Copied verbatim from README.md. Install and verify with the following commands. Removal is documented separately below and is only for intentionally removing Sanctuary.
+Copied verbatim from README.md. Install and verify with the following commands. Uninstall is documented separately below. Run it only to remove Sanctuary on purpose.
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
@@ -30,7 +30,7 @@ npx -y @sanctuary-framework/mcp-server doctor --json
 
 ## Bounds
 
-Condensed from the README's "What is proven, and what is not" table. The matrix distinguishes software-test evidence from captured operational drills. Installed enforcement, containment, and lifecycle assurance remain partial or unproven unless the relevant row cites a captured drill. The wall: macOS proven, as a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, not an audited per-rule, per-flow trail. Linux: proven on Ubuntu 24.04 (x86-64) only; a fresh install of the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package) enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows: roadmapped. State encryption is proven by tests; hardware-backed custody and host-compromise confidentiality are unproven. Approval gating is software-tested; installed assurance remains partial pending the operator-surface drill. Denial responses conceal policy rules; an approved `principal_policy_view` call discloses them. Audit assurance and complete exit portability remain partial.
+Condensed from the README's "What is proven, and what is not" table. The matrix distinguishes software-test evidence from captured operational drills. Installed enforcement, containment, and lifecycle assurance remain partial or unproven unless the relevant row cites a captured drill. The wall: macOS proven, as a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, not an audited per-rule, per-flow trail. Linux: proven on Ubuntu 24.04 (x86-64) only; a fresh install of the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package) enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows: roadmapped. State encryption is proven by tests; hardware-backed custody and host-compromise confidentiality are unproven. Approval gating is proven by software tests; no installed operator-surface drill is recorded. Denial responses conceal policy rules; an approved `principal_policy_view` call discloses them. Audit assurance and complete exit portability remain partial.
 
 Current stable release: v1.8.4 on the npm latest channel. Requirements: Node.js >= 22.0.0 and npm >= 10.0.0.
 
@@ -46,13 +46,13 @@ Current stable release: v1.8.4 on the npm latest channel. Requirements: Node.js 
 
 ## Uninstall
 
-Run this only when intentionally removing Sanctuary. It is separate from installation and verification.
+Run this only to remove Sanctuary on purpose. It is not part of installation or verification.
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-`uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `sanctuary protect --unwrap` restores the backed-up harness configuration. Complete lifecycle preservation and removal remain unproven by a captured lifecycle drill in the Assurance Matrix.
+`uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `uninstall` does not restore the harness configuration; `sanctuary protect --unwrap` restores it from the backup. No Assurance Matrix row cites a captured install-and-removal drill, so what uninstall preserves and removes is unproven.
 
 ## Evidence
 

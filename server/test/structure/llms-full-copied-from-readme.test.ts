@@ -42,6 +42,7 @@ const COPIED_HEADINGS = [
   "### Summary for agents",
   "## What is proven, and what is not",
   "## Quickstart",
+  "## Uninstall",
   "## For AI coding agents installing Sanctuary on behalf of an operator",
   "## Installation reference",
   "### Persistent install",

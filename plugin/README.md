@@ -1,8 +1,8 @@
 # Sanctuary Framework Plugin
 
-The cooperative control panel for your AI agents, as a Cowork/Claude Code plugin. Open source, created by Erik Newton. Operating-system enforcement is a separate arming step outside this plugin: live on macOS, proven on Linux for Ubuntu 24.04 (x86-64) only, Windows roadmapped. Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm server this plugin starts. Every claim traces to the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
+The cooperative control panel for your AI agents, as a Cowork/Claude Code plugin. Open source, created by Erik Newton. Operating-system enforcement is a separate arming step outside this plugin: proven on macOS for one host and one OS version, proven on Linux for Ubuntu 24.04 (x86-64) only, Windows roadmapped. Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm server this plugin starts. Capability bounds are recorded in the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
 
-Software-test evidence and captured operational drills are distinct. Installed enforcement and containment remain partial or unproven unless the relevant matrix row cites a captured drill. SHR signatures authenticate posture assertions; independent runtime protection is unproven by an SHR alone.
+Software-test evidence and captured operational drills are distinct. Installed enforcement and containment remain partial or unproven unless the relevant matrix row cites a captured drill. An SHR signature authenticates the signer's posture assertions. It does not prove that OS enforcement is installed or armed.
 
 ## What it does
 
@@ -23,13 +23,13 @@ npx -y @sanctuary-framework/mcp-server@1.8.4 doctor --json
 
 ## Uninstall
 
-Run this only when intentionally removing Sanctuary. It is separate from installation and verification.
+Run this only to remove Sanctuary on purpose. It is not part of installation or verification.
 
 ```bash
 npx -y @sanctuary-framework/mcp-server@1.8.4 uninstall
 ```
 
-`uninstall` removes the enforcement footprint and is designed to preserve keys, state, and the audit log. `sanctuary protect --unwrap` restores the backed-up harness configuration. Complete lifecycle preservation and removal remain unproven by a captured lifecycle drill in the Assurance Matrix.
+`uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `uninstall` does not restore the harness configuration; `sanctuary protect --unwrap` restores it from the backup. No Assurance Matrix row cites a captured install-and-removal drill, so what uninstall preserves and removes is unproven.
 
 ## Featured tools
 
@@ -42,7 +42,7 @@ Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, 
 - **`sanctuary/zk_commit` / `zk_prove`**: Pedersen commitments and Schnorr zero-knowledge proofs.
 - **`sanctuary/reputation_record`**: Build portable, signed reputation attestations. `reputation_export` and `reputation_import` are Tier 1.
 - **`sanctuary/handshake_initiate`**: Handshake protocol for mutual verification between agents.
-- **`sanctuary/context_gate_filter`**: Filter agent context before sending to LLM providers, redacting secrets, PII, and internal state.
+- **`sanctuary/context_gate_filter`**: Apply the configured context-gate field rules to content you supply before sending it to an LLM provider. Review the result; it does not detect secrets or PII outside those rules.
 
 ## OpenClaw Integration
 
@@ -62,8 +62,8 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 
 ## Requirements
 
-- Node.js 22+
-- npm (for `npx`)
+- Node.js >= 22.0.0
+- npm >= 10.0.0 (for `npx`)
 
 ## Tools provided
 

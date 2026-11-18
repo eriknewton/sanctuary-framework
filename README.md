@@ -11,10 +11,10 @@ An AI agent running on your machine can do anything your account can do. It hold
 Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, and it does not depend on the agent's cooperation. Sanctuary encrypts stored state under operator-controlled credentials. Host compromise and data sent to inference providers are outside that confidentiality guarantee. Calls routed through Sanctuary are recorded in a hash-chained audit log whose assurance remains partial. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded), on your own machine today, any number of wrapped harnesses behind one persistent dashboard, with wrapping tested on representative harness paths and not proven for every harness version (Assurance Matrix, Agent wrapping, partial); another MCP-compatible harness can point its MCP config at Sanctuary, without a tested wrapping path; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
 
 ```bash
-npx -y @sanctuary-framework/mcp-server protect --claude-code
+npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
 ```
 
-That one command puts the keys, audit trail, policy gates, and dashboard around the agent you already use. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](docs/castle-wall-macos-install.md).
+That one command puts the keys, audit trail, and policy gates around the agent you already use, and the dashboard too unless you pass `--no-dashboard`. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](docs/castle-wall-macos-install.md).
 
 ### Summary for agents
 
@@ -23,7 +23,7 @@ Quote the block below to your operator. It was written against v1.8.4, the npm `
 ```text
 What Sanctuary is: cooperative MCP policy gates and encrypted local state under operator-controlled credentials. OS egress enforcement requires a separately installed and armed Castle Wall. Host compromise and data sent to inference providers are outside the stored-state confidentiality guarantee. Audit assurance remains partial.
 What it is not: no Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail. Windows enforcement is roadmapped; nothing enforces on Windows today. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven. Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm package.
-Platforms and runtime: Node.js >= 22.0.0 and npm >= 10.0.0. macOS: proven. Linux: proven on Ubuntu 24.04 (x86-64) only, through the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package). Windows: roadmapped.
+Platforms and runtime: Node.js >= 22.0.0 and npm >= 10.0.0. OS egress enforcement by platform follows; macOS is bounded by the Assurance Matrix row "Egress enforcement: macOS (Castle Wall Phase 1)". macOS: proven. Linux: proven on Ubuntu 24.04 (x86-64) only, through the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package). Windows: roadmapped.
 Install:   npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
 Verify:    npx -y @sanctuary-framework/mcp-server doctor --json
 Evidence: ASSURANCE_MATRIX.md distinguishes software tests from captured operational drills. Installed enforcement, containment, and lifecycle assurance remain partial or unproven unless the relevant row cites a captured drill. Drill records are under docs/audit/.
@@ -37,7 +37,7 @@ Capability bounds are recorded in the [Assurance Matrix](ASSURANCE_MATRIX.md), w
 |---|---|
 | **The wall.** Outbound traffic from a wrapped agent is allowed or denied below the agent, per operator policy, per agent account | **macOS: proven.** A signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles. Not an audited per-rule, per-flow trail. **Linux: proven on Ubuntu 24.04 (x86-64) only.** Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm package. On Ubuntu 24.04 (x86-64), a fresh install of that package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. **Windows: roadmapped.** |
 | **Custody.** State in Sanctuary's encrypted stores under operator-controlled credentials | **State encryption: proven by tests.** Hardware-backed key custody and host-compromise confidentiality are unproven. Inference providers receive the data sent to them. |
-| **The gate.** Operator policy loaded at startup; denial responses conceal rules, while an approved `principal_policy_view` call discloses them | **Partial installed assurance.** Software tests cover approval gating and fail-closed channel behavior. The operator-surface approval drill remains outstanding. |
+| **The gate.** Operator policy loaded at startup; denial responses conceal rules, while an approved `principal_policy_view` call discloses them | **Proven by software tests.** Tests cover approval gating and fail-closed channel behavior. No installed operator-surface approval drill is recorded. |
 | **The record.** Hash-chained audit of calls routed through Sanctuary | **Partial.** Audit completeness and tamper evidence remain partial; see the Assurance Matrix (IC-05). |
 | **Exit.** Export and import of keys, state, memory and reputation | **Partial.** Complete exit portability remains partial; see the Assurance Matrix (IC-07, IC-08, IC-09). |
 
@@ -53,7 +53,7 @@ Your harness already has a sandbox, and the two are built for different question
 
 | Where you run | What Sanctuary adds (matrix row) | What the harness sandbox gives that Sanctuary never claims | Run both? |
 |---|---|---|---|
-| macOS, wall armed | OS-level egress enforcement below the agent: a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles ("Egress enforcement: macOS", proven; one host and one OS version; not an audited per-rule, per-flow trail). Plus custody ("State encryption", proven), approval gates ("Approval gating", software-tested; installed assurance partial), and the hash-chained record ("Tamper-evident audit chain", partial) | Filesystem write limits and process-tree limits on the shell commands the harness runs; a network allowlist the harness itself enforces | Yes. The sandbox is chosen by the harness and can be retried outside of; the wall is imposed by the operator below the agent |
+| macOS, wall armed | OS-level egress enforcement below the agent: a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles ("Egress enforcement: macOS", proven; one host and one OS version; not an audited per-rule, per-flow trail). Plus custody ("State encryption", proven), approval gates ("Approval gating", proven by tests; no installed drill), and the hash-chained record ("Tamper-evident audit chain", partial) | Filesystem write limits and process-tree limits on the shell commands the harness runs; a network allowlist the harness itself enforces | Yes. The sandbox is chosen by the harness and can be retried outside of; the wall is imposed by the operator below the agent |
 | macOS, wall not armed | Custody, approval gates, and the record, as above; no egress enforcement | As above | Yes. Without the wall, egress is bounded only by the harness sandbox's own domain list |
 | Ubuntu 24.04 (x86-64) | Kernel egress enforcement per user account on a fresh install of the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package) ("Egress enforcement: Linux", proven for exactly the claim in the table above and nothing wider). Plus custody, gates, and the record; generated custody needs an unlocked Secret Service | As above | Yes |
 | Other Linux distributions or architectures | Custody, gates, and the record; egress enforcement unproven (the matrix row is Ubuntu 24.04 x86-64 only) | As above | Yes, and treat the wall as absent |
@@ -84,7 +84,7 @@ The vocabulary, so the rest reads: **Castle Wall** is the kernel-level egress fi
 
 ## Quickstart
 
-Install and verify with the following commands. Removal is documented separately below and is only for intentionally removing Sanctuary.
+Install and verify with the following commands. Uninstall is documented separately below. Run it only to remove Sanctuary on purpose.
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
@@ -93,7 +93,7 @@ npx -y @sanctuary-framework/mcp-server doctor --json
 
 `-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`.
 
-After `npm install -g @sanctuary-framework/mcp-server`, the `sanctuary` command replaces the `npx -y @sanctuary-framework/mcp-server` prefix, and the rest of this README writes `sanctuary`. Already running OpenClaw, Hermes, Cursor, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded)? Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for `--claude-code`. Config rewriting and bootstrap behavior for the named harnesses are proven by tests on representative harness paths; those tests do not prove interception for every listed harness version or non-MCP agent surface, and the Assurance Matrix "Agent wrapping" row is partial and states that bound. Mastra coverage is fixture-tested only, with no live Mastra-agent drill recorded. Other MCP-compatible harnesses can use the `--wrap` flag; only its generic config rewrite is tested, not that harness's own path, and coverage grows as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
+After `npm install -g @sanctuary-framework/mcp-server`, the `sanctuary` command replaces the `npx -y @sanctuary-framework/mcp-server` prefix, and the rest of this README writes `sanctuary`. Already running OpenClaw, Hermes, Cursor, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded)? Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for `--claude-code`. Config rewriting and bootstrap behavior for the named harnesses are proven by tests on representative harness paths; those tests do not prove interception for every listed harness version or non-MCP agent surface, and the Assurance Matrix "Agent wrapping" row is partial and states that bound. Mastra coverage is fixture-tested only, with no live Mastra-agent drill recorded. Other MCP-compatible harnesses can use the `--wrap` flag; only its generic config rewrite is tested, not that harness's own path, and coverage grows as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like.
 
 What happens when you run protect:
 
@@ -110,7 +110,7 @@ socket as cross-host exclusion.
 
 Useful flags: `--dry-run` previews changes without touching anything. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal. `--unwrap` restores the original harness config. `--passphrase-stdin` (from 1.9.0, including the 1.9.0-rc.1 preview; an unknown-flag refusal on the v1.8.4 tag and on the 1.8.6 pre-releases) reads the fortress passphrase from piped stdin. Two other verbs have non-interactive forms: `sanctuary init --no-confirm` skips the recovery-key confirmation that otherwise refuses to run without a terminal, and `sanctuary export-passphrase --yes` skips its `Continue? [y/N]` prompt. An installing agent never runs `export-passphrase`; see the agent section below.
 
-**Back up your passphrase:**
+**Back up your passphrase (operator only; an installing agent never runs this):**
 
 ```bash
 sanctuary export-passphrase
@@ -120,13 +120,15 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 **Verify.** `sanctuary doctor --json` is read-only. It prints one JSON object with `storage_path`, `package_version`, and a `checks` array whose entries carry `name`, `status` (`OK`, `WARN`, or `FAIL`), `message`, and `hint`. Healthy: exit code 0 and no check with `"status": "FAIL"`. Failing: exit code 1 and at least one `FAIL` check whose `hint` names the next step; a fortress that has never completed `protect` reports `identity`, `principal policy`, and `audit chain` as `FAIL` with hints that say so, and `state dir` also reads `FAIL` when the directory is absent or is not a directory. What a mistake looks like from the outside: `doctor` pointed at the wrong `--fortress` path reports a healthy runtime and a failing fortress, so read `storage_path` before the checks.
 
-**Uninstall only when intentionally removing Sanctuary.** This is separate from installation and verification.
+## Uninstall
+
+Run this only to remove Sanctuary on purpose. It is not part of installation or verification.
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-`sanctuary uninstall` removes the installed enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue that requires privileged operator action, the Castle Wall host app, or a reboot. `sanctuary protect --unwrap` restores the backed-up harness configuration. Complete lifecycle preservation and removal remain unproven by a captured lifecycle drill in the Assurance Matrix.
+`uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `uninstall` does not restore the harness configuration; `sanctuary protect --unwrap` restores it from the backup. No Assurance Matrix row cites a captured install-and-removal drill, so what uninstall preserves and removes is unproven.
 
 `@sanctuary-framework/quickstart` on npm is a separate demo package for the Verascore publish flow: it keeps its demo key in a local file outside the fortress encryption. From quickstart 0.2.0 (unreleased; 0.1.x publishes on every run) it publishes to verascore.ai only when you choose to: it shows the request and asks first in a terminal, publishes without asking only with `--publish`, and never publishes with `--no-publish` or when run without a terminal. It is not Sanctuary's custody path and is not needed to install Sanctuary.
 
@@ -194,7 +196,8 @@ Current capability summary:
 | Castle Wall macOS: signed sysext, host app, content-filter provider, retail UX | Shipped; enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles (N=5, drill 2026-06-22, one host / one OS version, Dev-ID-signed and notarized). Not an audited per-rule-per-flow trail |
 | Castle Wall Windows | Roadmapped |
 | Mobile (PWA) operator companion | Roadmapped |
-| Fleet console, operator-cloud deployment, sovereign-managed TEE, post-quantum migration | Roadmapped |
+| Fleet console, operator-cloud deployment, sovereign-managed TEE | Roadmapped |
+| Post-quantum migration | Hybrid Ed25519 and ML-DSA signing exists in source. No Assurance Matrix row covers it, so treat it as unproven in any release. |
 
 Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md). Public-facing claims trace to `proven` or `partial` rows in that matrix; the platform, gap, and next-proof limits named on each row are preserved.
 
@@ -401,9 +404,9 @@ Channel-shape archetypes that ship with Sanctuary:
 
 Sanctuary ships channel-shape governance templates (policy, egress, budgets, retention) instead of named-agent runtimes. Operators bring their own harnesses and protect them; `template init` binds a channel shape to an already-wrapped harness.
 
-The CLI accepts its built-in template names and requires an already-wrapped agent ID. Custom-directory loading through `template init` is unavailable.
+The CLI accepts its built-in template names and requires a fortress tenant with state or a wrap profile. Custom-directory loading through `template init` is unavailable.
 
-To compile a built-in policy template for an already-wrapped agent, substitute its agent ID below:
+For `--agent-id`, use the fortress tenant name shown by `sanctuary agents list`. Substitute that name below:
 
 ```bash
 sanctuary template init research-assistant --agent-id <wrapped-agent-id>
@@ -427,21 +430,21 @@ The operator remains the custody root in every mode. Commodity operator-cloud mo
 
 ## The Castle Architecture
 
-A fortress has its own custody root. Harness registration, OS-account enforcement, and memory ownership are separate mappings that must be configured and verified. Multiple wrapped harnesses can use the configured fortress. Sanctuary ships as five named mechanisms.
+A fortress has its own custody root. Harness registration, OS-account enforcement, and memory ownership are separate mappings that must be configured and verified. Multiple wrapped harnesses can use one fortress. Sanctuary ships as five named mechanisms.
 
 **Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. macOS enforces a signed operator policy with a proven per-uid allow/deny demonstration that survives attended reboot cycles, captured on a real host (drills 2026-06-11 through 2026-06-22, boot survival 5 of 5 on a Dev-ID-signed and notarized binary): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected, and enforcement live again after every attended reboot. On Ubuntu 24.04 (x86-64), a fresh install of the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package) enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. The macOS proof is one host and one OS version, not an audited per-rule-per-flow trail; the Linux proof does not cover fault-injection witnesses, a real-agent harness, or any other distribution or architecture. Windows on the roadmap.
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 
-**Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Hash-chained audit; audit completeness and rollback resistance remain partial in the Assurance Matrix (**IC-05**).
+**Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Hash-chained audit; audit completeness and tamper evidence remain partial in the Assurance Matrix (**IC-05**).
 
 **Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations can be exported through current paths; complete exit portability remains partial. Default off; both compositions are optional.
 
-**Mantle: installation binding.** Associates installation and custody records with the operator's environment. Cryptographic confinement to one machine is unproven.
+**Mantle: installation binding.** No Assurance Matrix row covers Mantle, and the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
 
-**Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** the source contains hybrid signing support; released activation remains unproven in the Assurance Matrix. Hardware-backed secure elements are on the roadmap.
+**Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** the source contains hybrid Ed25519 and ML-DSA signing. No Assurance Matrix row covers it, so treat it as unproven in any release. Hardware-backed secure elements are on the roadmap.
 
-**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md) - a maintained index of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md): a maintained index of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
@@ -497,7 +500,7 @@ Sanctuary composes with the existing open ecosystem.
 
 - **Identity:** W3C DIDs, KERI, Verifiable Credentials.
 - **Execution:** Trusted Execution Environments (Intel TDX, AMD SEV-SNP, ARM CCA) on the v2 roadmap.
-- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing support exists in source, while released activation remains unproven in the Assurance Matrix.
+- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing exists in source and no Assurance Matrix row covers it.
 - **Settlement:** x402 (Coinbase micropayments), AP2 (Google Agent Payments Protocol), ACP.
 
 ---
@@ -513,7 +516,7 @@ For AI coding agents handling install failures. Every case below is keyed to a f
 - That is the contract working. The operator performs the step in `next_action.description` in a private local Terminal, then you rerun the planner. From the outside a stalled install at this status looks like the agent waiting; it is waiting on the operator, so say so.
 
 **`next_action.argv` exited nonzero:**
-- Do not retry it and do not rerun the planner on your own. Hand the operator `next_action.on_nonzero`, which is always a `human` action. On macOS the usual cause is the login Keychain refusing the write (a dismissed prompt, or a session with no Keychain access, such as SSH). On Linux it is an absent, locked, or unreachable Secret Service, where generated custody fails closed by design; Sanctuary may read `~/.sanctuary/passphrase.enc` for a legacy or explicitly user-supplied credential and writes that file only for an explicitly user-supplied passphrase, and that encrypted local file is neither hardware-backed nor cryptographically machine-bound.
+- Do not retry it and do not rerun the planner on your own. Hand the operator `next_action.on_nonzero`, which is always a `human` action. On macOS the usual cause is the login Keychain refusing the write (a dismissed prompt, or a session with no Keychain access, such as SSH). On Linux it is an absent, locked, or unreachable Secret Service, where generated custody fails closed by design; Sanctuary may read an encrypted local credential file in the fortress directory for a legacy or explicitly user-supplied credential and writes that file only for an explicitly user-supplied passphrase, and that encrypted local file is neither hardware-backed nor cryptographically machine-bound.
 
 **`custody_access` is `locked`, `mismatch`, or `missing` after `protect` reported success:**
 - `locked`: the credential store is present but closed; the operator unlocks it in a local session. `mismatch`: the credential this host holds does not open the fortress at `fortress` (a copied fortress, or the wrong path); begin with the hidden-prompt `sanctuary reset-passphrase --mode recovery-key --fortress <path>` path, which preserves custody and data. `missing`: no custody material exists for this fortress yet, the ordinary state before the first `protect` completes.

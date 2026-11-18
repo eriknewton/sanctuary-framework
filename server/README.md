@@ -14,7 +14,7 @@ Capability bounds are recorded in the [Assurance Matrix](https://github.com/erik
 |---|---|
 | **The wall.** Outbound traffic from a wrapped agent is allowed or denied below the agent, per operator policy, per agent account | **macOS: proven.** A signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles. Not an audited per-rule, per-flow trail. **Linux: proven on Ubuntu 24.04 (x86-64) only.** Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm package. On Ubuntu 24.04 (x86-64), a fresh install of that package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. **Windows: roadmapped.** |
 | **Custody.** State in Sanctuary's encrypted stores under operator-controlled credentials | **State encryption: proven by tests.** Hardware-backed key custody and host-compromise confidentiality are unproven. Inference providers receive the data sent to them. |
-| **The gate.** Operator policy loaded at startup; denial responses conceal rules, while an approved `principal_policy_view` call discloses them | **Partial installed assurance.** Software tests cover approval gating and fail-closed channel behavior. The operator-surface approval drill remains outstanding. |
+| **The gate.** Operator policy loaded at startup; denial responses conceal rules, while an approved `principal_policy_view` call discloses them | **Proven by software tests.** Tests cover approval gating and fail-closed channel behavior. No installed operator-surface approval drill is recorded. |
 | **The record.** Hash-chained audit of calls routed through Sanctuary | **Partial.** Audit completeness and tamper evidence remain partial; see the Assurance Matrix (IC-05). |
 | **Exit.** Export and import of keys, state, memory and reputation | **Partial.** Complete exit portability remains partial; see the Assurance Matrix (IC-07, IC-08, IC-09). |
 
@@ -35,13 +35,13 @@ That one command puts the keys, audit trail, and policy gates around the agent y
 
 ## Uninstall
 
-Run this only when intentionally removing Sanctuary. It is separate from installation and verification.
+Run this only to remove Sanctuary on purpose. It is not part of installation or verification.
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-`uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It reports residue requiring operator action. `sanctuary protect --unwrap` restores the backed-up harness configuration. Complete lifecycle preservation and removal remain unproven by a captured lifecycle drill in the Assurance Matrix.
+`uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `uninstall` does not restore the harness configuration; `sanctuary protect --unwrap` restores it from the backup. No Assurance Matrix row cites a captured install-and-removal drill, so what uninstall preserves and removes is unproven.
 
 ## The secret boundary
 
@@ -155,9 +155,9 @@ Once connected, your agent has access to these selected foundational tools, orga
 ### Verifiable Reputation
 | Tool | Description |
 |------|-------------|
-| `sanctuary/reputation_record` | Record signed interaction attestation (sovereignty-weighted) |
+| `sanctuary/reputation_record` | Record signed interaction attestation (weighted by the signer's verification tier; self-attested and unverified signers are capped) |
 | `sanctuary/reputation_query` | Query aggregated reputation data |
-| `sanctuary/reputation_query_weighted` | Query with sovereignty-tier weighting |
+| `sanctuary/reputation_query_weighted` | Query weighted reputation |
 | `sanctuary/reputation_export` | Export portable reputation bundle (Tier 1) |
 | `sanctuary/reputation_import` | Import bundle with signature verification (Tier 1) |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
@@ -210,14 +210,14 @@ Environment variables. There is deliberately no passphrase variable in this tabl
 
 ## Security model
 
-Sanctuary's security claims are structural, not cooperative-only, and each traces to a matrix row.
+Sanctuary's enforcement claims and their bounds are recorded in the Assurance Matrix.
 
-**Castle Wall enforcement (macOS live; Ubuntu 24.04 x86-64 bounded proof; Windows roadmap):**
+**Castle Wall enforcement (macOS proven on one host and one OS version; Ubuntu 24.04 x86-64 bounded proof; Windows roadmap):**
 - Captured macOS enforcement evidence covers the installed and armed signed Network Extension's per-account allow/deny path on one host and one OS version
 - Ubuntu 24.04 x86-64 fresh installs carry the narrowed per-account signed-policy proof in the Assurance Matrix; other Linux platforms, DNS and hostname paths, a real-agent harness, and Windows Filtering Platform are roadmap
 - Per-process attribution, template enforcement, and alternative enforcement paths remain unproven
-- Destination allowlists constrain reachable destinations; content confinement remains unproven
-- A prompt-injected agent cannot bypass the macOS wall within the proven scope: one host, one OS version, signed extension installed and armed
+- Destination allowlists constrain which destinations are reachable. They do not constrain what an allowed flow carries.
+- The macOS drill showed the agent account blocked on a destination outside its allowlist: one host, one OS version, signed extension installed and armed
 
 **Sentinels observation (shipped; observation only):**
 - Process introspection via auditd-tail fallback and syscall-observation scaffolding; the eBPF probe loader is a placeholder today
@@ -234,7 +234,7 @@ Sanctuary's security claims are structural, not cooperative-only, and each trace
 - Private keys never appear in any MCP tool response
 - Verified reads cover integrity and rollback checks; complete rollback resistance remains partial
 - Principal Policy gates every MCP call Sanctuary executes or forwards (three-tier approval)
-- Behavioral baseline detects anomalous agent behavior
+- Behavioral baseline flags configured deviations for operator approval
 - Stderr is informational and deny-only; decision-ready Tier 1 approval requires an authenticated configured approval channel
 
 **Heralds cross-castle accountability:**
@@ -247,7 +247,7 @@ Sanctuary's security claims are structural, not cooperative-only, and each trace
 
 Sanctuary's enforcement model is the Castle Architecture. Five named mechanisms, each with a distinct contract.
 
-**Castle Wall: the perimeter.** OS-level egress enforcement at the operator-external boundary. Captured macOS evidence covers the installed and armed signed Network Extension: a signed operator policy with a proven per-uid allow/deny demonstration that survives attended reboot cycles, one host, one OS version. On Ubuntu 24.04 (x86-64), a fresh install of the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package) enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows is roadmapped. Where the macOS wall is installed and armed within the proven scope, the kernel blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it.
+**Castle Wall: the perimeter.** OS-level egress enforcement at the operator-external boundary. Captured macOS evidence covers the installed and armed signed Network Extension: a signed operator policy with a proven per-uid allow/deny demonstration that survives attended reboot cycles, one host, one OS version. On Ubuntu 24.04 (x86-64), a fresh install of the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release, not part of the npm package) enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows is roadmapped. Within the proven scope, the drill showed the agent account blocked on a destination outside its allowlist and reaching the destination on it, while the operator account was unaffected. Traffic to an allowed destination is not inspected.
 
 **Sentinels: the nerves.** Internal observation, not enforcement. Behavioral baselining via process introspection, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via menubar and OS notifications. Sentinels observe and surface; they do not block, and they are unrelated to any vendor's "sentinel."
 
@@ -255,9 +255,9 @@ Sanctuary's enforcement model is the Castle Architecture. Five named mechanisms,
 
 **Heralds: the voice.** How your agent is recognized by other sovereigns. Concordia receipts on cross-castle transactions, Verascore reputation aggregating across operators, cross-castle accountability after the fact, portable reputation across vendor churn. Default off; both compositions are optional, and neither repo imports the other.
 
-**Mantle: installation binding.** Associates installation and custody records with the operator's environment. Cryptographic confinement to one machine is unproven.
+**Mantle: installation binding.** No Assurance Matrix row covers Mantle, and the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
 
-The castle must be both real and delightful: hard enforcement at the wall, approval response under 2 seconds when prompted, default-deny outbound with always-allow rules that learn, Sentinels that observe without surfacing noise, and a cooperative MCP path that stays additive and fully usable. The runtime sees a normal operating environment with constrained egress; nothing internal is sandboxed.
+The castle must be both real and usable: enforcement at the wall, prompt approval requests, default-deny outbound with operator-set allow rules, Sentinels that observe, and a cooperative MCP path that stays additive. The runtime sees a normal operating environment with constrained egress; nothing internal is sandboxed.
 
 ## Capability surfaces
 
@@ -289,7 +289,7 @@ Sanctuary lives in your menubar. When your agent wants to do something risky, yo
 
 The dashboard is for setup, inspection, and authenticated operator approvals. It includes the substrate selector, policy editor, audit deep-dive, exit bundle drill, and fortress configuration. The menubar keeps routine status and approval entry points close at hand. Concierge chat is a read-oriented natural-language interface to fortress state: "What's going on?" returns a summary from the audit log; "Why did my Hermes agent stop?" looks up recent gate triggers and explains. It does not approve requests or trigger exports on the operator's behalf.
 
-You do not sit in Sanctuary. Sanctuary sits with you.
+Use the menubar for routine status and the dashboard for inspection and approvals.
 
 ## Development
 
