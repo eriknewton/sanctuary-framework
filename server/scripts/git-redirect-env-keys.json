@@ -1,0 +1,23 @@
+{
+  "$comment": "The one list of git environment variables that redirect which repository, config file, or object graph git acts on. A process inherits them from a git hook (GIT_DIR, GIT_INDEX_FILE, GIT_WORK_TREE) or from a developer shell. repositoryKeys choose the repository and its object graph; configKeys and numberedConfigKeyPattern (the GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> pairs that GIT_CONFIG_COUNT enables) choose config. GIT_CEILING_DIRECTORIES is deliberately absent: it only restricts discovery. Consumers: server/test/setup/git-env-scrub.ts clears BOTH groups (tests must never act on the real repository or config); server/scripts/install-hooks.js clears repositoryKeys plus GIT_CONFIG_PARAMETERS only, because a developer's deliberate config (GIT_CONFIG_GLOBAL, a numbered pair) may carry the core.hooksPath git really runs. Bash copies (.githooks/pre-commit, scripts/verify-fail-before-self-test.sh) carry repositoryKeys then configKeys as one array and must match exactly; server/test/structure/git-env-scrub.test.ts pins both. numberedConfigKeyPattern is POSIX ERE so bash [[ =~ ]] and JavaScript RegExp read it identically.",
+  "repositoryKeys": [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE"
+  ],
+  "configKeys": [
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM"
+  ],
+  "numberedConfigKeyPattern": "^GIT_CONFIG_(KEY|VALUE)_[0-9]+$"
+}

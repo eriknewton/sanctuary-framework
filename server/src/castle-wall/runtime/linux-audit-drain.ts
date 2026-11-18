@@ -83,6 +83,7 @@ import { fortressIdFromProtectionSubject } from "../subject-binding.js";
 import { WAL_OPERATION_TO_EVENT_TYPE } from "./audit-consumer.js";
 import type { AuditConsumer, CriticalEventEnvelope } from "./audit-consumer.js";
 import type { IpcClient } from "./ipc-client.js";
+import {createBusinessRecordConsumer, type ConsumerMode} from "./business-record-consumer.js";
 import { RuntimeDrainError } from "./errors.js";
 
 /**
@@ -169,6 +170,8 @@ export const DEFAULT_AUDIT_DRAIN_MAX_FAULT_BACKOFF_MS = 30_000;
 
 /** Options for one drain cycle / the continuous loop. */
 export interface LinuxAuditDrainOptions {
+  /** Trusted composition selects Business with required pins, committed state and durable sink. */
+  mode?: {kind:"Legacy"} | Extract<ConsumerMode, {kind:"Business"}>;
   /** Max events to request per drain frame. Defaults to 256. */
   maxEvents?: number;
   /** Poll interval (ms) between drain cycles when running continuously. Default 1000. */
@@ -575,9 +578,17 @@ export interface LinuxAuditDrainHandle {
 
 export function startLinuxAuditDrainLoop(
   client: IpcClient,
-  consumer: AuditConsumer,
+  consumer: AuditConsumer | null,
   options: LinuxAuditDrainOptions = {}
 ): LinuxAuditDrainHandle {
+  const mode = options.mode ?? {kind:"Legacy" as const};
+  // Missing dependencies cannot silently fall back to Legacy at the real loop boundary.
+  if (mode.kind === "Business" && (!mode.pin || !mode.committed_state || !mode.durable_sink
+      || typeof mode.durable_sink.load !== "function" || typeof mode.durable_sink.persist !== "function")) throw Error("BUSINESS_DEPENDENCIES");
+  if (mode.kind === "Legacy" && !consumer) throw Error("LEGACY_CONSUMER");
+  const business = mode.kind === "Business" ? createBusinessRecordConsumer(mode) : null;
+  // Observe initialization rejection immediately; cycle still awaits and reports the original failure.
+  if (business) business.catch(() => {});
   const maxEvents = options.maxEvents ?? DEFAULT_AUDIT_DRAIN_MAX_EVENTS;
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
   const maxFaultBackoffMs = positiveIntegerOption(
@@ -606,9 +617,23 @@ export function startLinuxAuditDrainLoop(
       // Drain all currently-pending batches before sleeping.
       let morePending = true;
       while (morePending && !stopped) {
+        if (business) {
+          const accepted = await business;
+          const response = await client.businessDrainRequest();
+          if (response.event !== null) {
+            const ack = await accepted.accept(response.event);
+            if (!ack) throw Error("BUSINESS_ACK");
+            // The sink's durable readback precedes ACK. Native delivery holds n until its local fact readback.
+            await client.sendBusinessAck(ack);
+            cursor = ack.identity.sequence;
+            lastAcked = cursor;
+          }
+          morePending = false;
+          continue;
+        }
         const result = await drainOnce(
           client,
-          consumer,
+          consumer!,
           cursor,
           maxEvents,
           options.onError,

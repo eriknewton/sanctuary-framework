@@ -28,6 +28,7 @@ import { argvTokenForDisplay } from "./cli/argv.js";
 export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 
 const require = createRequire(import.meta.url);
+// Must match hermesPackageRootFromEntry in cli/hermes-memory.ts, which locates this same package.json's folder.
 const { version: PKG_VERSION } = require("../package.json");
 
 /**
@@ -77,6 +78,15 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "hermes") {
+    // The Hermes owner verbs dispatch here, before environment promotion, custody resolution or ordinary boot.
+    const { hermesPackageRootFromEntry, runHermesMemory } = await import("./cli/hermes-memory.js");
+    // Only recover-save goes to its own module; help, the owner verbs and an unknown command go to the owner
+    // module, so a mistyped verb gets the hermes usage and the closing line, never recover-save's help.
+    if (args[1] !== "recover-save") {
+      // This module's own URL (src/cli.ts or dist/cli.js, one folder below the package root) locates the package.
+      return drainAndExit(await runHermesMemory({ argv: args.slice(1), packageVersion: PKG_VERSION,
+        packageRoot: hermesPackageRootFromEntry(import.meta.url), invokedEntry: process.argv[1] }));
+    }
     const { runHermesRecoverSave } = await import("./cli/hermes-recover-save.js");
     return drainAndExit(await runHermesRecoverSave({ argv: args.slice(1) }));
   }
@@ -1140,6 +1150,9 @@ Subcommands:
                        Use "sanctuary memory_transcode --help" for options.
 
   hermes               recover-save --fortress <dir> [--apply]: recover an unfinished save.
+                       memory-report, memory-show, memory-delete: owner tools for the
+                       Hermes fortress, run with the Hermes memory relay stopped.
+                       Use "sanctuary hermes <command> --help" for options.
 
   hermes-memory-client
     Scoped memory search and get; writes not yet available.

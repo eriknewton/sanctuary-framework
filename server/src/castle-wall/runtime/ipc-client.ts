@@ -1,3 +1,7 @@
+import {parseStrict} from "../../smb/parse-strict.js";
+import {appendWireShape, parseBusinessEvent, type BusinessDeliveryAck} from "../../signing/business-append-wire.js";
+import {canonicalBytes} from "../../signing/contract.js";
+import {CAP_BUSINESS_DELIVERY, type BusinessDrainResponse, type BusinessDeliveryAckResponse} from "../ipc/messages.js";
 /**
  * Castle Wall IPC client (Sanctuary main side).
  *
@@ -113,6 +117,7 @@ export interface IpcClientOptions {
 
 /** Public client surface. */
 export class IpcClient {
+  private business = false;
   private inbound: Uint8Array = new Uint8Array(0);
   private pending = new Map<IpcRequestId, PendingRequest>();
   private handshakeComplete = false;
@@ -145,6 +150,32 @@ export class IpcClient {
       requestTimeoutMs: options.requestTimeoutMs ?? 10_000,
       generateNonceHex: options.generateNonceHex ?? defaultNonceHex,
     });
+  }
+
+  /** Explicit isolated Business transport; capabilities affect compatibility, never record authority. */
+  static createBusiness(transport: IpcTransport, key: ClientKeyMaterial, options: IpcClientOptions = {}): IpcClient {
+    const client = IpcClient.create(transport, key, options);
+    client.business = true;
+    return client;
+  }
+
+  /** Pull one exact Business event, without any Legacy cursor authority. */
+  async businessDrainRequest(): Promise<BusinessDrainResponse> {
+    if (!this.business || !this.daemonSupports(CAP_BUSINESS_DELIVERY)) throw Error("BUSINESS_CAPABILITY");
+    const request_id = this.options.generateNonceHex();
+    const response = await this.send<BusinessDrainResponse>(request_id, wrapEnvelope("business_drain_request", {type:"business_drain_request", request_id}));
+    if (Object.keys(response).sort().join(",") !== "error,event,request_id,type" || response.error !== null) throw Error("BUSINESS_DRAIN");
+    if (response.event !== null) parseBusinessEvent(response.event);
+    return response;
+  }
+
+  /** Send only the consumer's exact durable identity; a refusal retains delivery. */
+  async sendBusinessAck(ack: BusinessDeliveryAck): Promise<void> {
+    if (!this.business || !this.daemonSupports(CAP_BUSINESS_DELIVERY) || !appendWireShape("ack", ack)) throw Error("BUSINESS_ACK");
+    const request_id = this.options.generateNonceHex();
+    const response = await this.send<BusinessDeliveryAckResponse>(request_id, wrapEnvelope("business_delivery_ack", {type:"business_delivery_ack", request_id, ack}));
+    if (Object.keys(response).sort().join(",") !== "ack,ok,request_id,type" || response.ok !== true || !appendWireShape("ack", response.ack)
+        || !Buffer.from(canonicalBytes(response.ack)).equals(Buffer.from(canonicalBytes(ack)))) throw Error("BUSINESS_ACK");
   }
 
   /** Begin reading frames from the transport and complete the handshake. */
@@ -416,6 +447,9 @@ export class IpcClient {
   // ---------- internals ----------
 
   private async completeHandshake(): Promise<void> {
+    // TS does not authenticate the daemon; Business acceptance rests on the pinned
+    // record signature and join, never transport identity. Must match business-record-consumer.ts.
+    const capabilities = this.business ? [...CASTLE_WALL_IPC_CAPABILITIES, CAP_BUSINESS_DELIVERY] : [...CASTLE_WALL_IPC_CAPABILITIES];
     const challenge = await this.awaitMessage<HandshakeChallenge>(
       "handshake_challenge",
       this.options.handshakeTimeoutMs
@@ -435,7 +469,7 @@ export class IpcClient {
           fortressId: this.key.fortressId,
           signingKeyId: this.key.signingKeyId,
           protocolVersion: CASTLE_WALL_IPC_PROTOCOL_VERSION,
-          capabilities: CASTLE_WALL_IPC_CAPABILITIES,
+          capabilities,
         }),
         this.key.encryptedPrivateKey,
         this.key.encryptionKey
@@ -468,7 +502,7 @@ export class IpcClient {
       // fields (both sides tolerate unknown JSON members), and a v2 daemon uses
       // them to decide whether it may reply to an `audit_drain_ack`.
       protocol_version: CASTLE_WALL_IPC_PROTOCOL_VERSION,
-      capabilities: [...CASTLE_WALL_IPC_CAPABILITIES],
+      capabilities,
     };
     const envelope = wrapEnvelope("handshake_response", response);
     await this.transport.send(frame(JSON.stringify(envelope)));
@@ -502,7 +536,8 @@ export class IpcClient {
   private handleFrame(body: string): void {
     let envelope: { method?: string; params?: { type?: string } & Record<string, unknown> };
     try {
-      envelope = JSON.parse(body) as typeof envelope;
+      // Strict parsing precedes object use so duplicate Business fields cannot disappear in JSON.parse.
+      envelope = (this.business ? parseStrict(Buffer.from(body, "utf8"), DAEMON_MAX_INBOUND_BODY_BYTES) : JSON.parse(body)) as typeof envelope;
     } catch (err) {
       this.handleFatal(
         new RuntimeIpcError(`malformed JSON envelope: ${(err as Error).message}`)
@@ -626,6 +661,8 @@ function expectedReplyType(requestType: string): string {
       return "policy_reload_response";
     case "policy_bundle_publish_request":
       return "policy_bundle_publish_response";
+    case "business_drain_request": return "business_drain_response";
+    case "business_delivery_ack": return "business_delivery_ack_response";
     case "audit_drain_request":
       return "audit_drain_response";
     case "audit_drain_ack":

@@ -132,3 +132,6 @@ pub mod constants {
     /// right pinned producer public key. Mirrors the TS constant.
     pub const PRODUCER_SIG_KEY_ID_V1: &str = "cw-audit-producer-v1";
 }
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub use business_profile::compose::compose_for_test;

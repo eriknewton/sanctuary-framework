@@ -1,19 +1,20 @@
 ---
 layout: null
 ---
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sanctuary. The open source standard for secure, private AI.</title>
-<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, with keys only you hold. Enforcement is proven on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package; Windows is roadmapped.">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sanctuary: your AI should answer to you</title>
+<meta name="description" content="Open-source software that keeps your AI agent answerable to you: keys on your machine, encrypted storage for what your agent saves through Sanctuary, connection rules you sign, approvals for the actions you choose, and a record you can check. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64), the latter through the separate Castle Wall Linux pre-release.">
 <meta name="author" content="Erik Newton">
-<meta name="theme-color" content="#0b1326">
+<meta name="theme-color" content="#FFFFFF">
+<link rel="canonical" href="https://sanctuaryprotocol.ai/">
 
 <!-- Open Graph -->
-<meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, with keys only you hold. Enforcement is proven on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package; Windows is roadmapped. Apache-2.0. Install with npx.">
+<meta property="og:title" content="Sanctuary: your AI should answer to you">
+<meta property="og:description" content="Open-source software that keeps your AI agent answerable to you: keys on your machine, encrypted storage for what your agent saves through Sanctuary, connection rules you sign, approvals for the actions you choose, and a record you can check. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64), the latter through the separate Castle Wall Linux pre-release. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -32,7 +33,7 @@ layout: null
   "name": "Sanctuary",
   "alternateName": "@sanctuary-framework/mcp-server",
   "applicationCategory": "SecurityApplication",
-  "operatingSystem": "macOS; Linux (Ubuntu 24.04 x86-64, bounded)",
+  "operatingSystem": "macOS; Linux",
   "softwareVersion": "1.8.4",
   "license": "https://www.apache.org/licenses/LICENSE-2.0",
   "url": "https://sanctuaryprotocol.ai/",
@@ -43,7 +44,7 @@ layout: null
     "@id": "https://sanctuaryprotocol.ai/#erik-newton",
     "name": "Erik Newton"
   },
-  "description": "A firewall for your AI agent that runs on your own machine. It enforces what the agent can reach at the operating-system level, under a policy you sign, with keys only you hold, and writes what the agent did to a hash-chained record. Enforcement is proven on macOS (a signed operator policy with per-uid allow and deny that survives attended reboots; not a per-rule, per-flow audit trail); on Linux it is proven on Ubuntu 24.04 (x86-64) only, for the separate Castle Wall Linux package; Windows is roadmapped. Apache-2.0. Installs with npx."
+  "description": "Open-source software that runs on your own machine. With the wall armed, the operating system allows or denies the connections of the agent's own account under a policy you sign, with keys only you hold, and what the agent does through Sanctuary goes into a hash-chained record whose tamper check is rated partial. The connection rules are proven on macOS (one host and one OS version; per-uid allow and deny that survives attended reboots, unattended survival unproven; not a per-rule, per-flow audit trail) and on Ubuntu 24.04 (x86-64) only, through the separate Castle Wall Linux 0.1.0-1 pre-release proven with a test program; Windows is roadmapped. Apache-2.0. Installs with npx."
 }
 </script>
 <script type="application/ld+json">
@@ -68,581 +69,279 @@ layout: null
 }
 </script>
 
-<!-- Fonts -->
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+<link rel="icon" href="/assets/home/favicon-a2.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/home/fonts.css">
+<style>
 
-<!-- Styles -->
-<link rel="stylesheet" href="/assets/css/site.css">
+:root {
+  color-scheme: light;
+  --page: #FFFFFF;
+  --tint: #F6F8FB;          /* a step lighter than the console's own #F4F6FA paper */
+  --ink: #0F172A; --ink-2: #4B5566; --ink-3: #5E6879;
+  --rule: #E3E7EF; --rule-2: #D9DEE9;
+  --indigo: #2F63E8; --indigo-hover: #1F4FC9; --indigo-bg: #EAEFFD;
+  --teal: #1FA3A3;
+  --sage: #037949; --sage-bg: #E1EFE9; --sage-line: #9AC9B6;
+  --ochre: #8B6508; --ochre-bg: #F1EDE1; --ochre-line: #D1C19C;
+  --neutral-line: #BCC2CF;
+  --mono: "Roboto Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --display: "Space Grotesk", "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --w: 1200px; --gutter: 24px;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 400 17px/1.65 var(--sans); -webkit-font-smoothing: antialiased; }
+a { color: var(--indigo); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+a:hover { color: var(--indigo-hover); }
+:focus-visible { outline: 2px solid var(--indigo); outline-offset: 2px; border-radius: 3px; }
+h1, h2, h3, p, ul, dl, dd, figure, pre { margin: 0; }
+ul { padding: 0; list-style: none; }
+img, svg { max-width: 100%; height: auto; display: block; }
+.wrap { max-width: var(--w); margin: 0 auto; padding: 0 var(--gutter); }
+.skip { position: absolute; left: -9999px; top: 0; background: var(--ink); color: #fff; padding: 10px 16px; z-index: 10; }
+.skip:focus { left: 12px; top: 12px; }
+.label { font: 500 12px/1.4 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
+.pv { background: var(--tint); border-bottom: 1px solid var(--rule); font: 400 12px/1.5 var(--mono); color: var(--ink-2); }
+.pv .wrap { padding-top: 7px; padding-bottom: 7px; }
+.pv a { color: var(--ink); }
+.top { background: var(--page); border-bottom: 1px solid var(--rule); }
+.bar { display: flex; align-items: center; gap: 8px 28px; flex-wrap: wrap; min-height: 64px; padding-top: 10px; padding-bottom: 10px; }
+.brand { display: inline-flex; align-items: center; gap: 10px; font: 700 19px/1 var(--display); letter-spacing: -.01em; color: var(--ink); text-decoration: none; }
+.brand:hover { color: var(--ink); }
+.brand svg { width: 30px; height: 30px; flex: none; }
+.nav { display: flex; align-items: center; gap: 4px 26px; flex-wrap: wrap; margin-left: auto; }
+.nav a { color: var(--ink-2); text-decoration: none; font: 500 15px/1 var(--sans); padding: 8px 0; }
+.nav a:hover { color: var(--ink); }
+.btn { display: inline-flex; align-items: center; justify-content: center; height: 46px; padding: 0 22px; border-radius: 8px; font: 600 16px/1 var(--sans); text-decoration: none; border: 1px solid transparent; }
+.btn.primary { background: var(--indigo); color: #fff; }
+.btn.primary:hover { background: var(--indigo-hover); color: #fff; }
+.btn.ink { background: var(--ink); color: #fff; }
+.btn.ink:hover { background: #1E293B; color: #fff; }
+.btn.ghost { background: #fff; color: var(--ink); border-color: var(--rule-2); }
+.btn.ghost:hover { border-color: var(--ink-3); color: var(--ink); }
+.btn.sm { height: 38px; padding: 0 16px; font-size: 15px; }
+.actions { display: flex; gap: 12px; flex-wrap: wrap; }
+.ic { display: inline-flex; width: 40px; height: 40px; align-items: center; justify-content: center; border-radius: 10px; background: var(--indigo-bg); }
+.ic svg { width: 22px; height: 22px; fill: none; stroke: var(--indigo); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px; border-radius: 6px; font: 500 11px/1 var(--mono); letter-spacing: .03em; border: 1px solid transparent; white-space: nowrap; }
+.chip i { width: 8px; height: 8px; display: inline-block; flex: none; }
+.chip.good { color: var(--sage); background: var(--sage-bg); border-color: var(--sage-line); }
+.chip.good i { background: var(--sage); border-radius: 50%; }
+.chip.warn { color: var(--ochre); background: var(--ochre-bg); border-color: var(--ochre-line); }
+.chip.warn i { background: var(--ochre); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.chip.neutral { color: var(--ink-2); background: #fff; border-color: var(--neutral-line); }
+.chip.neutral i { border: 1.5px solid var(--ink-3); border-radius: 50%; }
+.cmd { border: 1px solid var(--rule-2); border-radius: 10px; background: var(--tint); overflow: hidden; margin: 14px 0; }
+.cmd-h { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; border-bottom: 1px solid var(--rule); }
+.cmd pre { padding: 14px; font: 400 14px/1.6 var(--mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); }
+.copy { font: 500 12px/1 var(--mono); color: var(--ink-2); background: #fff; border: 1px solid var(--rule-2); border-radius: 6px; height: 28px; padding: 0 10px; cursor: pointer; }
+.start { display: grid; grid-template-columns: 1.4fr 1fr; gap: 56px; }
+.start h3 { font: 600 20px/1.3 var(--display); margin-bottom: 8px; }
+.start p { color: var(--ink-2); }
+.start p + p { margin-top: 10px; }
+.more { display: inline-block; margin-top: 12px; font-weight: 600; }
+.contact li { padding: 8px 0; border-bottom: 1px solid var(--rule); color: var(--ink-2); }
+.foot { border-top: 1px solid var(--rule); padding: 56px 0 40px; background: var(--page); font-size: 15px; }
+.foot-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 32px; }
+.foot .about p { color: var(--ink-2); margin-top: 12px; max-width: 42ch; }
+.foot h2 { font: 500 12px/1.4 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 12px; }
+.foot li { padding: 4px 0; }
+.foot li a { color: var(--ink-2); text-decoration: none; }
+.foot li a:hover { color: var(--ink); text-decoration: underline; }
+.fine { margin-top: 40px; color: var(--ink-3); font-size: 14px; }
+.provenance { font: 400 12px/1.6 var(--mono); color: var(--ink-3); }
+@media (max-width: 860px) {
+  body { font-size: 16px; }
+  .nav { display: none; }
+  .bar .btn { margin-left: auto; }
+  .start, .foot-grid { grid-template-columns: 1fr; gap: 32px; }
+}
 
-<!-- Favicon: inline SVG diamond mark in signature gradient -->
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ddb7ff'/%3E%3Cstop offset='1' stop-color='%234fdbc8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M16 2 30 16 16 30 2 16z'/%3E%3C/svg%3E">
+.hero { text-align: center; padding: 96px 0 56px; }
+.hero h1 { font: 700 68px/1.04 var(--display); letter-spacing: -.035em; max-width: 18ch; margin: 0 auto; text-wrap: balance; }
+.hero h1 span { display: block; }
+.hero h1 span { background: linear-gradient(100deg, var(--indigo), var(--teal)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero .lede { font-size: 20px; line-height: 1.6; color: var(--ink-2); max-width: 62ch; margin: 28px auto 0; }
+.hero .actions { justify-content: center; margin-top: 36px; }
+.stage { background: linear-gradient(to bottom, var(--page) 0, var(--page) 38%, var(--tint) 38%, var(--tint) 100%); padding-bottom: 72px; }
+.shot { margin: 0; }
+.shot img { border-radius: 14px; border: 1px solid var(--rule-2); box-shadow: 0 1px 2px rgba(15,23,42,.06), 0 24px 60px -18px rgba(15,23,42,.22); background: #fff; }
+.shot figcaption { margin-top: 18px; color: var(--ink-2); font-size: 15px; text-align: center; max-width: 70ch; margin-left: auto; margin-right: auto; }
+.stage .provenance { text-align: center; margin-top: 6px; }
+.s { padding: 112px 0; }
+.s.tint { background: var(--tint); }
+.eyebrow { color: var(--indigo); margin-bottom: 14px; }
+h2 { font: 700 44px/1.1 var(--display); letter-spacing: -.025em; max-width: 22ch; }
+.split { display: grid; grid-template-columns: 1fr 1.1fr; gap: 64px; align-items: start; }
+.prose p { color: var(--ink-2); font-size: 18px; }
+.prose p + p { margin-top: 18px; }
+.prose .turn { color: var(--ink); font-weight: 600; border-left: 3px solid var(--indigo); padding-left: 18px; }
+.promises { display: grid; grid-template-columns: repeat(4, 1fr); gap: 36px; margin-top: 56px; }
+.promises .label { margin-top: 20px; }
+.promises h3 { font: 600 21px/1.25 var(--display); margin: 6px 0 10px; }
+.promises p:last-child { color: var(--ink-2); font-size: 16px; }
+.bound { margin-top: 56px; padding: 20px 24px; border: 1px solid var(--rule); border-radius: 12px; background: #fff; color: var(--ink-2); font-size: 15px; }
+.bound .label { margin-bottom: 6px; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 72px; align-items: center; }
+.row + .row { margin-top: 96px; }
+.row h3 { font: 700 32px/1.15 var(--display); letter-spacing: -.02em; margin-bottom: 14px; }
+.row p { color: var(--ink-2); font-size: 18px; }
+.row .shot figcaption { text-align: left; margin-left: 0; font-size: 14px; }
+.row .shot.narrow img { max-width: min(440px, 100%); }
+.row > * { min-width: 0; }
+.row.wide { grid-template-columns: 1fr; gap: 28px; }
+.row.wide .txt { max-width: 640px; }
+.diff { display: grid; grid-template-columns: repeat(2, 1fr); gap: 40px 64px; margin-top: 48px; }
+.diff dt { font: 600 20px/1.3 var(--display); margin-bottom: 6px; }
+.diff dt::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: var(--teal); margin-right: 12px; vertical-align: middle; position: relative; top: -2px; }
+.diff dd { color: var(--ink-2); }
+.status { display: grid; grid-template-columns: 1.2fr 1fr; gap: 56px; align-items: start; }
+.status-line { font: 600 26px/1.3 var(--display); letter-spacing: -.01em; margin-bottom: 14px; }
+.status p.more-p { color: var(--ink-2); }
+.plats { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid var(--rule); border-radius: 12px; background: #fff; font-size: 15px; }
+.plats th, .plats td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+.plats thead th { font: 500 11px/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+.plats tbody th { font-weight: 600; }
+.plats tbody tr:last-child th, .plats tbody tr:last-child td { border-bottom: 0; }
+@media (max-width: 520px) { .plats th, .plats td { padding: 10px 8px; } .plats .chip { font-size: 10px; padding: 0 6px; } }
+.trust { display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; margin-top: 40px; }
+.trust li { border-top: 2px solid var(--ink); padding-top: 16px; color: var(--ink-2); font-size: 15px; }
+.trust b { display: block; color: var(--ink); font: 600 17px/1.3 var(--display); margin-bottom: 6px; }
+@media (max-width: 860px) {
+  .hero { padding: 56px 0 36px; }
+  .hero h1 { font-size: 42px; }
+  .hero .lede { font-size: 17px; }
+  .s { padding: 72px 0; }
+  h2 { font-size: 32px; }
+  .split, .row, .status { grid-template-columns: 1fr; gap: 32px; }
+  .row + .row { margin-top: 64px; }
+  .promises { grid-template-columns: 1fr 1fr; gap: 28px; }
+  .diff, .trust { grid-template-columns: 1fr; }
+  .stage { padding-bottom: 48px; }
+}
+@media (max-width: 520px) { .promises { grid-template-columns: 1fr; } }
+
+</style>
 </head>
 <body>
-
 <a class="skip" href="#main">Skip to content</a>
-
-<nav class="nav" aria-label="Primary">
-  <div class="nav__inner">
-    <a class="nav__brand" href="/">
-      <span class="nav__brand-mark" aria-hidden="true"></span>
-      Sanctuary
-    </a>
-    <div class="nav__links">
-      <a href="#layers">Architecture</a>
-      <a href="#quickstart">Quickstart</a>
-      <a href="#harnesses">Harnesses</a>
-      <a href="/blog/">Journal</a>
-      <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
-    </div>
-    <div class="nav__actions">
-      <a class="btn btn--secondary btn--sm" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
-      <a class="btn btn--primary btn--sm" href="https://github.com/eriknewton/sanctuary-framework">Install</a>
-    </div>
-  </div>
-</nav>
-
+<header class="top"><div class="wrap bar">
+  <a class="brand" href="/"><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><linearGradient id="sa2a11" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2F63E8"/><stop offset="1" stop-color="#1FA3A3"/></linearGradient></defs><rect width="32" height="32" rx="8" fill="url(#sa2a11)"/><g color="#FFFFFF" transform="translate(3.2 3.2) scale(0.8)"><circle cx="16" cy="16" r="14.6" fill="none" stroke="currentColor" stroke-width="1.8"/><defs><clipPath id="sa2a12"><path d="M32 10.75H12.14V16H19.86V21.25H0V0H32Z"/></clipPath><clipPath id="sa2a13"><path d="M32 10.75H12.14V16H19.86V21.25H0V32H32Z"/></clipPath><clipPath id="sa2a14"><path d="M16 4.8L27.2 16L16 27.2L4.8 16Z"/></clipPath><mask id="sa2a15" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32"><rect width="32" height="32" fill="#fff"/><path d="M32 10.75H12.14V16H19.86V21.25H0" fill="none" stroke="#000" stroke-width="2.7"/></mask></defs><g clip-path="url(#sa2a14)"><g mask="url(#sa2a15)"><path d="M16 4.8L27.2 16L16 27.2L4.8 16Z" fill="currentColor" opacity="1" clip-path="url(#sa2a12)"/><path d="M16 4.8L27.2 16L16 27.2L4.8 16Z" fill="currentColor" opacity="0.78" clip-path="url(#sa2a13)"/></g><path d="M32 10.75H12.14V16H19.86V21.25H0" fill="none" stroke="currentColor" stroke-opacity="0.4" stroke-width="2.7"/></g></g></svg>
+Sanctuary</a>
+  <nav class="nav" aria-label="Primary"><a href="#h-answer">How it works</a><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Evidence</a><a href="#h-start">Install</a><a href="/blog/">Journal</a><a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a></nav>
+  <a class="btn primary sm" href="#h-start">Install</a>
+</div></header>
 <main id="main">
+<section class="hero"><div class="wrap">
+  <h1>Your AI should answer to you. <span>Only you.</span></h1>
+  <p class="lede">AI agents are starting to act with your data, your keys, your money and your name, on systems someone else controls. Sanctuary is the open-source ground they stand on: keys that stay on your machine, encrypted storage for what your agent saves through Sanctuary, connection rules you sign, a human yes for the actions you choose, and a record you can check.</p>
+  <p class="actions"><a class="btn primary" href="#h-start">Install</a><a class="btn ghost" href="#h-answer">How it works</a></p>
+</div></section>
 
-  <!-- ===================== HERO ===================== -->
-  <section class="hero container" aria-labelledby="hero-title">
-    <div class="hero__eyebrow">
-      <span class="hero__eyebrow-dot" aria-hidden="true"></span>
-      <span class="eyebrow">Open source · Apache-2.0 · v1.8.4 stable on npm</span>
-    </div>
+<div class="stage"><div class="wrap">
+  <figure class="shot"><img src="/assets/home/console-approvals-hero.png" width="2400" height="964" alt="The Sanctuary console's Approvals screen in its light theme. A queue lists two held requests from demo agents, a Tier 1 state export and a Tier 2 state write, each waiting for a decision, with Allow once and Deny buttons. A side panel explains what the selected request wants to do and why it is held." loading="eager"><figcaption>The console's Approvals screen. An agent asked to export stored data; the request waits until you allow or deny it, and the decision goes into your record.</figcaption></figure>
+  <p class="provenance">Real captures of the Sanctuary console, which ships in the 1.9.0 preview, not yet in the stable release. Recorded 2026-11-17 from a development build (v1.9.0-rc.4) running seeded demo data, not a live user's machine, and cropped to fit.</p>
+</div></div>
 
-    <h1 id="hero-title" class="hero__title">
-      Your agent knows a lot about you.<br>
-      <span class="text-gradient">Sanctuary keeps that information private.</span>
-    </h1>
+<section class="s" aria-labelledby="h-problem"><div class="wrap split">
+  <div><p class="label eyebrow">The problem</p><h2 id="h-problem">One bad web page can turn your agent against you.</h2></div>
+  <div class="prose"><p>Say you give an assistant your email, your files, your logins and a card for paying bills. It answers mail, sorts documents and pays what is due while you get on with your day.</p><p>Then it opens a page someone wrote for it, with instructions hidden in the text: send these files here, use the card, say nothing. The agent cannot tell those words from yours, so it does what they say, with everything you trusted it to hold.</p><p class="turn">A safeguard inside the agent holds only while the agent stays on your side. A safeguard run by some company asks you to trust that company. Sanctuary puts its connection rules on your own machine, below the agent, where they do not depend on the agent's cooperation.</p></div>
+</div></section>
 
-    <p class="hero__sub">
-      Sanctuary is a firewall for your AI agent that runs on your own Mac. It enforces what the
-      agent is allowed to reach at the operating-system level, with keys only
-      you hold, and it does not depend on the agent's cooperation. The enforcement lives below
-      the agent, inside the operating system itself.
-    </p>
+<section class="s tint" aria-labelledby="h-answer"><div class="wrap">
+  <p class="label eyebrow">The answer</p>
+  <h2 id="h-answer">Four promises, kept on your machine.</h2>
+  <ul class="promises">
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="7.5" cy="12" r="3.75"/><path d="M11.25 12H21M17.5 12v3.25M21 12v2.5"/></svg></span><p class="label">Keys</p><h3>You hold the keys.</h3><p>Your agent's keys are made on your machine and locked under your passphrase, and the project keeps no copy.</p></li>
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="2.5"/><path d="M5 6v12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V6M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg></span><p class="label">Memory</p><h3>You keep the memory.</h3><p>What your agent stores through Sanctuary is encrypted at rest on your machine, readable only with your keys. Files it writes by other means are outside that.</p></li>
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3.5 12h11M11 8.5l3.5 3.5-3.5 3.5"/><path d="M19.5 5v14" stroke-width="2.25"/></svg></span><p class="label">Connections</p><h3>You decide where it connects.</h3><p>With the wall armed on macOS or Ubuntu 24.04 (x86-64), a policy you signed allows or refuses each destination for the agent's own account. Actions you mark for approval wait for your yes.</p></li>
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="9.5" width="5" height="5" rx="1"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><rect x="16.5" y="9.5" width="5" height="5" rx="1"/><path d="M7.5 12h2M14.5 12h2"/></svg></span><p class="label">Record</p><h3>You can check what happened.</h3><p>Sanctuary writes what your agent does through it into a hash-chained record. Checking that record for tampering is still rated partial.</p></li>
+</ul>
+  <div class="bound"><p class="label">Where these stop today</p><p>The connection rules cover a separate account you create for the agent, and decide where it may connect, not what an allowed connection carries. The approval step covers only tool calls that go through Sanctuary, so a harness's own built-in tools skip it, and whatever the agent sends to its AI model can be seen by that model's provider.</p></div>
+</div></section>
 
-    <p class="hero__sub" style="opacity:0.66;margin-top:-0.75rem;">
-      Proven on macOS. Ubuntu 24.04 x86-64: the fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package. Windows: roadmapped.
-    </p>
-
-    <!-- Install block -->
-    <div class="install surface-card">
-      <div class="install__label">
-        <span>Install</span>
-        <span>Node 22+ · macOS wall proven · Ubuntu 24.04 bounded proof</span>
-      </div>
-      <div class="install__row">
-        <code class="install__cmd mono"><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server protect --claude-code</code>
-        <button type="button" class="install__copy" data-copy="npx -y @sanctuary-framework/mcp-server protect --claude-code" aria-label="Copy install command">Copy</button>
-      </div>
-      <div class="install__label">
-        <span>Interactive form: opens the dashboard in your browser.</span>
-        <span>Agents: the headless install, verify and uninstall lines are in the <a href="#quickstart">quickstart</a>.</span>
-      </div>
-    </div>
-
-    <div class="btn-row" style="margin-bottom: 3rem;">
-      <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">
-        View on GitHub
-      </a>
-      <a class="btn btn--secondary" href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">
-        Read the docs
-      </a>
-      <a class="btn btn--terminal" href="#quickstart">60-second quickstart</a>
-    </div>
-
-    <div class="hero__stats" aria-label="Project stats">
-      <div class="hero__stat"><strong>5</strong><span>Castle layers</span></div>
-      <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
-    </div>
-  </section>
-
-  <!-- ===================== PROVISIONING ===================== -->
-  <section class="section section--floor" aria-labelledby="provisioning-title">
-    <div class="container">
-      <div class="section__heading">
-        <span class="eyebrow">Local node</span>
-        <h2 id="provisioning-title">One command. <span class="text-gradient">Full stack, running locally.</span></h2>
-        <p>
-          Sanctuary runs on your hardware with your keys. Policy-gated calls route through local
-          approval surfaces, and Castle Wall enforcement follows the platform bounds in the
-          Assurance Matrix. Point a supported MCP-compatible agent at it, and the cooperative substrate is live.
-        </p>
-      </div>
-
-      <div class="provisioning">
-        <!-- Boot log -->
-        <div class="bootlog" aria-label="Bootstrap log">
-          <div class="bootlog__header">
-            <span>boot.log</span>
-            <span>stdio://sanctuary</span>
-          </div>
-          <span class="bootlog__line t-hdr">:: bootstrap_local_node</span>
-          <span class="bootlog__line t-dim">generate_ed25519_keypair...</span>
-          <span class="bootlog__line">id: <span class="t-pri">did:key:z6Mki7f8a...e90</span></span>
-          <span class="bootlog__line">&nbsp;</span>
-          <span class="bootlog__line t-hdr">:: init_aes_256_gcm_encryption</span>
-          <span class="bootlog__line t-dim">master_kdf = argon2id(m=64mb, t=3, p=4)</span>
-          <span class="bootlog__line">mounting vault at <span class="t-pri">~/.sanctuary/state</span></span>
-          <span class="bootlog__line">&nbsp;</span>
-          <span class="bootlog__line t-hdr">:: load_principal_policy</span>
-          <span class="bootlog__line t-dim">tier_1 ops = 5 (approval gated)</span>
-          <span class="bootlog__line t-dim">tier_2 ops = 14 (anomaly gated)</span>
-          <span class="bootlog__line t-dim">tier_3 ops = 43 (audit logged)</span>
-          <span class="bootlog__line">&nbsp;</span>
-          <span class="bootlog__line t-hdr">:: spawn_approval_dashboard</span>
-          <span class="bootlog__line t-ok">status: gateway_online @ 127.0.0.1:3501</span>
-          <span class="bootlog__line">&nbsp;</span>
-          <span class="bootlog__line t-ok">&gt; ready. waiting for harness <span class="cursor">_</span></span>
-        </div>
-
-        <!-- Feature list -->
-        <ul class="provisioning__list">
-          <li class="provisioning__item">
-            <span class="provisioning__marker">01</span>
-            <div>
-              <h3 class="provisioning__heading">Kernel-level egress wall</h3>
-              <p class="provisioning__body">
-                On macOS today, the Castle Wall blocks unauthorized outbound calls
-                at the operating system. Within the proven scope the enforcement does not depend on
-                the agent's cooperation, because the kernel itself enforces. It enforces a signed
-                operator policy, per account, and re-establishes itself after a restart.
-                On Ubuntu 24.04 (x86-64), a fresh install of the shipped package
-                enforces a signed operator policy per user account: blocked destinations stay blocked
-                and allowed ones connect, through five reboots, on three fresh servers, with
-                the evidence checked by two independent reviewers. Other Linux distributions,
-                DNS, DoH, DoT, hostname paths, and a real-agent harness remain unproven.
-              </p>
-            </div>
-          </li>
-          <li class="provisioning__item">
-            <span class="provisioning__marker">02</span>
-            <div>
-              <h3 class="provisioning__heading">Client-side keys</h3>
-              <p class="provisioning__body">
-                Ed25519 identity generated locally. AES-256-GCM on every write. Keys never leave
-                the box and never appear in any MCP response, log, or error.
-              </p>
-            </div>
-          </li>
-          <li class="provisioning__item">
-            <span class="provisioning__marker">03</span>
-            <div>
-              <h3 class="provisioning__heading">Local approval dashboard</h3>
-              <p class="provisioning__body">
-                Dark-theme web UI on <code class="mono">127.0.0.1:3501</code>. Approve and deny
-                buttons, audit viewer. Optional TLS and webhook channels for
-                headless setups.
-              </p>
-            </div>
-          </li>
-        </ul>
-      </div>
-    </div>
-  </section>
-
-  <!-- ===================== CASTLE ARCHITECTURE ===================== -->
-  <section id="layers" class="section" aria-labelledby="layers-title">
-    <div class="container">
-      <div class="section__heading">
-        <span class="eyebrow">Architecture</span>
-        <h2 id="layers-title">The Castle Architecture.</h2>
-        <p>
-          Five named layers, each with a distinct contract. Castle Wall: operating-system egress
-          enforcement, proven on macOS and, on Linux, proven on Ubuntu 24.04
-          (x86-64) only. Sentinels: behavioral observation inside the box. Charter: the encrypted
-          state and policy surface for cooperative agents. Heralds: receipts and reputation that
-          travel across vendors. Mantle: the install-time mechanism that binds the other four to
-          your machine. The layers compose, and none of them substitutes for another.
-        </p>
-      </div>
-
-      <div class="layers">
-        <article class="layer surface-card">
-          <span class="layer__id">Perimeter</span>
-          <h3 class="layer__title">Castle Wall</h3>
-          <p class="layer__body">
-            Operating-system-level egress filtering. Network Extension on macOS, where Phase 1
-            is proven on a signed and notarized build. On Ubuntu 24.04 (x86-64),
-            a fresh install of the shipped package enforces a signed operator
-            policy per user account through five reboots on three fresh servers; DNS, DoH, DoT,
-            hostname paths, and other Linux platforms remain unproven.
-          </p>
-          <div class="layer__tags">
-            <span class="layer__tag">kernel-binding</span>
-            <span class="layer__tag">cgroup-v2</span>
-            <span class="layer__tag">per-account-policy</span>
-          </div>
-        </article>
-
-        <article class="layer surface-card">
-          <span class="layer__id">Observation</span>
-          <h3 class="layer__title">Sentinels</h3>
-          <p class="layer__body">
-            Internal behavioral observation. Cross-platform auditd-tail, plus an eBPF watcher
-            scaffold on Linux that currently falls back to stub mode because the real probe loader
-            is not implemented. Seven
-            sentinels watching for prompt-injection signatures, anomalous tool sequences, and
-            policy drift. The sentinels surface; the operator decides.
-          </p>
-          <div class="layer__tags">
-            <span class="layer__tag">ebpf</span>
-            <span class="layer__tag">auditd-tail</span>
-            <span class="layer__tag">seven-sentinels</span>
-          </div>
-        </article>
-
-        <article class="layer surface-card">
-          <span class="layer__id">Cooperative surface</span>
-          <h3 class="layer__title">Charter (Cooperative MCP)</h3>
-          <p class="layer__body">
-            Encrypted state, hash-chained audit, mandate primitives, canonical policy slots, and
-            substrate selector. Production call sites sign audit checkpoints when the fortress
-            holds an identity; a fortress with no identity yet, and the root daemon's split audit
-            store, write honest unsigned checkpoints, and the audit-chain row stays partial
-            pending the IC-05 external-verifier drill. Compliant agents that voluntarily route
-            through Sanctuary get the full surface. On macOS with the wall installed and armed,
-            non-compliant agents still hit the wall and the Sentinels.
-          </p>
-          <div class="layer__tags">
-            <span class="layer__tag">approval-gates</span>
-            <span class="layer__tag">context-gate</span>
-            <span class="layer__tag">audit-log</span>
-          </div>
-        </article>
-
-        <article class="layer surface-card">
-          <span class="layer__id">Accountability</span>
-          <h3 class="layer__title">Heralds (Receipts and Reputation)</h3>
-          <p class="layer__body">
-            Cryptographic receipts on cross-castle transactions, portable reputation that
-            survives vendor churn. Concordia structures negotiation and commitments; Verascore
-            prices the reputation. Operators carry the trust record across vendors.
-          </p>
-          <div class="layer__tags">
-            <span class="layer__tag">concordia</span>
-            <span class="layer__tag">verascore</span>
-            <span class="layer__tag">portable</span>
-          </div>
-        </article>
-
-        <article class="layer surface-card">
-          <span class="layer__id">Substrate</span>
-          <h3 class="layer__title">Mantle (install-time binding)</h3>
-          <p class="layer__body">
-            Install-time substrate-binding to the operator. The Mantle gives the rest of the
-            castle a verifiable anchor on the operator's machine before the agent runs.
-            Template init rejects orphan agent identifiers that are not bound to a wrapped harness.
-          </p>
-          <div class="layer__tags">
-            <span class="layer__tag">install-time</span>
-            <span class="layer__tag">substrate-binding</span>
-            <span class="layer__tag">verifiable</span>
-          </div>
-        </article>
-      </div>
-    </div>
-  </section>
-
-  <!-- ===================== HARNESSES ===================== -->
-  <section id="harnesses" class="section section--floor" aria-labelledby="harnesses-title">
-    <div class="container">
-      <div class="section__heading">
-        <span class="eyebrow">Interop</span>
-        <h2 id="harnesses-title">Drop it into your MCP harness.</h2>
-        <p>
-          Sanctuary speaks standard MCP over stdio. Claude Code, Cursor, Hermes, OpenClaw
-          and Cline have tested wrapping paths. CrewAI connects through its mcps field with a stdio server and
-          LangChain through the langchain-mcp-adapters package, as shown below; neither
-          has a tested wrapping path.
-        </p>
-      </div>
-
-      <div class="harnesses">
-        <article class="surface-card">
-          <div class="harness__title">
-            <strong>Claude Code</strong>
-            <span>mcp · stdio</span>
-          </div>
-          <div class="code-card">
-<pre><code><span class="token--dim">// .mcp.json</span>
-"mcpServers": {
-  "sanctuary": {
-    "command": "npx",
-    "args": ["-y", "@sanctuary-framework/mcp-server"]
-  }
-}</code></pre>
-          </div>
-        </article>
-
-        <article class="surface-card">
-          <div class="harness__title">
-            <strong>OpenClaw</strong>
-            <span>mcp · stdio</span>
-          </div>
-          <div class="code-card">
-<pre><code><span class="token--dim"># ~/.openclaw/mcp.yaml</span>
-servers:
-  sanctuary:
-    type: stdio
-    command: npx
-    args: ["-y", "-p", "@sanctuary-framework/mcp-server",
-           "sanctuary-mcp-server"]</code></pre>
-          </div>
-        </article>
-
-        <article class="surface-card">
-          <div class="harness__title">
-            <strong>CrewAI</strong>
-            <span>python · mcp</span>
-          </div>
-          <div class="code-card">
-<pre><code><span class="token--dim"># crewai 1.15+ (crewai.mcp), local stdio server</span>
-from crewai import Agent
-from crewai.mcp import MCPServerStdio
-
-agent = Agent(
-  role="analyst",
-  goal="answer with Sanctuary's tools",
-  backstory="runs under operator custody",
-  mcps=[MCPServerStdio(
-    command="npx",
-    args=["-y", "@sanctuary-framework/mcp-server"],
-  )],
-)</code></pre>
-          </div>
-        </article>
-
-        <article class="surface-card">
-          <div class="harness__title">
-            <strong>LangChain</strong>
-            <span>python · adapter</span>
-          </div>
-          <div class="code-card">
-<pre><code><span class="token--dim"># langchain-mcp-adapters</span>
-import asyncio
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
-async def main():
-    client = MultiServerMCPClient(
-        {
-            "sanctuary": {
-                "command": "npx",
-                "args": ["-y", "@sanctuary-framework/mcp-server"],
-                "transport": "stdio",
-            }
-        }
-    )
-    tools = await client.get_tools()
-
-asyncio.run(main())</code></pre>
-          </div>
-        </article>
-      </div>
-    </div>
-  </section>
-
-  <!-- ===================== QUICKSTART ===================== -->
-  <section id="quickstart" class="section" aria-labelledby="quickstart-title">
-    <div class="container">
-      <div class="section__heading">
-        <span class="eyebrow">60 seconds</span>
-        <h2 id="quickstart-title">From zero to <span class="text-gradient">custody</span>.</h2>
-        <p>
-          Three commands, in order: install, verify, uninstall. Each exists on the v1.8.4 tag that
-          <code>npx</code> resolves to, and none of them prompts when stdin is not a terminal.
-        </p>
-      </div>
-
-      <div class="quickstart">
-        <article class="step surface-card">
-          <span class="step__number">Step 01 · Protect</span>
-          <h3 class="step__heading">Wrap the harness you already run</h3>
-          <p class="step__body">One npx command. It backs up your harness config, rewrites its MCP server entries to point at Sanctuary, and starts the dashboard unless you pass <code>--no-dashboard</code>. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (<a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Assurance Matrix</a>, Agent wrapping). Substitute <code>--openclaw</code>, <code>--hermes</code>, <code>--cursor</code>, <code>--cline</code>, <code>--mastra</code> (fixture-tested only; no live Mastra-agent drill recorded), or <code>--wrap &lt;path-to-config&gt;</code> for <code>--claude-code</code>; other MCP-compatible harnesses work via the <code>--wrap</code> flag and are covered as drills extend the matrix.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard</code></pre>
-          <p class="step__body"><code>-y</code> skips npm's install prompt. <code>--no-open</code> runs headless: it skips opening the dashboard in a browser. <code>--no-dashboard</code> skips the per-call dashboard, which otherwise serves in the foreground until you stop it; start it later with <code>sanctuary dashboard</code>. After <code>npm install -g @sanctuary-framework/mcp-server</code>, the <code>sanctuary</code> command replaces the <code>npx -y @sanctuary-framework/mcp-server</code> prefix, and the rest of this page writes <code>sanctuary</code>. The Sovereignty Dashboard starts on <code>http://localhost:3501</code> (or the next free port, trying up to twenty ports from 3501).</p>
-        </article>
-
-        <article class="step surface-card">
-          <span class="step__number">Step 02 · Verify</span>
-          <h3 class="step__heading">Read one JSON object</h3>
-          <p class="step__body"><code>doctor --json</code> is read-only. Healthy: exit code 0 and no check with <code>"status": "FAIL"</code>. Failing: exit code 1 and at least one <code>FAIL</code> check whose <code>hint</code> names the next step. Read <code>storage_path</code> before the checks: <code>doctor</code> pointed at the wrong <code>--fortress</code> path reports a healthy runtime and a failing fortress.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server doctor --json</code></pre>
-        </article>
-
-        <article class="step surface-card">
-          <span class="step__number">Step 03 · Uninstall</span>
-          <h3 class="step__heading">Remove the footprint, keep your data</h3>
-          <p class="step__body"><code>uninstall</code> removes Sanctuary's installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it reports any residue that needs sudo, the Castle Wall host app, or a reboot. <code>sanctuary protect --unwrap</code> restores the original harness config from <code>~/.sanctuary/backup/</code> and removes nothing else.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server uninstall</code></pre>
-        </article>
-      </div>
-
-      <div class="btn-row" style="margin-top: 2.5rem; justify-content: center;">
-        <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">Clone the repo</a>
-        <a class="btn btn--secondary" href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart">Full quickstart guide</a>
-      </div>
-    </div>
-  </section>
-
-  <!-- ===================== JOURNAL ===================== -->
-  <section class="section section--floor" aria-labelledby="journal-title">
-    <div class="container">
-      <div class="section__heading">
-        <span class="eyebrow">Journal</span>
-        <h2 id="journal-title">Field notes from the substrate layer.</h2>
-        <p>Design decisions, security write-ups, and the reasoning behind the architecture.</p>
-      </div>
-
-      <div class="journal">
-        <a class="journal__card surface-card" href="/2026/07/13/residency-is-not-custody.html">
-          <div class="journal__meta">
-            <span>Position</span>
-            <span>2026-07-13</span>
-          </div>
-          <h3 class="journal__title">Residency Is Not Custody</h3>
-          <p class="journal__excerpt">
-            Microsoft's CEO says data location was never the point. He's right. The test for
-            AI security is custody: who holds the keys, what enforces the deny, and who can
-            edit the record. Three questions, and the drill evidence behind ours.
-          </p>
-          <span class="btn btn--terminal">Read the post</span>
-        </a>
-
-        <a class="journal__card surface-card" href="/2026/05/15/nobody-else-was-going-to-build-it.html">
-          <div class="journal__meta">
-            <span>Story</span>
-            <span>2026-05-15</span>
-          </div>
-          <h3 class="journal__title">Nobody Else Was Going to Build It</h3>
-          <p class="journal__excerpt">
-            Why I left a startup four years ago, why I waited, and why one morning in February
-            I leapt out of bed and started coding. The Castle Architecture is the iteration
-            that finally got the framing right.
-          </p>
-          <span class="btn btn--terminal">Read the post</span>
-        </a>
-
-        <a class="journal__card surface-card" href="/2026/05/08/castle-wall-phase-1-linux.html">
-          <div class="journal__meta">
-            <span>Architecture</span>
-            <span>2026-05-08</span>
-          </div>
-          <h3 class="journal__title">The Castle Wall, Linux Phase 1 Source Path</h3>
-          <p class="journal__excerpt">
-            Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does on macOS, within the proven scope.
-            Current correction: the May 2026 source-path claim is retired; a later Ubuntu 24.04
-            x86-64 package has the narrowed fresh-install per-account proof.
-          </p>
-          <span class="btn btn--terminal">Read the post</span>
-        </a>
-      </div>
-
-      <div class="btn-row" style="margin-top: 2.5rem;">
-        <a class="btn btn--secondary" href="/blog/">All posts →</a>
-      </div>
-    </div>
-  </section>
-
-  <!-- ===================== CTA ===================== -->
-  <section class="section" aria-labelledby="cta-title">
-    <div class="container">
-      <div class="cta surface-card">
-        <span class="eyebrow">Ship agents you actually control</span>
-        <h2 id="cta-title">Put the Sanctuary wall around your agent.</h2>
-        <p>Open source and local-first. Castle Wall enforcement is proven on macOS, and on Ubuntu 24.04 (x86-64) for the fresh-install per-account signed-policy claim in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
-        <div class="btn-row" style="justify-content: center;">
-          <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">View on GitHub</a>
-          <a class="btn btn--secondary" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Install from npm</a>
-        </div>
-      </div>
-    </div>
-  </section>
-
-</main>
-
-<!-- ===================== FOOTER ===================== -->
-<footer class="footer">
-  <div class="container">
-    <div class="footer__grid">
-      <div class="footer__brand">
-        <a class="nav__brand" href="/">
-          <span class="nav__brand-mark" aria-hidden="true"></span>
-          Sanctuary
-        </a>
-        <p>
-          A custody substrate for AI agents: operating-system enforcement is proven on macOS, and the
-          Ubuntu 24.04 (x86-64) fresh-install per-account signed-policy claim
-          is proven within the Assurance Matrix bounds; Windows remains roadmap for enforcement, with
-          portable reputation and current bounds in the Assurance Matrix.
-        </p>
-      </div>
-
-      <div class="footer__col">
-        <h5>Project</h5>
-        <ul>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a></li>
-          <li><a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">Docs</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md">Changelog</a></li>
-        </ul>
-      </div>
-
-      <div class="footer__col">
-        <h5>Architecture</h5>
-        <ul>
-          <li><a href="#layers">Castle Architecture</a></li>
-          <li><a href="#harnesses">Harness support</a></li>
-          <li><a href="#quickstart">Quickstart</a></li>
-          <li><a href="/blog/">Journal</a></li>
-        </ul>
-      </div>
-
-      <div class="footer__col">
-        <h5>Legal</h5>
-        <ul>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE">License</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/GOVERNANCE.md">Governance</a></li>
-        </ul>
-      </div>
-    </div>
-
-    <div class="footer__bottom">
-      <div>© 2026 Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (specification).</div>
-      <div class="footer__status">
-        <span class="footer__status-dot" aria-hidden="true"></span>
-        <span>v1.8.4 stable on npm</span>
-      </div>
-    </div>
+<section class="s" aria-labelledby="h-see"><div class="wrap">
+  <p class="label eyebrow">See it</p>
+  <h2 id="h-see" style="margin-bottom:64px">You stay in the loop, and you can check the record.</h2>
+  <div class="row">
+    <div class="txt"><h3>Actions you mark for approval wait for your yes.</h3><p>When an agent asks, through Sanctuary, to do something your policy marks for approval, Sanctuary holds it and shows you what it wants and why it stopped. You allow it once or deny it, and the decision is recorded.</p></div>
+    <figure class="shot narrow"><img src="/assets/home/detail-approval-drawer.png" width="843" height="898" alt="Detail of a held request: Tier 1, waiting. What it wants to do: export state as a portable bundle. Why it is held: your operator policy lists this operation as Tier 1, so it always asks for approval." loading="lazy"><figcaption>Each held request says what the agent wants to do and why it was stopped.</figcaption></figure>
   </div>
-</footer>
+  <div class="row wide">
+    <div class="txt"><h3>Check the record yourself.</h3><p>Each entry is chained to the one before it, and the console in the 1.9.0 preview checks the chain and reports what it finds. This check is still rated partial; the evidence page says what it covers.</p></div>
+    <figure class="shot"><picture><source media="(max-width: 600px)" srcset="/assets/home/detail-chain-verified-sm.png"><img src="/assets/home/detail-chain-verified.png" width="2331" height="220" alt="Detail of the record check: Chain verified. Routine entries verified clean; 0 integrity findings for the whole chain." loading="lazy"></picture><figcaption>The record check, as the console shows it.</figcaption></figure>
+  </div>
+</div></section>
 
+<section class="s tint" id="layers" aria-labelledby="h-diff"><div class="wrap">
+  <p class="label eyebrow">Why it is different</p>
+  <h2 id="h-diff">It sits beneath the agent, on ground you own.</h2>
+  <dl class="diff"><div><dt>Below the agent</dt><dd>On macOS and Ubuntu 24.04 (x86-64), with the wall armed, your operating system enforces the connection rules underneath the agent, so they do not depend on the agent's cooperation.</dd></div><div><dt>On your own machine</dt><dd>It runs on hardware you control. There is nothing to sign up for and no account with us.</dd></div><div><dt>No vendor in the middle</dt><dd>No company holds your keys or a copy of what Sanctuary stores for you, the author included.</dd></div><div><dt>Open source</dt><dd>Every line is public under Apache-2.0, so you, or anyone you trust, can read what it does.</dd></div></dl>
+</div></section>
+
+<section class="s" aria-labelledby="h-status"><div class="wrap status">
+  <div><p class="label eyebrow">Where it runs</p><h2 class="status-line" id="h-status">Keys, approvals and the record run on macOS and Linux. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64). Windows is not yet supported.</h2><p class="more-p">The macOS proof covers one host and one OS version: a signed policy that allows and denies per agent account and survives attended reboot cycles, not a per-rule, per-flow log; unattended reboot survival is unproven. On Ubuntu the connection rules come as the separate Castle Wall Linux 0.1.0-1 pre-release, proven on fresh installs with a test program; real agent harnesses, injected faults and some rule forms are not yet proven there. The record's tamper check, checking it from another machine, and taking your data with you are still partial. The evidence page shows what is proven, on which build, and what is not.</p><a class="more" href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">See the evidence</a></div>
+  <table class="plats"><thead><tr><th scope="col">Platform</th><th scope="col">Keys, approvals, record</th><th scope="col">Connection rules</th></tr></thead><tbody><tr><th scope="row">macOS</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip good"><i></i>PROVEN</span></td></tr><tr><th scope="row">Ubuntu 24.04 (x86-64)</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip good"><i></i>PROVEN</span></td></tr><tr><th scope="row">Other Linux</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip neutral"><i></i>NOT PROVEN</span></td></tr><tr><th scope="row">Windows</th><td><span class="chip neutral"><i></i>NOT YET</span></td><td><span class="chip neutral"><i></i>NOT YET</span></td></tr></tbody></table>
+</div></section>
+
+<section class="s tint" aria-labelledby="h-trust"><div class="wrap">
+  <p class="label eyebrow">Trust</p>
+  <h2 id="h-trust">Things you can check yourself.</h2>
+  <ul class="trust"><li><b>Open source</b><span>Apache-2.0. <a href="https://github.com/eriknewton/sanctuary-framework">Read the code on GitHub</a>.</span></li><li><b>Signed releases</b><span>The npm package is signed and carries a provenance record. <a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Check a release yourself</a>.</span></li><li><b>A public Internet-Draft</b><span>A proposal for how agents record what they agreed, co-written by the author, <a href="https://datatracker.ietf.org/doc/draft-newton-agreement-evidence/">draft-newton-agreement-evidence-01</a>, posted at the IETF in November 2026.</span></li><li><b>An honest status table</b><span>Every claim, with what is not proven beside it. <a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Read the table</a>.</span></li></ul>
+</div></section>
+
+<section class="s" id="quickstart" aria-labelledby="h-start"><div class="wrap"><span id="harnesses"></span>
+  <p class="label eyebrow">Start</p>
+  <h2 id="h-start" style="margin-bottom:40px">Try it on your own machine.</h2>
+  <div class="start">
+  <div>
+    <h3>Install</h3>
+    <p>Shown for Claude Code. It needs Node.js 22 or newer.</p>
+    <div class="cmd"><div class="cmd-h"><span class="label">Terminal</span><button class="copy" type="button" hidden>Copy</button></div><pre>npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard</pre></div>
+    <p>This sets up your keys, the approval step and the record. Turning on the connection rules is a separate step on macOS and Ubuntu, and uninstalling keeps your data.</p>
+    <a class="more" href="https://github.com/eriknewton/sanctuary-framework#readme">Other harnesses, the connection rules and uninstall</a>
+  </div>
+  <div>
+    <h3>Get in touch</h3>
+    <p>Sanctuary is written and maintained by Erik Newton.</p>
+    <ul class="contact">
+      <li><a href="https://github.com/eriknewton/sanctuary-framework/issues">GitHub issues</a> for questions and ideas</li>
+      <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/SECURITY.md">Security policy</a>, to report a security problem privately</li>
+      <li><a href="/2026/05/15/nobody-else-was-going-to-build-it.html">Why the project exists</a>, in the author's words</li>
+    </ul>
+  </div>
+</div>
+</div></section>
+</main>
+<footer class="foot"><div class="wrap">
+  <div class="foot-grid">
+    <div class="about">
+      <a class="brand" href="/"><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><linearGradient id="sa2a21" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2F63E8"/><stop offset="1" stop-color="#1FA3A3"/></linearGradient></defs><rect width="32" height="32" rx="8" fill="url(#sa2a21)"/><g color="#FFFFFF" transform="translate(3.2 3.2) scale(0.8)"><circle cx="16" cy="16" r="14.6" fill="none" stroke="currentColor" stroke-width="1.8"/><defs><clipPath id="sa2a22"><path d="M32 10.75H12.14V16H19.86V21.25H0V0H32Z"/></clipPath><clipPath id="sa2a23"><path d="M32 10.75H12.14V16H19.86V21.25H0V32H32Z"/></clipPath><clipPath id="sa2a24"><path d="M16 4.8L27.2 16L16 27.2L4.8 16Z"/></clipPath><mask id="sa2a25" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32"><rect width="32" height="32" fill="#fff"/><path d="M32 10.75H12.14V16H19.86V21.25H0" fill="none" stroke="#000" stroke-width="2.7"/></mask></defs><g clip-path="url(#sa2a24)"><g mask="url(#sa2a25)"><path d="M16 4.8L27.2 16L16 27.2L4.8 16Z" fill="currentColor" opacity="1" clip-path="url(#sa2a22)"/><path d="M16 4.8L27.2 16L16 27.2L4.8 16Z" fill="currentColor" opacity="0.78" clip-path="url(#sa2a23)"/></g><path d="M32 10.75H12.14V16H19.86V21.25H0" fill="none" stroke="currentColor" stroke-opacity="0.4" stroke-width="2.7"/></g></g></svg>
+Sanctuary</a>
+      <p>Open-source software that keeps your AI agent answerable to you. Written and maintained by Erik Newton.</p>
+      <p>This site loads nothing from third parties: no trackers, no analytics, no remote fonts.</p>
+    </div>
+    <div><h2>Site</h2><ul><li><a href="#h-answer">How it works</a></li><li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Evidence and limits</a></li><li><a href="#h-start">Install</a></li><li><a href="/blog/">Journal</a></li></ul></div>
+    <div><h2>Source</h2><ul><li><a href="https://github.com/eriknewton/sanctuary-framework">GitHub repository</a></li><li><a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm package</a></li><li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md">Changelog</a></li><li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE">License</a></li></ul></div>
+    <div><h2>Trust</h2><ul><li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Assurance Matrix</a></li><li><a href="https://github.com/eriknewton/sanctuary-framework/tree/main/docs/audit">Drill records</a></li><li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/SECURITY.md">Security policy</a></li><li><a href="/llms.txt">llms.txt, for AI agents</a></li></ul></div>
+  </div>
+  <p class="fine">&copy; 2026 Erik Newton. Code under Apache-2.0. Stable release v1.8.4.</p>
+</div></footer>
 <script>
-  // Copy-to-clipboard for install block (progressive enhancement)
-  (function () {
-    var buttons = document.querySelectorAll('[data-copy]');
-    if (!buttons.length || !navigator.clipboard) return;
-    buttons.forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var text = btn.getAttribute('data-copy');
-        navigator.clipboard.writeText(text).then(function () {
-          var original = btn.textContent;
-          btn.textContent = 'Copied';
-          btn.setAttribute('data-copied', 'true');
-          setTimeout(function () {
-            btn.textContent = original;
-            btn.removeAttribute('data-copied');
-          }, 1600);
-        }).catch(function () { /* no-op on failure */ });
+(function () {
+  if (!navigator.clipboard) return;
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.hidden = false;
+    b.addEventListener("click", function () {
+      var pre = b.closest(".cmd").querySelector("pre");
+      navigator.clipboard.writeText(pre.textContent.trim()).then(function () {
+        var was = b.textContent; b.textContent = "Copied";
+        setTimeout(function () { b.textContent = was; }, 1400);
       });
     });
-  })();
+  });
+})();
 </script>
-
 </body>
 </html>

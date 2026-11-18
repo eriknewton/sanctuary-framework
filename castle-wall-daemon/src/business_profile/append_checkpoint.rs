@@ -10,6 +10,12 @@ pub const CHECKPOINT_PENDING_MAX: usize = 1;
 pub const CHECKPOINT_CHALLENGE_MS: u64 = drain_store::D_REQUEST_DEADLINE_MS as u64
     + 2 * signer_contract::SIGNER_REQUEST_DEADLINE_MS as u64;
 pub const CHECKPOINT_AGE_MS: u64 = signer_contract::SIGNER_REQUEST_DEADLINE_MS as u64;
+/// Wall clients retain an in-window checkpoint acknowledgement through final delivery.
+// Must match writer_service::CHECKPOINT_ADJUDICATION_BUDGET_MS and the serve poll tick:
+// an in-window grant may reach W after adjudication and one relative sleep.
+pub const CHECKPOINT_ACK_MS: u64 = CHECKPOINT_CHALLENGE_MS
+    + super::writer_service::CHECKPOINT_ADJUDICATION_BUDGET_MS
+    + super::signer_watchdog::WATCHDOG_TICK_MS as u64;
 pub const CHECKPOINT_PART_SILENCE_MS: u64 = CHECKPOINT_AGE_MS;
 // Generated from the same closed field tables used by the two parsers.
 include!("checkpoint_bounds.rs");
@@ -78,6 +84,50 @@ fn object_bytes<'a>(bytes: &'a [u8], marker: &[u8]) -> Result<&'a [u8]> {
         }
     }
     Err(Refusal::Shape)
+}
+
+/// Required ordinary verifier for the writer's authenticated checkpoint path.
+/// It retains no report, so a later heartbeat cannot promote stale evidence.
+pub struct OrdinaryCheckpointProvider {
+    _sealed: (),
+}
+impl OrdinaryCheckpointProvider {
+    /// Construct the evidence-checking provider, with no synthetic acceptance mode.
+    pub fn production() -> Self {
+        Self { _sealed: () }
+    }
+    /// Assemble one challenge-bound report from authenticated D and durable WAL readbacks.
+    /// Call on the store worker; WriterClient retains and sends the returned bytes without reserialization.
+    pub fn report(
+        &self,
+        challenge: &super::append_clients::CheckpointChallenge,
+        drain: &super::append_clients::DrainObservation,
+        wal: super::business_wal::OrdinaryWalCheckpoint,
+        fortress: &str,
+        revision: u64,
+        now: u64,
+    ) -> Result<Vec<u8>> {
+        let value = serde_json::json!({"version":1,"session_id":challenge.session,
+            "request_id":challenge.request,"nonce":challenge.nonce,
+            "status_digest":digest(&status_bytes(&challenge.status)?),
+            "observed_boottime_ns":drain.observed().min(wal.observed).to_string(),
+            "fortress_id":fortress,"enrollment_revision":revision,
+            "d_observation":drain.value(),"wal_checkpoint":wal.value});
+        let bytes = records::canonical_integer_domain(&value).ok_or(Refusal::Shape)?;
+        let report = Candidate::parse(&bytes)?;
+        report.fresh(challenge.issued, now)?;
+        self.verify(&report, &challenge.status, fortress, revision)?;
+        Ok(bytes)
+    }
+    pub(crate) fn verify(
+        &self,
+        report: &Candidate,
+        status: &StatusReply,
+        fortress: &str,
+        revision: u64,
+    ) -> Result<()> {
+        report.consistent(status, fortress, revision)
+    }
 }
 
 pub struct Candidate {

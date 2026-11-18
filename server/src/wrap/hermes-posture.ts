@@ -18,7 +18,10 @@ export const HERMES_POSTURE_SETTINGS = [
 // Must match the manifest read by server/scripts/copy-templates.js and the complete plugin tree.
 export const HERMES_PLUGIN_FILES = ["sanctuary/__init__.py", "sanctuary/plugin.yaml", "sanctuary/sanctuary_client.py", "sanctuary_memory/__init__.py", "sanctuary_memory/plugin.yaml"] as const;
 export const HERMES_TOOLS_PLUGIN_NAME = "sanctuary";
-const INSTRUCTIONS = "Memory is persistent and kept by Sanctuary. Save with remember. Export with export_memory, never by writing memories to a file. Sign with sign_statement. For rules, protections or security settings call protection_rules. If a Sanctuary tool says a request was not done, say so in one sentence and do not retry.";
+// The SOUL block and skill reach every Hermes session, so the automatic-save sentence names the one platform that captures.
+// Must match CAPTURE_PROMPT and REMEMBER_PROMPT in hermes-plugin/sanctuary_memory/__init__.py (the automatic-save wording and
+// the honesty clause), checked by server/test/structure/hermes-posture-parity.test.ts.
+const INSTRUCTIONS = "Memory is persistent and kept by Sanctuary. In a Telegram chat, plain messages from the user may be saved to memory automatically after the turn ends; save anything else with remember. Never say something was saved unless remember returned saved in this turn. Export with export_memory, never by writing memories to a file. Sign with sign_statement. For rules, protections or security settings call protection_rules. If a Sanctuary tool says a request was not done, say so in one sentence and do not retry.";
 export const HERMES_SKILL = `---\nname: sanctuary\ndescription: Use when the user asks you to remember something, to export what you know, to sign a statement, or asks about your rules or protections.\n---\n\n${INSTRUCTIONS}\n`;
 export const HERMES_SOUL_BLOCK = `<!-- sanctuary memory begin -->\n${INSTRUCTIONS}\n<!-- sanctuary memory end -->`;
 const MODE_MASK = 0o7777; // Permission and special mode bits, without the file type.

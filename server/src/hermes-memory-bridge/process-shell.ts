@@ -12,7 +12,6 @@ import { establishMaster, type EstablishMasterResult } from "../core/master-cust
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { TRAP_STORE_KEY_PREFIX, TRAP_STORE_NAMESPACE } from "../honeypot/trap-store.js";
 import { AuditLog } from "../operational/audit-log.js";
-import { KnownSignersStore } from "../reputation/known-signers-store.js";
 import { createSdwMemoryAdapter } from "../index.js";
 import {
   MEMORY_BATCH_LOCK_NAMESPACE,
@@ -22,12 +21,7 @@ import {
   type SdwMemoryBackendAdapter,
   sdwMemoryCorpusBatchLockFile,
 } from "../sdw/adapters/sdw-memory-backend.js";
-import { MemoryProvenanceBadSignerStore, memoryProvenancePublicKeyFingerprint } from "../sdw/memory-provenance-bad-signers.js";
-import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
-import {
-  createPrimaryMemoryProvenancePublicKeyResolver,
-  createPrimaryMemoryProvenanceSigningHandleResolver,
-} from "../sdw/memory-provenance-signing.js";
+import { memoryProvenancePublicKeyFingerprint } from "../sdw/memory-provenance-bad-signers.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import { KERNEL_LOCK_RELEASE_TIMEOUT_MS } from "../storage/cross-process-lock.js";
@@ -43,6 +37,7 @@ import {
 } from "./constants.js";
 import { encodeNodeToRelay, parseRelayToNode, type NodeToRelayInput } from "./envelopes.js";
 import { PrivateFrameDecoder } from "./framing.js";
+import { composeHermesMemoryAdapterOptions } from "./memory-adapter-composition.js";
 import {
   HermesBridgeCore,
   type HermesBridgeAuditRecord,
@@ -100,7 +95,8 @@ const STATE_CHILD_READY = "state_CHILD_READY";
 
 const MIN_INHERITED_SOCKET_FD = 3;
 const GROUP_OR_WORLD_WRITE_BITS = 0o022;
-const ID_GRAMMAR = /^[a-z0-9][a-z0-9-]{0,62}$/u;
+/** Agent and fortress id grammar; the owner verbs import this one source to validate --agent-id. */
+export const ID_GRAMMAR = /^[a-z0-9][a-z0-9-]{0,62}$/u;
 const BRIDGE_IDENTITY_GRAMMAR = /^[a-f0-9]{64}$/u;
 
 type FirstCause = "clean" | "fatal" | "startup_refused";
@@ -163,8 +159,8 @@ class StartupRefusal extends Error {
 }
 
 class CorpusLockRefusal extends StartupRefusal {
-  constructor(readonly lockPath: string) {
-    super(STATE_CONFIG_CHECKED, "leftover corpus lock requires operator recovery");
+  constructor(readonly lockPath: string, state: string = STATE_CONFIG_CHECKED) {
+    super(state, "leftover corpus lock requires operator recovery");
   }
 }
 
@@ -769,6 +765,12 @@ export async function runHermesBridgeProcess(options: HermesBridgeProcessOptions
     custody = await state_CUSTODY_PRESENT(storage, resolved.storagePath, env.HOME!);
     await refusePreReadyStop(options.startupStopRequested?.(), custody, STATE_CUSTODY_PRESENT);
     barrier = custody.masterWriteBarrier;
+    // Recheck after taking the shared side, still inside state_CUSTODY_PRESENT: an owner verb, recover-save, an
+    // import or a dying writer could leave a lock, an intent or an import journal between the first checks and
+    // admission, and only checks made while holding the barrier are current.
+    await assertNoLeftoverCorpusLock(storage, STATE_CUSTODY_PRESENT);
+    await assertNoUnfinishedInsert(storage, STATE_CUSTODY_PRESENT);
+    await assertNoInterruptedExitImport(storage, STATE_CUSTODY_PRESENT);
     const establishedCustody = custody;
     enter(STATE_CONFIG_CHECKED);
     const persistedTrapSpecCount = await assertNoPersistedTraps(storage);
@@ -996,33 +998,33 @@ function assertFilesystemBridgeStorage(storage: StorageBackend): asserts storage
   }
 }
 
-async function assertNoLeftoverCorpusLock(storage: FilesystemStorage): Promise<void> {
+async function assertNoLeftoverCorpusLock(storage: FilesystemStorage, state: string = STATE_CONFIG_CHECKED): Promise<void> {
   const lockPath = join(storage.namespacePath(MEMORY_BATCH_LOCK_NAMESPACE), sdwMemoryCorpusBatchLockFile());
   const exists = await lstat(lockPath).then(
     () => true,
     (error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return false;
-      throw new StartupRefusal(STATE_CONFIG_CHECKED, `leftover corpus lock status is unreadable at ${lockPath}`);
+      throw new StartupRefusal(state, `leftover corpus lock status is unreadable at ${lockPath}`);
     },
   );
   if (exists) {
-    throw new CorpusLockRefusal(lockPath);
+    throw new CorpusLockRefusal(lockPath, state);
   }
 }
 
 const UNFINISHED_SAVE_RECOVERY = "An earlier save did not finish; run `sanctuary hermes recover-save --fortress <dir>` to recover it.";
 
 class UnfinishedInsertRefusal extends StartupRefusal {
-  constructor() {
-    super(STATE_CONFIG_CHECKED, UNFINISHED_SAVE_RECOVERY);
+  constructor(state: string = STATE_CONFIG_CHECKED) {
+    super(state, UNFINISHED_SAVE_RECOVERY);
     this.name = "UnfinishedInsertRefusal";
   }
 }
 
-async function assertNoUnfinishedInsert(storage: StorageBackend): Promise<void> {
+async function assertNoUnfinishedInsert(storage: StorageBackend, state: string = STATE_CONFIG_CHECKED): Promise<void> {
   // Presence alone refuses before core construction: neither unreadable nor unfinished intent can authorize a new save.
   if (await storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY) !== null) {
-    throw new UnfinishedInsertRefusal();
+    throw new UnfinishedInsertRefusal(state);
   }
 }
 
@@ -1039,10 +1041,10 @@ async function assertNoPersistedTraps(storage: StorageBackend): Promise<number> 
   return metas.length;
 }
 
-async function assertNoInterruptedExitImport(storage: StorageBackend): Promise<void> {
+async function assertNoInterruptedExitImport(storage: StorageBackend, state: string = STATE_CONFIG_CHECKED): Promise<void> {
   const { hasInterruptedExitImport } = await import("../storage/exit-import-journal.js");
   if (await hasInterruptedExitImport(storage)) {
-    throw new StartupRefusal(STATE_CONFIG_CHECKED, "interrupted exit-import journal is present");
+    throw new StartupRefusal(state, "interrupted exit-import journal is present");
   }
 }
 
@@ -1101,44 +1103,20 @@ async function composeHermesBridge(input: {
   auditForwarder.bind(auditLog);
   // Must match fortressIdFromStoragePath in ../dashboard/v1_1/wiring.ts: this child uses the same local namespace key as the owner process.
   const fortressId = fortressIdFromStoragePath(input.storagePath);
-  const signingHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, input.masterKey);
-  const signerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
-  const migration = new SdwMemoryProvenanceMigration({
+  // The owner verbs build their standard-mode adapter from this same composition; only mode and commit check differ.
+  const composed = await composeHermesMemoryAdapterOptions({
     storage: input.storage,
     masterKey: input.masterKey,
     fortressId,
     ownerRef: input.env.HERMES_MEMORY_AGENT_ID!,
-    resolvePrimarySigningHandle: signingHandle,
-    resolveSignerPublicKey: signerPublicKey,
-  });
-  const knownSigners = new KnownSignersStore(input.storage, input.masterKey, {
-    partition: "memory_provenance",
-  });
-  const persistedSigners = new Map((await knownSigners.loadAll()).map((entry) => [entry.did, entry.publicKey]));
-  const resolveSignerPublicKey = (identityId: string, did: string) =>
-    signerPublicKey(identityId, did) ?? persistedSigners.get(did)?.slice();
-  const badSignerStore = new MemoryProvenanceBadSignerStore({
-    storage: input.storage,
-    masterKey: input.masterKey,
-    fortressId,
-    resolveSignerPublicKey: (did) => persistedSigners.get(did)?.slice(),
-    isLocallyRootedSigner: (did, publicKey) => {
-      const current = identityManager.getDefault();
-      return current?.did === did && Buffer.from(fromBase64url(current.public_key)).equals(Buffer.from(publicKey));
-    },
+    identityManager,
     scanForeignDependencies: (did, fingerprint) => badSignerScanner.scanForeignDependencies(did, fingerprint),
   });
+  const { migration, knownSigners, badSignerStore } = composed;
   const adapter = createSdwMemoryAdapter({
     mode: "hermes-bridge",
-    storage: input.storage,
-    masterKey: input.masterKey,
-    fortressId,
-    ownerRef: input.env.HERMES_MEMORY_AGENT_ID!,
-    resolvePrimarySigningHandle: signingHandle,
-    resolveSignerPublicKey,
-    resolveMemoryIntegrityState: () => migration.getState(),
+    ...composed.options,
     commitCheck: core.commitCheck,
-    badSignerAuthority: badSignerStore,
   });
   adapterForwarder.bind(adapter);
   badSignerScanner.bind(adapter);

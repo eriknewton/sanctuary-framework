@@ -86,6 +86,7 @@ import {
 
 export const TRANSPARENCY_ANCHOR_NAMESPACE = "_transparency_anchors";
 export const TRANSPARENCY_ANCHOR_RECEIPT_PREFIX = "anchor-";
+// Must match sourceKind in audit/split-evidence-registry.ts; configuration is excluded from evidence.
 export const TRANSPARENCY_ANCHOR_CONFIG_META_KEY =
   "transparency-anchor-config-v1";
 

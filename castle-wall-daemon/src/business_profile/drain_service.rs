@@ -1119,6 +1119,8 @@ impl Executor<'_, '_> {
                     )?;
                     let _state = RequestState::Capacity;
                     // A missing head original, copy cap or latch can stop DRAIN and then COMMIT; refusal never evicts and no finalization headroom is promised.
+                    // Must match DrainObservation::ordinary_room in append_clients.rs: count pre-COMMIT ledger entries; RESERVE adds none.
+                    // Changing either side's reservation accounting reopens the no-renewal proof.
                     if ledger.len() >= drain_store::D_UNDRAINED_MAX {
                         return Err(Refusal::CAPACITY);
                     }
