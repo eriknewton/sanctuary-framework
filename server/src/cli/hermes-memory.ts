@@ -68,8 +68,10 @@ const PERMISSION_BITS = 0o777;
 export const DELETE_IGNORED_SIGNALS = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"] as const);
 type IgnoredSignal = typeof DELETE_IGNORED_SIGNALS[number];
 
-export type OwnerDeleteOutcome =
-  | "intent" | "deleted" | "not_found" | "not_attempted" | "failed_restored" | "failed_unrestored" | "indeterminate";
+const OWNER_DELETE_OUTCOMES = [
+  "intent", "deleted", "not_found", "not_attempted", "failed_restored", "failed_unrestored", "indeterminate",
+] as const;
+export type OwnerDeleteOutcome = typeof OWNER_DELETE_OUTCOMES[number];
 
 const NOTHING_CHANGED = "Nothing was changed.";
 const NOTHING_DELETED = "Nothing was deleted.";
@@ -100,13 +102,13 @@ zeroed inside a JavaScript process.
 
 Refusals change nothing: root, an SSH session (the keychain prompt cannot be answered there), a
 fortress your account does not own, a missing fortress (nothing is created), or a prompt left
-unanswered for 120 seconds. The last line says how to start the Hermes memory relay only after the audit record
-has been checked, covers the full history, and no unresolved delete is identified. After a delete that
+unanswered for 120 seconds. The last line says how to start the Hermes memory relay only when the audit record
+has been checked and covers the full history, and no unresolved delete is identified. After a delete that
 may have left the passage half-removed or unconfirmed, that run and every later run that reads the audit log
 says to leave the relay stopped until the coordinator has read a memory-report, and steps 5 and 6 wait until
-then. If the record on this computer does not cover the full history, leave the relay stopped until the
-coordinator has read a memory-report; steps 5 and 6 wait until then. A usage error or a refusal that stops before the audit log can be checked also says to
-leave the relay stopped.
+then. If the record this command read does not cover the full history, leave the relay stopped until the
+coordinator has read a memory-report; steps 5 and 6 wait until then. A usage error or a refusal that stops
+before the audit log can be checked also says to leave the relay stopped.
 `;
 
 const HELP_REPORT = `Usage: sanctuary hermes memory-report --fortress <dir> --agent-id <id> [--since <ISO time>] [--out <file>] [--recovery-key-prompt]
@@ -258,7 +260,7 @@ export async function runHermesMemory(options: HermesMemoryOptions): Promise<num
 
 /**
  * Start advice requires a verified, complete, unpruned view, no unresolved hold, and no unsafe or
- * unrecorded delete in this run. Recovery remains limited (HERMES-OWNER-HOLD-RETENTION).
+ * unrecorded delete in this run. No recovery path exists yet (HERMES-OWNER-HOLD-RETENTION).
  * Bridge startup does not read delete outcomes; this closing advice is for the owner.
  */
 interface RelayClosing {
@@ -287,7 +289,7 @@ const CLOSING_LINE_RECORD_UNCHECKED = "The Hermes memory relay is still stopped.
   "Leave it stopped until the coordinator has read a memory-report.\n";
 
 const CLOSING_LINE_RECORD_INCOMPLETE = "The Hermes memory relay is still stopped. " +
-  "The record on this computer does not cover the full history. " +
+  "The record this command read does not cover the full history. " +
   "Leave it stopped until the coordinator has read a memory-report.\n";
 
 // Every later run that reads the audit view keeps the relay stopped too, until an unconfirmed delete is cleared.
@@ -423,7 +425,6 @@ async function runOwnerVerb(args: ParsedArgs, options: HermesMemoryOptions, uid:
             const noteAuditView = (view: AuditView): StartGuidance => {
               // The owner decision relies on pruning-marker absence AND a clean AuditLog verdict together,
               // never either alone; equal retained/returned counts bound coverage to this read view.
-              relay.auditViewRead = true;
               relay.auditRecordUnchecked ||= !view.chainVerified || typeof view.everPruned !== "boolean";
               relay.auditRecordIncomplete ||= view.everPruned !== false || view.retainedCount !== view.entries.length;
               if (!view.chainVerified) relay.recordChecks.add("audit_unverified");
@@ -431,10 +432,10 @@ async function runOwnerVerb(args: ParsedArgs, options: HermesMemoryOptions, uid:
               if (view.everPruned === true) relay.recordChecks.add("history_pruned");
               if (view.retainedCount !== view.entries.length) relay.recordChecks.add("row_count_mismatch");
               for (const identity of ownerDeleteHolds(view.entries)) relay.unconfirmedIdentities.add(identity);
+              relay.auditViewRead = true;
               return {
                 withheld_by: [...relay.recordChecks,
-                  ...(relay.unconfirmedIdentities.size > 0 ? ["unresolved_delete" as const] : []),
-                  ...(relay.thisDeleteUnsafe ? ["current_delete_unsafe" as const] : [])],
+                  ...(relay.unconfirmedIdentities.size > 0 ? ["unresolved_delete" as const] : [])],
                 retained_count: view.retainedCount,
                 returned_count: view.entries.length,
               };
@@ -652,25 +653,24 @@ async function readAuditView(context: OwnerContext): Promise<AuditView> {
 /** Closed set of failed start checks. An empty list permits the start line.
  * audit_unverified: AuditLog did not verify the view; retention_unknown: usage was not boolean;
  * history_pruned: usage reported prior pruning; row_count_mismatch: retained and returned differ;
- * unresolved_delete: the view leaves a hold; current_delete_unsafe: this run lacks a safe recorded outcome.
+ * unresolved_delete: the view leaves a hold.
  * The counts describe the same owner read, before any current delete appends, not the report window.
  */
 type StartGuidanceWithheldBy = "audit_unverified" | "retention_unknown" | "history_pruned" |
-  "row_count_mismatch" | "unresolved_delete" | "current_delete_unsafe";
+  "row_count_mismatch" | "unresolved_delete";
 interface StartGuidance {
   readonly withheld_by: readonly StartGuidanceWithheldBy[];
   readonly retained_count: number;
   readonly returned_count: number;
 }
 
+// Must match row in deletePassage in cli/hermes-memory.ts.
 function validOwnerDeleteDetails(details: Record<string, unknown>): boolean {
   return typeof details.document_id === "string" && details.document_id.length > 0 &&
     typeof details.passage_id === "string" && details.passage_id.length > 0 &&
     (details.text_sha256 === null || typeof details.text_sha256 === "string") &&
     (details.error_category === undefined || typeof details.error_category === "string") &&
-    (details.outcome === "intent" || details.outcome === "deleted" || details.outcome === "not_found" ||
-      details.outcome === "not_attempted" || details.outcome === "failed_restored" ||
-      details.outcome === "failed_unrestored" || details.outcome === "indeterminate");
+    (OWNER_DELETE_OUTCOMES as readonly unknown[]).includes(details.outcome);
 }
 
 /** Holds are bounded by the rows already returned by the owner reader. */
@@ -1258,7 +1258,7 @@ function trackCorpusMutations(storage: FilesystemStorage, onMutation: () => void
  * view with complete unpruned coverage, no unresolved hold in that view, and no hold in this run.
  * With that evidence, preparation refusals, pre-intent refusals and recorded deleted, not_found,
  * not_attempted or failed_restored outcomes permit restart advice. Only recorded deleted clears an
- * earlier scoped hold for its document/passage identity. Recovery remains HERMES-OWNER-HOLD-RETENTION.
+ * earlier scoped hold for its document/passage identity. No recovery path exists yet (HERMES-OWNER-HOLD-RETENTION).
  *
  * Arm                                   | Outcome row        | Exit and message
  * Writer composition or the raw-record  | none (no intent)   | 1, could not be prepared; nothing was deleted
@@ -1345,6 +1345,7 @@ async function deletePassage(context: OwnerContext, args: ParsedArgs, io: {
   // From an accepted DELETE until the delete returns, a stray signal cannot cut the delete between its writes.
   for (const signal of DELETE_IGNORED_SIGNALS) io.signals.on(signal, ignore);
   try {
+    // Must match validOwnerDeleteDetails in cli/hermes-memory.ts.
     const row = (outcome: OwnerDeleteOutcome, extra: Record<string, unknown> = {}) => audit.appendCritical({
       layer: "l3",
       operation: HERMES_MEMORY_OWNER_DELETE_OPERATION,

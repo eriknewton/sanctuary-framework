@@ -47,7 +47,7 @@ afterEach(async () => {
 });
 
 const CLOSING = "The Hermes memory relay is still stopped. Start it with: launchctl kickstart";
-const CLOSING_INCOMPLETE = "The Hermes memory relay is still stopped. The record on this computer does not cover the full history. Leave it stopped until the coordinator has read a memory-report.";
+const CLOSING_INCOMPLETE = "The Hermes memory relay is still stopped. The record this command read does not cover the full history. Leave it stopped until the coordinator has read a memory-report.";
 const CLOSING_KEEP_STOPPED = "The Hermes memory relay is still stopped. Leave it stopped until the coordinator has read the memory-report.";
 // A run that stops before reading the audit log cannot rule out an earlier unconfirmed delete.
 const CLOSING_BEFORE_AUDIT_READ = "The Hermes memory relay is still stopped. The audit record could not be checked. Leave it stopped until the coordinator has read a memory-report.";
@@ -1788,7 +1788,7 @@ describe("hermes owner verbs: help text", () => {
     expect(HERMES_MEMORY_HELP["memory-show"]).toContain("scrollback");
     expect(HERMES_MEMORY_HELP["memory-report"]).toContain("not a witness");
     for (const verb of ["memory-report", "memory-show", "memory-delete"] as const) {
-      expect(HERMES_MEMORY_HELP[verb]).toContain("has been checked, covers the full history, and no unresolved delete is identified.");
+      expect(HERMES_MEMORY_HELP[verb]).toContain("has been checked and covers the full history, and no unresolved delete is identified.");
       expect(HERMES_MEMORY_HELP[verb]).toContain("Only if the last line says to start the relay:");
       expect(HERMES_MEMORY_HELP[verb]).toContain("cannot be\nzeroed inside a JavaScript process");
       expect(HERMES_MEMORY_HELP[verb]).toContain("B_RUNTIME/bin/node B_RUNTIME/pkg/dist/cli.js");
@@ -1993,13 +1993,53 @@ describe("owner start guidance requires complete evidence", () => {
     const f = await ownerFortress(stack);
     const prefix = name.startsWith("orphan") ? [] : [details("intent")];
     await appendRows(f, [...prefix, row, details("intent"), details("deleted")]);
-    const realUsage = AuditLog.prototype.getRetentionUsage;
-    vi.spyOn(AuditLog.prototype, "getRetentionUsage").mockImplementation(async function(this: AuditLog) {
-      return { ...await realUsage.call(this), everPruned: true };
-    });
-    const parsed = report(await runVerb(f, ["memory-report"]));
-    expect(parsed.start_guidance?.withheld_by).toEqual(["history_pruned", "unresolved_delete"]);
+    const rowOnly = name === "orphan failed_unrestored" || name === "malformed passage";
+    if (!rowOnly) {
+      const realUsage = AuditLog.prototype.getRetentionUsage;
+      vi.spyOn(AuditLog.prototype, "getRetentionUsage").mockImplementation(async function(this: AuditLog) {
+        return { ...await realUsage.call(this), everPruned: true };
+      });
+    }
+    const run = await runVerb(f, ["memory-report"]);
+    const parsed = report(run);
+    expect.soft(parsed.start_guidance?.withheld_by).toEqual(rowOnly
+      ? ["unresolved_delete"] : ["history_pruned", "unresolved_delete"]);
     expect(parsed.window.chain_verified).toBe(true);
+    if (rowOnly) {
+      expect(parsed.window.ever_pruned).toBe(false);
+      expect(parsed.start_guidance.retained_count).toBe(parsed.start_guidance.returned_count);
+      expect.soft(lastLine(run.err)).toBe(CLOSING_AFTER_UNCONFIRMED + " this report.");
+      expect.soft(run.err).not.toContain("launchctl kickstart");
+    }
+  });
+
+  it.each([
+    { name: "passage object", row: { ...details("intent"), passage_id: { toString: null } } },
+    { name: "null entry", row: null },
+  ])("keeps advice stopped when the view cannot be evaluated: $name", async ({ row }) => {
+    const f = await ownerFortress(stack);
+    await appendRows(f, [details("intent")]);
+    const realQuery = AuditLog.prototype.query;
+    vi.spyOn(AuditLog.prototype, "query").mockImplementation(async function(this: AuditLog, ...args) {
+      const result = await realQuery.apply(this, args);
+      return { ...result, entries: result.entries.map(entry => row === null ? row : { ...entry, details: row }) } as typeof result;
+    });
+    const run = await runVerb(f, ["memory-report"]);
+    expect(run.code).toBe(1);
+    expect(run.err).toContain("The command could not finish and nothing was changed.");
+    expect(run.err).not.toMatch(/TypeError|Cannot convert|Cannot read|\n\s+at /u);
+    expect.soft(lastLine(run.err)).toBe(CLOSING_BEFORE_AUDIT_READ);
+    expect.soft(run.err).not.toContain("launchctl kickstart");
+  });
+
+  it("permits report advice after a complete clear view and an output failure", async () => {
+    const f = await ownerFortress(stack);
+    const stdout = new TerminalSink();
+    vi.spyOn(stdout, "write").mockImplementation(() => { throw new Error("report output fixture"); });
+    const run = await runVerb(f, ["memory-report"], { stdout });
+    expect(run.code).toBe(1);
+    expect(run.err).toContain("The command could not finish and nothing was changed.");
+    expect(lastLine(run.err)).toContain(CLOSING);
   });
 
   it("requires full row coverage with a valid sealed prefix", async () => {
