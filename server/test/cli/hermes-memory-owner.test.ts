@@ -549,6 +549,23 @@ describe("hermes owner verbs: memory-report", () => {
     expect(lastLine(run.err)).toContain(CLOSING);
   });
 
+  it.each(["insert_refused", "insert_unconfirmed"] as const)("keeps correlation indeterminate when an %s row carries no entry id", async kind => {
+    const f = await ownerFortress(stack);
+    const entryId = "hermes-entry-1";
+    const passageId = "saved";
+    const text = "identity passage";
+    await seedPassage(f, passageId, text);
+    const terminal = { kind, passage_id: "other" };
+    await seedBridgeRows(f, [admittedRow(passageId, text, entryId), terminal]);
+    const run = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect(run.code, run.err).toBe(0);
+    const parsed = report(run);
+    expect(parsed.window.absence_claims_supported).toBe(true);
+    expect(rowFor(parsed, entryId)).toMatchObject({ passage_id: passageId, later_failure: "indeterminate" });
+    expect(parsed.rows.filter((row: Record<string, any>) => row.kind === kind)).toMatchObject([terminal]);
+    expect(lastLine(run.err)).toContain(CLOSING);
+  });
+
   it("marks every earlier admitted row as a later failure after a latch row", async () => {
     const f = await ownerFortress(stack);
     await seedPassage(f, "before", "before latch");

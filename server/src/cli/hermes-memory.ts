@@ -748,9 +748,8 @@ async function buildMemoryReport(context: OwnerContext, args: ParsedArgs, runAt:
       const later = windowRows.slice(index + 1).map(next => next.details ?? {});
       // Must match HermesBridgeCore.admitInsert, assertAllowedToCommit, auditRefusedAdmission and auditUnconfirmed
       // in server/src/hermes-memory-bridge/bridge-core.ts: entry ids are issued once per process, and terminal
-      // rows follow durable admission with its passage id. The stop boundary assumes one bridge per fortress.
-      // RelaySocketLifecycle in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift locks one private
-      // directory; process-shell.ts takes shared custody. Fortress-wide single-bridge admission is not enforced.
+      // rows follow durable admission with its passage id. The stop boundary assumes one bridge process appends
+      // to a fortress at a time: DEBT(HERMES-REPORT-SINGLE-BRIDGE).
       const hasAdmissionIds = typeof details.entryId === "string" && typeof details.passage_id === "string";
       let terminalFailure = false;
       let terminalIndeterminate = false;
@@ -758,7 +757,8 @@ async function buildMemoryReport(context: OwnerContext, args: ParsedArgs, runAt:
         if (hasAdmissionIds && next.kind === "insert_admitted" && next.entryId === details.entryId) break;
         if (next.kind !== "insert_refused" && next.kind !== "insert_unconfirmed") continue;
         // An absent identifier is never read as evidence of absence.
-        if (!hasAdmissionIds || (next.entryId === details.entryId && next.passage_id === undefined)) {
+        if (!hasAdmissionIds || typeof next.entryId !== "string" ||
+            (next.entryId === details.entryId && typeof next.passage_id !== "string")) {
           terminalIndeterminate = true;
           continue;
         }
