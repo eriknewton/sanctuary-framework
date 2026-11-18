@@ -8,6 +8,45 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+// The one list of git redirect variables (AGENTS.md rule 5). Must match the
+// consumers named in git-redirect-env-keys.json's "$comment"; this file loads
+// the JSON rather than restating it. Read at call time from beside this
+// script, so a missing or malformed file throws instead of scrubbing nothing.
+//
+// This installer clears `repositoryKeys` plus GIT_CONFIG_PARAMETERS ONLY, not
+// the whole config group the test setup clears. Its job is to name the hooks
+// directory that later ordinary git commands in this checkout will run, and a
+// developer's deliberate config (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, a
+// GIT_CONFIG_COUNT/KEY_<n>/VALUE_<n> set in the shell) applies to those
+// commands too; dropping it could install into a directory git never runs and
+// still report success. GIT_CONFIG_PARAMETERS is different: it is the
+// single-command `git -c` scope a parent git process hands its children, so
+// it describes the invoking command, not this checkout's lasting setup.
+const INVOCATION_SCOPED_CONFIG_KEY = "GIT_CONFIG_PARAMETERS";
+
+function loadInstallerScrubKeys() {
+  const spec = JSON.parse(
+    fs.readFileSync(new URL("./git-redirect-env-keys.json", import.meta.url), "utf8")
+  );
+  if (!Array.isArray(spec.repositoryKeys) || !Array.isArray(spec.configKeys)) {
+    throw new Error("git-redirect-env-keys.json must carry repositoryKeys[] and configKeys[]");
+  }
+  // Fails loudly if the shared list ever drops or renames the key named above.
+  if (!spec.configKeys.includes(INVOCATION_SCOPED_CONFIG_KEY)) {
+    throw new Error(`git-redirect-env-keys.json configKeys must include ${INVOCATION_SCOPED_CONFIG_KEY}`);
+  }
+  return [...spec.repositoryKeys, INVOCATION_SCOPED_CONFIG_KEY];
+}
+
+// Returns a copy of `env` without the repository variables and the
+// invocation-scoped config; deliberate config is kept (see above).
+export function withoutGitRedirectEnv(env) {
+  const keys = loadInstallerScrubKeys();
+  const out = { ...env };
+  for (const key of keys) delete out[key];
+  return out;
+}
+
 // Resolve the hooks directory git will ACTUALLY execute from.
 //
 // This is subtler than it looks and the original implementation got it wrong in
@@ -32,27 +71,21 @@ export function resolveHooksDir(root) {
     throw new Error(`Not a git repository: ${root}`);
   }
 
+  // Scrub the repo-scoping GIT_* variables before asking git anything. When
+  // this runs inside a git hook (or any git-invoked subprocess) those are set
+  // and point at the INVOKING repository, so an inherited GIT_DIR would make
+  // `rev-parse` answer for the wrong repo entirely while looking perfectly
+  // healthy. An inherited `git -c core.hooksPath=...` (GIT_CONFIG_PARAMETERS)
+  // would do the same to the hooks path for one command only. We want the
+  // answer for `root` under the config its later git commands will see, so
+  // the developer's deliberate config is kept (see withoutGitRedirectEnv).
+  // Other GIT_* vars (GIT_EXEC_PATH, GIT_SSH) are left intact: they configure
+  // how git runs, not which repository it targets.
+  //
+  // Computed OUTSIDE the try below: an unreadable list must throw here, not be
+  // swallowed by the "git unavailable" catch.
+  const env = withoutGitRedirectEnv(process.env);
   try {
-    // Scrub the repo-scoping GIT_* variables before asking git anything. When
-    // this runs inside a git hook (or any git-invoked subprocess) those are set
-    // and point at the INVOKING repository, so an inherited GIT_DIR would make
-    // `rev-parse` answer for the wrong repo entirely while looking perfectly
-    // healthy. We want the answer for `root` and nothing else, so the resolution
-    // must be driven by cwd alone. Other GIT_* vars (GIT_EXEC_PATH, GIT_SSH) are
-    // left intact: they configure how git runs, not which repository it targets.
-    const env = { ...process.env };
-    for (const key of [
-      "GIT_DIR",
-      "GIT_COMMON_DIR",
-      "GIT_WORK_TREE",
-      "GIT_INDEX_FILE",
-      "GIT_OBJECT_DIRECTORY",
-      "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-      "GIT_NAMESPACE",
-      "GIT_PREFIX",
-    ]) {
-      delete env[key];
-    }
     const out = execFileSync("git", ["rev-parse", "--git-path", "hooks"], {
       cwd: root,
       encoding: "utf8",
