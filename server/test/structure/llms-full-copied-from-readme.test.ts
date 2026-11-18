@@ -1,3 +1,4 @@
+// fail-before-exempt: This file pins README.md against docs/llms-full.txt, both outside server/src, which this gate does not revert, so it passes on reverted server/src by construction; the copied-heading list grows because the README gains an Uninstall section.
 /**
  * `docs/llms-full.txt` is served at https://sanctuaryprotocol.ai/llms-full.txt
  * for agents deciding whether and how to install Sanctuary. It promises that
