@@ -19,7 +19,9 @@ const scenarios = ["leaked", "released", "failed-teardown"] as const;
 const fixtureTimeoutMs = childTimeoutMs * scenarios.length + parentHeadroomMs;
 
 it("reaps and reports unclosed leases after file teardown while accepting released leases", async () => {
+  // Must match setupFiles in vitest.config.ts; git-env-scrub.ts runs first (pinned in test/structure/git-env-scrub.test.ts).
   expect(config.test?.setupFiles).toEqual([
+    "./test/setup/git-env-scrub.ts",
     "./test/setup/keychain-fake.ts",
     "./test/setup/homedir-follows-env.ts",
     "./test/setup/master-write-leases.ts",
