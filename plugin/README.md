@@ -42,7 +42,7 @@ Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, 
 - **`sanctuary/zk_commit` / `zk_prove`**: Pedersen commitments and Schnorr zero-knowledge proofs.
 - **`sanctuary/reputation_record`**: Build portable, signed reputation attestations. `reputation_export` and `reputation_import` are Tier 1.
 - **`sanctuary/handshake_initiate`**: Handshake protocol for mutual verification between agents.
-- **`sanctuary/context_gate_filter`**: Apply the configured context-gate field rules to content you supply before sending it to an LLM provider. Review the result; it does not detect secrets or PII outside those rules.
+- **`sanctuary/context_gate_filter`**: Apply the configured context-gate field rules to content you supply before sending it to an LLM provider. Review the result; configured filtering does not guarantee removal of all secrets or PII.
 
 ## OpenClaw Integration
 
