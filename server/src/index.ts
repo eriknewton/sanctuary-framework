@@ -141,7 +141,8 @@ import { createMemoryProvenanceSignerPruneTool } from "./sdw/memory-provenance-s
 import { KnownSignersStore } from "./reputation/known-signers-store.js";
 import { StorageSnapshotSdwInventorySource } from "./sdw/export.js";
 import { fromBase64url } from "./core/encoding.js";
-import { initializedFortressExists, FORTRESS_STATE_DIRECTORY } from "./evidence-pack/existing-fortress.js";
+import { initializedFortressExists } from "./evidence-pack/existing-fortress.js";
+import { FORTRESS_STATE_DIRECTORY } from "./core/custody-markers.js";
 import { join as joinPath, resolve as resolvePath } from "node:path";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
@@ -382,7 +383,7 @@ export async function createSanctuaryServer(options?: {
     if (options.storage !== undefined || ambientPath !== options.existingFortressPath) {
       throw new Error("Existing fortress path mismatch.");
     }
-    // Owner-rights concurrent actors can change the path between an in-process admission check and the next filesystem operation.
+    // A directory on the fortress path that another account can modify bounds admission to the check instant; existing-only boot holds no first-run custody authority.
     await requireExistingFortress(options.existingFortressPath);
   }
   // 1. Load configuration
@@ -408,7 +409,7 @@ export async function createSanctuaryServer(options?: {
   // would otherwise be orphaned inside the fortress dir); it only applies when
   // the boot path owns a filesystem fortress.
   const bootOwnsStorage = options?.storage === undefined;
-  // Must match FORTRESS_STATE_DIRECTORY in evidence-pack/existing-fortress.ts; custody admission and boot share the filesystem root.
+  // Must match FORTRESS_STATE_DIRECTORY in core/custody-markers.ts; custody admission and boot share the filesystem root.
   const storage = options?.storage ?? new FilesystemStorage(
     `${config.storage_path}/${FORTRESS_STATE_DIRECTORY}`
   );

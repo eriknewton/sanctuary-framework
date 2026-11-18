@@ -4,6 +4,7 @@ import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { createIdentity, sign, type StoredIdentity } from "../src/core/identity.js";
+import { FORTRESS_STATE_DIRECTORY, LEGACY_PASSPHRASE_KEY } from "../src/core/custody-markers.js";
 import { derivePurposeKey } from "../src/core/key-derivation.js";
 import { checkpointSigningBytes } from "../src/audit/chain.js";
 import { snapshotJSON } from "../src/evidence-pack/snapshot-generate.js";
@@ -59,8 +60,8 @@ export async function runDrillFixture(argv: string[]): Promise<number> {
     const fortress = join(root, "fortress"), statePath = join(fortress, "synthetic-state.json"); let state: FixtureState;
     if (argv[0] === "create") {
       await mkdir(fortress, { mode: MODE_DIRECTORY });
-      await mkdir(join(fortress, "state", "_meta"), { recursive: true, mode: MODE_DIRECTORY });
-      await writeFile(join(fortress, "state", "_meta", "key-params.enc"), "Synthetic fixture custody marker.\n", { flag: "wx", mode: MODE_FILE });
+      await mkdir(join(fortress, FORTRESS_STATE_DIRECTORY, "_meta"), { recursive: true, mode: MODE_DIRECTORY });
+      await writeFile(join(fortress, FORTRESS_STATE_DIRECTORY, "_meta", `${LEGACY_PASSPHRASE_KEY}.enc`), "Synthetic fixture custody marker.\n", { flag: "wx", mode: MODE_FILE });
       const master = randomBytes(C.KEY_BYTES), key = derivePurposeKey(master, "identity-encryption");
       const who = createIdentity("synthetic evidence drill", key, "passphrase").storedIdentity;
       const wrong = createIdentity("synthetic unrelated pin", key, "passphrase").storedIdentity;

@@ -76,7 +76,7 @@
  * performs it through the ordinary passphrase path.
  */
 
-import { LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY } from "../evidence-pack/existing-fortress.js";
+import { LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY } from "../core/custody-markers.js";
 import { homedir, platform as osPlatform } from "node:os";
 import { join } from "node:path";
 

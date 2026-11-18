@@ -89,10 +89,10 @@ it.each(["missing", "empty", "symlink"] as const)("rechecks the %s root at boot 
   await environment();
   const x = await exporterFixture(); roots.push(x.root);
   vi.stubEnv("SANCTUARY_STORAGE_PATH", x.options.fortress);
-  const { createSanctuaryServer } = await import("../../src/index.js");
-  const { exportSnapshot } = await import("../../src/evidence-pack/snapshot-export-cli.js");
+  const { exportSnapshot, exportDependencies } = await import("../../src/evidence-pack/snapshot-export-cli.js");
+  const productionBoot = exportDependencies.boot;
   const bootCalls: string[] = [];
-  x.deps.boot = path => { bootCalls.push(path); return createSanctuaryServer({ existingFortressPath: path }); };
+  x.deps.boot = path => { bootCalls.push(path); return productionBoot(path); };
   const config = await import("../../src/config.js");
   const configuration = vi.spyOn(config, "loadConfig");
   let before: unknown;

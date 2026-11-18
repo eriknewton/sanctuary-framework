@@ -27,7 +27,7 @@
  *    migration leaves a pure-legacy fortress (no un-unlockable window).
  */
 
-import { CUSTODY_ENVELOPE_KEY, CUSTODY_SENTINEL_KEY, LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY } from "../evidence-pack/existing-fortress.js";
+import { CUSTODY_ENVELOPE_KEY, CUSTODY_SENTINEL_KEY, LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY } from "./custody-markers.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -154,7 +154,7 @@ const CUSTODY_INSTALL_MODES: ReadonlySet<string> = new Set([
   "legacy-migrated",
 ]);
 
-export { CUSTODY_ENVELOPE_KEY, CUSTODY_SENTINEL_KEY } from "../evidence-pack/existing-fortress.js";
+export { CUSTODY_ENVELOPE_KEY, CUSTODY_SENTINEL_KEY } from "./custody-markers.js";
 
 /**
  * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
@@ -2220,7 +2220,7 @@ async function establishMasterUnderBarrier(
       throw error;
     }
   }
-  // Must match FORTRESS_INITIALIZATION_KEYS in ../evidence-pack/existing-fortress.ts; boot authenticates every admitted custody shape.
+  // Must match FORTRESS_INITIALIZATION_KEYS in ./custody-markers.ts; boot authenticates every admitted custody shape.
   const existingEnvelope = await readCustodyEnvelope(opts.storage);
   if (existingEnvelope) {
     const unlocked = await unlockEnvelopeReadOnly(existingEnvelope, opts);
@@ -2361,7 +2361,7 @@ async function establishMasterLocked(
     throw envelopeMissingButSentinelPresent();
   }
 
-  // Must match FORTRESS_INITIALIZATION_KEYS in ../evidence-pack/existing-fortress.ts; sentinel and legacy reads complete boot admission.
+  // Must match FORTRESS_INITIALIZATION_KEYS in ./custody-markers.ts; sentinel and legacy reads complete boot admission.
   const legacyParamsRaw = await storage.read("_meta", LEGACY_PASSPHRASE_KEY);
   const legacyHashRaw = await storage.read("_meta", LEGACY_RECOVERY_KEY);
 

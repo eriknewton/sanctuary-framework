@@ -2,7 +2,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, writeFile, lstat, unlink, rmdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { initializedFortressExists, FORTRESS_STATE_DIRECTORY } from "./existing-fortress.js";
+import { initializedFortressExists } from "./existing-fortress.js";
+import { FORTRESS_STATE_DIRECTORY } from "../core/custody-markers.js";
 import { createSanctuaryServer } from "../index.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { gatherSnapshot, resolveSnapshotTransparencyPin, type SnapshotGather, type CastlePin } from "./snapshot-gather.js";
@@ -113,7 +114,7 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
     C.requireSnapshot(resolve(instance.config.storage_path) === fortress, C.HARD.unsafe_path);
     const signer = instance.identityManager.getDefault(); C.requireSnapshot(signer, C.HARD.pin_invalid);
     const generatedAt = new Date().toISOString(), exportId = randomUUID();
-    // Must match FORTRESS_STATE_DIRECTORY in existing-fortress.ts; gathering uses the admitted custody root.
+    // Must match FORTRESS_STATE_DIRECTORY in ../core/custody-markers.ts; gathering uses the admitted custody root.
     // V0 reads its roster after gather; B shares one roster first read after normal shutdown in gatherExportStatement.
     let identityRoster: readonly StoredIdentity[] | undefined;
     const readIdentities = () => identityRoster ??= instance!.identityManager.list().map(i => instance!.identityManager.get(i.identity_id)!);
