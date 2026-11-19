@@ -18,6 +18,7 @@
  *     (the started dashboard's own boot path is the only production writer).
  */
 
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { mkdtemp, readFile, writeFile, readdir } from "node:fs/promises";

@@ -6,8 +6,8 @@
  * candidate build script, and any child process, which inherits the variable) creates its
  * folders inside that root; the teardown phase of a file-level `aroundAll` restores `TMPDIR` and
  * removes the root. That phase runs when a test failed or timed out and when a `beforeAll` or an
- * `afterAll` of the file threw, and the file still reports its own error. Bound: cleanup applies
- * only after the file-level `aroundAll` hook has been entered. The teardown phase runs after every
+ * `afterAll` of the file threw, and the file still reports its own error. Global teardown removes
+ * the recorded root if collection fails or every test is skipped. The hook teardown runs after every
  * `afterAll`, every beforeAll-returned cleanup and the file-scoped fixture teardown, so a fixture
  * that unlinks a path inside the root at teardown still finds it (an early removal fails that
  * teardown with ENOENT). test/setup/master-write-leases.ts registers its `aroundAll` from a setup
@@ -18,37 +18,23 @@
  * file that binds one keeps the socket directory under a short parent and removes it itself; see
  * SHORT_SOCKET_TMP_PARENT in test/castle-wall/runtime/enforcement-availability.test.ts.
  *
- * Why: a full-suite run on a build box left gigabytes of `pack-*`, `recipient-*` and
- * `snapshot-*` folders in the OS temp directory (disk filled three times on 2026-11-16). The
- * failure mode from the outside is a disk that fills slowly across runs with no failing test.
- *
  * Invariant: the root is created under the REAL temp directory captured at import time and is
  * never a path the operator owns (no login keychain, no `~/.sanctuary`); only this root is deleted.
  */
-import { aroundAll } from "vitest";
-import { chmodSync, lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { aroundAll, inject } from "vitest";
+import { createOwnedTempRoot, removeOwnedTempRoot, requireTempRootRegistry, PRIVATE_ROOT_PREFIX, TEMP_ROOT_REGISTRY } from "./owned-temp-roots.js";
 
-// 19 bytes; with the separator and mkdtemp's 6 random characters the root adds 26 bytes to every path
-// under it. Must match the 26-byte figure beside `SHORT_SOCKET_TMP_PARENT` in
-// test/castle-wall/runtime/enforcement-availability.test.ts.
-const PREFIX = "sanctuary-test-tmp-";
+// Prefix length and socket-path budget are pinned beside PRIVATE_ROOT_PREFIX in owned-temp-roots.ts.
+const PREFIX = PRIVATE_ROOT_PREFIX; // Must match the run teardown allowlist in owned-temp-roots.ts.
 const previous = process.env.TMPDIR;
-// realpath: on macOS tmpdir() sits under the /var symlink to /private/var, and tests compare canonical paths.
-const root = realpathSync(mkdtempSync(join(tmpdir(), PREFIX)));
+let registry: string | undefined;
+let plainNode = false;
+try { registry = inject(TEMP_ROOT_REGISTRY); } catch { plainNode = true; }
+// Only a missing runner selects the exit lifecycle; a live runner requires its registry.
+const runRegistry = plainNode ? null : requireTempRootRegistry(registry);
+const ownedRoot = createOwnedTempRoot(PREFIX, runRegistry);
+const root = ownedRoot.path;
 process.env.TMPDIR = root;
-
-/** Fixtures chmod folders to 000 to witness refusals; make them traversable so removal cannot fail on a failed test. */
-function reopen(path: string): void {
-  let stat;
-  try { stat = lstatSync(path); } catch { return; }
-  if (!stat.isDirectory()) return;
-  try { chmodSync(path, 0o700); } catch { /* Best effort: removal below reports the real failure. */ }
-  let names: string[] = [];
-  try { names = readdirSync(path); } catch { return; }
-  for (const name of names) reopen(join(path, name));
-}
 
 let released = false;
 /** Idempotent: restores the caller's TMPDIR and deletes the private root. */
@@ -56,10 +42,8 @@ export function releasePrivateTmpdir(): void {
   if (released) return;
   released = true;
   if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous;
-  // Refuse to delete anything that is not the folder this module created.
-  if (!root.includes(PREFIX)) return;
-  reopen(root);
-  rmSync(root, { recursive: true, force: true });
+  // The captured allocation identity confines removal to the root this run created.
+  removeOwnedTempRoot(ownedRoot);
 }
 
 /**
