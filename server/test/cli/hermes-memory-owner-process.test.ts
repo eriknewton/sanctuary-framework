@@ -40,6 +40,7 @@ describe("sanctuary hermes routing from cli.ts", () => {
     expect(JSON.parse(run.out)).toMatchObject({ report: "sanctuary hermes memory-report", owner_scope_passage_count: 1 });
     // cli.ts passes its own package version; the header carries it exactly, never a placeholder.
     expect(JSON.parse(run.out).provenance.package_version).toBe(PACKAGE_VERSION);
+    expect(JSON.parse(run.out).start_guidance).toEqual({ withheld_by: [], retained_count: expect.any(Number), returned_count: expect.any(Number) });
     expect(run.err.trimEnd().split("\n").at(-1)).toContain(CLOSING);
   });
 

@@ -23,7 +23,7 @@ import { CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, unlockExist
 import { CUSTODY_RELEASE_FAILURE_MESSAGE } from "../../src/cli/custody-release-message.js";
 import { MEMORY_CORPUS_SCAN_CAP } from "../../src/hermes-memory-bridge/index.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, deriveAuditStoreSplitBoundaryMacKey, writeAuditStoreSplitBoundary } from "../../src/operational/audit-log.js";
 import { KnownSignersStore } from "../../src/reputation/known-signers-store.js";
 import {
   DEFAULT_MAX_CHUNK_CHARS, HERMES_INSERT_INTENT_KEY, HERMES_INSERT_INTENT_NAMESPACE, HERMES_SAVE_MAX_CHUNKS,
@@ -47,6 +47,7 @@ afterEach(async () => {
 });
 
 const CLOSING = "The Hermes memory relay is still stopped. Start it with: launchctl kickstart";
+const CLOSING_INCOMPLETE = "The Hermes memory relay is still stopped. The record this command read does not cover the full history. Leave it stopped until the coordinator has read a memory-report.";
 const CLOSING_KEEP_STOPPED = "The Hermes memory relay is still stopped. Leave it stopped until the coordinator has read the memory-report.";
 // A run that stops before reading the audit log cannot rule out an earlier unconfirmed delete.
 const CLOSING_BEFORE_AUDIT_READ = "The Hermes memory relay is still stopped. The audit record could not be checked. Leave it stopped until the coordinator has read a memory-report.";
@@ -396,6 +397,7 @@ describe("hermes owner verbs: refusals", () => {
     const run = await runVerb(f, ["memory-report", "--since", f.since]);
     expect(run.code).toBe(1);
     expect(run.err).toMatch(/different agent id|does not match the --agent-id owner scope/u);
+    expect(lastLine(run.err)).toContain(CLOSING);
     expect(run.out).toBe("");
   });
 
@@ -718,6 +720,7 @@ describe("hermes owner verbs: memory-report", () => {
     await chmod(reports, 0o700);
     expect(run.code).toBe(1);
     expect(run.err).toContain("could not be written in full");
+    expect(lastLine(run.err)).toContain(CLOSING);
     if (removable) {
       expect(run.err).toContain("the partial file was removed");
       expect(await stat(target).then(() => true, () => false)).toBe(false);
@@ -785,6 +788,7 @@ describe("hermes owner verbs: memory-report", () => {
     const target = join(reports, "report.json");
     const ok = await runVerb(f, ["memory-report", "--since", f.since, "--out", target]);
     expect(ok.code, ok.err).toBe(0);
+    expect(lastLine(ok.err)).toContain(CLOSING);
     // One open handle for the mode check and the read, so both observe the same file.
     const written = await open(target, "r");
     try {
@@ -1166,6 +1170,7 @@ describe("hermes owner verbs: memory-delete", () => {
     const run = await runVerb(f, ["memory-delete", "--passage", "p1"], { answer: `${answer}\n` });
     expect(run.code).toBe(1);
     expect(run.err).toContain("did not match");
+    expect(lastLine(run.err)).toContain(CLOSING);
     expect(await treeHashes(f.fortress)).toEqual(before);
   });
 
@@ -1175,6 +1180,7 @@ describe("hermes owner verbs: memory-delete", () => {
     const run = await runVerb(f, ["memory-delete", "--passage", "p1"], { promptTimeoutMs: 50 });
     expect(run.code).toBe(1);
     expect(run.err).toContain("No answer within the time limit");
+    expect(lastLine(run.err)).toContain(CLOSING);
     expect(await treeHashes(f.fortress)).toEqual(before);
   });
 
@@ -1206,6 +1212,7 @@ describe("hermes owner verbs: memory-delete", () => {
     const missing = await runVerb(f, ["memory-delete", "--passage", "nope"], { answer: "DELETE\n" });
     expect(missing.code).toBe(1);
     expect(missing.err).toContain("No saved passage with that id");
+    expect(lastLine(missing.err)).toContain(CLOSING);
     expect(await outcomes(f)).toEqual([]);
   });
 
@@ -1251,6 +1258,7 @@ describe("hermes owner verbs: memory-delete", () => {
     expect(run.code).toBe(1);
     expect(loads).toBe(2);
     expect(run.err).toContain("The delete could not be prepared (error). Nothing was deleted.");
+    expect(lastLine(run.err)).toContain(CLOSING);
     expect(run.err).not.toContain("could not finish");
     expect(await docPresent(f)).toBe(true);
     expect(await outcomes(f)).toEqual([]);
@@ -1333,6 +1341,7 @@ describe("hermes owner verbs: memory-delete", () => {
     const run = await runVerb(f, ["memory-delete", "--passage", "p1"], { answer: "DELETE\n" });
     expect(run.code).toBe(1);
     expect(run.err).toContain("The delete could not start (lock_contention). Nothing was deleted.");
+    expect(lastLine(run.err)).toContain(CLOSING);
     expect(await docPresent(f)).toBe(true);
     expect((await outcomes(f))[1]).toMatchObject({ outcome: "not_attempted", error_category: "lock_contention" });
   });
@@ -1354,6 +1363,7 @@ describe("hermes owner verbs: memory-delete", () => {
     const run = await runVerb(f, ["memory-delete", "--passage", "p1"], { stdout, stdin });
     expect(run.code).toBe(1);
     expect(run.err).toContain("already gone");
+    expect(lastLine(run.err)).toContain(CLOSING);
     expect((await outcomes(f)).map(row => row?.outcome)).toEqual(["intent", "not_found"]);
   });
 
@@ -1778,6 +1788,8 @@ describe("hermes owner verbs: help text", () => {
     expect(HERMES_MEMORY_HELP["memory-show"]).toContain("scrollback");
     expect(HERMES_MEMORY_HELP["memory-report"]).toContain("not a witness");
     for (const verb of ["memory-report", "memory-show", "memory-delete"] as const) {
+      expect(HERMES_MEMORY_HELP[verb]).toContain("has been checked and covers the full history, and no unresolved delete is identified.");
+      expect(HERMES_MEMORY_HELP[verb]).toContain("Only if the last line says to start the relay:");
       expect(HERMES_MEMORY_HELP[verb]).toContain("cannot be\nzeroed inside a JavaScript process");
       expect(HERMES_MEMORY_HELP[verb]).toContain("B_RUNTIME/bin/node B_RUNTIME/pkg/dist/cli.js");
     }
@@ -1852,9 +1864,13 @@ describe("owner evidence and destinations 1514", () => {
     });
     for (const verb of VERBS) {
       const run = await runVerb(f, verbArgs(verb), { answer: "no\n" });
+      if (verb === "memory-report") expect.soft(report(run).start_guidance?.withheld_by).toEqual([
+        !verified ? "audit_unverified" : everPruned === true ? "history_pruned" : "retention_unknown",
+      ]);
       if (everPruned === true) {
         // DEBT(HERMES-OWNER-HOLD-RETENTION)
-        expect.soft(lastLine(run.err)).toContain(CLOSING);
+        expect.soft(lastLine(run.err)).toBe(CLOSING_INCOMPLETE);
+        expect.soft(run.err).not.toContain("launchctl kickstart");
       } else {
         expect.soft(lastLine(run.err)).toContain("record could not be checked");
         expect.soft(lastLine(run.err)).toContain("Leave it stopped");
@@ -1919,5 +1935,199 @@ describe("owner evidence and destinations 1514", () => {
   it("describes audit metadata retention limits in delete help R7", () => {
     expect.soft(HERMES_MEMORY_HELP["memory-delete"]).toContain("under the audit log's retention limits");
     expect.soft(HERMES_MEMORY_HELP["memory-delete"]).not.toContain("permanently");
+  });
+});
+
+
+describe("owner start guidance requires complete evidence", () => {
+  const PASSAGE = "p1";
+  const DOCUMENT = `mem.${FIXTURE_AGENT_ID}.${PASSAGE}`;
+  const details = (outcome: string) => ({ passage_id: PASSAGE, document_id: DOCUMENT, text_sha256: null, outcome });
+  async function appendRows(f: OwnerFortress, rows: readonly Record<string, unknown>[]) {
+    await withSeedSession(f, async ({ audit }) => {
+      for (const row of rows) await audit.appendCritical({ layer: "l3", operation: HERMES_MEMORY_OWNER_DELETE_OPERATION,
+        identity_id: "operator", result: "success", details: row });
+    });
+  }
+  function incomplete(run: { err: string }) {
+    expect.soft(lastLine(run.err)).toBe(CLOSING_INCOMPLETE);
+    expect.soft(run.err).not.toContain("launchctl kickstart");
+    expect.soft(run.err).not.toContain("could not be checked");
+  }
+
+  it("uses a complete retained record for all three closing decisions", async () => {
+    const f = await ownerFortress(stack);
+    await seedPassage(f, PASSAGE, "retained passage");
+    await appendRows(f, [details("intent"), details("indeterminate")]);
+    const RETAINED_CAP = 4; // Small fixture ceiling, enough for a safe delete's two rows and a retained suffix.
+    const FILLER_ROWS = RETAINED_CAP * 2; // Two full windows leave only ordinary fixture rows.
+    await withSeedSession(f, async ({ masterKey }) => {
+      const audit = new AuditLog(f.storage, masterKey, { maxEntries: RETAINED_CAP });
+      for (let index = 0; index < FILLER_ROWS; index++) await audit.appendCritical({ layer: "l1",
+        operation: "owner_fixture_ready", identity_id: "operator", result: "success" });
+      expect((await audit.getRetentionUsage()).everPruned).toBe(true);
+    });
+    expect(await auditEntries(f, HERMES_MEMORY_OWNER_DELETE_OPERATION)).toEqual([]);
+    for (const verb of VERBS) {
+      const run = await runVerb(f, verbArgs(verb), { answer: "DELETE\n" });
+      expect(run.code, run.err).toBe(0);
+      incomplete(run);
+      if (verb === "memory-report") {
+        const parsed = report(run);
+        expect(parsed.window.chain_verified).toBe(true);
+        expect.soft(parsed.start_guidance).toEqual({ withheld_by: ["history_pruned"],
+          retained_count: parsed.start_guidance?.returned_count, returned_count: expect.any(Number) });
+      }
+    }
+  });
+
+  it.each([
+    { name: "orphan failed_unrestored", row: details("failed_unrestored") },
+    { name: "orphan indeterminate", row: details("indeterminate") },
+    { name: "unknown outcome", row: details("unknown") },
+    { name: "missing outcome", row: { passage_id: PASSAGE, document_id: DOCUMENT } },
+    { name: "malformed passage", row: { ...details("deleted"), passage_id: null } },
+    { name: "malformed document", row: { ...details("deleted"), document_id: null } },
+    { name: "malformed digest", row: { ...details("intent"), text_sha256: false } },
+  ])("retains a hold for $name in the report decision", async ({ name, row }) => {
+    const f = await ownerFortress(stack);
+    const prefix = name.startsWith("orphan") ? [] : [details("intent")];
+    await appendRows(f, [...prefix, row, details("intent"), details("deleted")]);
+    const rowOnly = name === "orphan failed_unrestored" || name === "malformed passage";
+    if (!rowOnly) {
+      const realUsage = AuditLog.prototype.getRetentionUsage;
+      vi.spyOn(AuditLog.prototype, "getRetentionUsage").mockImplementation(async function(this: AuditLog) {
+        return { ...await realUsage.call(this), everPruned: true };
+      });
+    }
+    const run = await runVerb(f, ["memory-report"]);
+    const parsed = report(run);
+    expect.soft(parsed.start_guidance?.withheld_by).toEqual(rowOnly
+      ? ["unresolved_delete"] : ["history_pruned", "unresolved_delete"]);
+    expect(parsed.window.chain_verified).toBe(true);
+    if (rowOnly) {
+      expect(parsed.window.ever_pruned).toBe(false);
+      expect(parsed.start_guidance.retained_count).toBe(parsed.start_guidance.returned_count);
+      expect.soft(lastLine(run.err)).toBe(CLOSING_AFTER_UNCONFIRMED + " this report.");
+      expect.soft(run.err).not.toContain("launchctl kickstart");
+    }
+  });
+
+  it.each([
+    { name: "passage object", row: { ...details("intent"), passage_id: { toString: null } } },
+    { name: "null entry", row: null },
+  ])("keeps advice stopped when the view cannot be evaluated: $name", async ({ row }) => {
+    const f = await ownerFortress(stack);
+    await appendRows(f, [details("intent")]);
+    const realQuery = AuditLog.prototype.query;
+    vi.spyOn(AuditLog.prototype, "query").mockImplementation(async function(this: AuditLog, ...args) {
+      const result = await realQuery.apply(this, args);
+      return { ...result, entries: result.entries.map(entry => row === null ? row : { ...entry, details: row }) } as typeof result;
+    });
+    const run = await runVerb(f, ["memory-report"]);
+    expect(run.code).toBe(1);
+    expect(run.err).toContain("The command could not finish and nothing was changed.");
+    expect(run.err).not.toMatch(/TypeError|Cannot convert|Cannot read|\n\s+at /u);
+    expect.soft(lastLine(run.err)).toBe(CLOSING_BEFORE_AUDIT_READ);
+    expect.soft(run.err).not.toContain("launchctl kickstart");
+  });
+
+  it("permits report advice after a complete clear view and an output failure", async () => {
+    const f = await ownerFortress(stack);
+    const stdout = new TerminalSink();
+    vi.spyOn(stdout, "write").mockImplementation(() => { throw new Error("report output fixture"); });
+    const run = await runVerb(f, ["memory-report"], { stdout });
+    expect(run.code).toBe(1);
+    expect(run.err).toContain("The command could not finish and nothing was changed.");
+    expect(lastLine(run.err)).toContain(CLOSING);
+  });
+
+  it("requires full row coverage with a valid sealed prefix", async () => {
+    const f = await ownerFortress(stack);
+    await seedPassage(f, PASSAGE, "sealed fixture passage");
+    await appendRows(f, [details("intent"), details("indeterminate")]);
+    await withSeedSession(f, async ({ audit, masterKey }) => {
+      const head = await audit.getChainHead();
+      const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
+      try {
+        await writeAuditStoreSplitBoundary(join(f.fortress, "state"), macKey, {
+          sealed_tip_sequence: head.sequence, sealed_base_sequence: 1, // The first audit sequence is one.
+          sealed_tip_entry_hash: head.entry_hash, daemon_namespace: "_audit-daemon",
+        });
+      } finally { macKey.fill(0); }
+      await new AuditLog(f.storage, masterKey).appendCritical({ layer: "l1", operation: "owner_fixture_ready",
+        identity_id: "operator", result: "success" });
+    });
+    for (const verb of VERBS) {
+      const run = await runVerb(f, verbArgs(verb), { answer: "no\n" });
+      incomplete(run);
+      if (verb === "memory-report") {
+        const parsed = report(run);
+        expect(parsed.window).toMatchObject({ chain_verified: true, ever_pruned: false });
+        expect.soft(parsed.start_guidance?.withheld_by).toEqual(["row_count_mismatch"]);
+        expect.soft(parsed.start_guidance?.retained_count).toBeGreaterThan(parsed.start_guidance?.returned_count);
+      }
+    }
+  });
+
+  it("requires equal counts from the usage-reading seam", async () => {
+    const f = await ownerFortress(stack);
+    await seedPassage(f, PASSAGE, "window fixture passage");
+    const realUsage = AuditLog.prototype.getRetentionUsage;
+    const OMITTED_ROWS = 1; // Model one retained row beyond the reader's window; this is not a large real log.
+    vi.spyOn(AuditLog.prototype, "getRetentionUsage").mockImplementation(async function(this: AuditLog) {
+      const usage = await realUsage.call(this);
+      return { ...usage, entryCount: usage.entryCount + OMITTED_ROWS };
+    });
+    for (const verb of VERBS) {
+      const run = await runVerb(f, verbArgs(verb), { answer: "no\n" });
+      incomplete(run);
+      if (verb === "memory-report") expect.soft(report(run).start_guidance?.withheld_by).toEqual(["row_count_mismatch"]);
+    }
+  });
+
+  it("keeps the complete pre-append view for the current delete", async () => {
+    const f = await ownerFortress(stack);
+    await seedPassage(f, PASSAGE, "current delete passage");
+    const realUsage = AuditLog.prototype.getRetentionUsage;
+    const realAppend = AuditLog.prototype.appendCritical;
+    let appended = false;
+    const usageSpy = vi.spyOn(AuditLog.prototype, "getRetentionUsage").mockImplementation(async function(this: AuditLog) {
+      const usage = await realUsage.call(this);
+      return { ...usage, everPruned: appended };
+    });
+    vi.spyOn(AuditLog.prototype, "appendCritical").mockImplementation(async function(this: AuditLog, ...args) {
+      const result = await realAppend.apply(this, args);
+      appended = true;
+      return result;
+    });
+    const run = await runVerb(f, ["memory-delete", "--passage", PASSAGE], { answer: "DELETE\n" });
+    expect(run.code, run.err).toBe(0);
+    expect(appended).toBe(true);
+    expect(usageSpy).toHaveBeenCalledOnce();
+    expect(lastLine(run.err)).toContain(CLOSING);
+    incomplete(await runVerb(f, ["memory-report"]));
+  });
+
+  it.each(["empty", "display failure"] as const)("permits show after a complete clear view: %s", async mode => {
+    const f = await ownerFortress(stack);
+    const stdout = new TerminalSink();
+    if (mode === "display failure") {
+      await seedPassage(f, PASSAGE, "display fixture passage");
+      vi.spyOn(stdout, "write").mockImplementation(() => { throw new Error("display fixture"); });
+    }
+    const run = await runVerb(f, ["memory-show", "--recent", "1"], { stdout });
+    expect(run.code).toBe(mode === "empty" ? 0 : 1);
+    expect(lastLine(run.err)).toContain(CLOSING);
+  });
+
+  it.each(VERBS)("permits %s with a complete clear view", async verb => {
+    const f = await ownerFortress(stack);
+    await seedPassage(f, PASSAGE, "complete fixture passage");
+    const run = await runVerb(f, verbArgs(verb), { answer: "DELETE\n" });
+    expect(run.code, run.err).toBe(0);
+    expect(lastLine(run.err)).toContain(CLOSING);
+    if (verb === "memory-report") expect(report(run).start_guidance).toEqual({ withheld_by: [],
+      retained_count: (await auditEntries(f)).length, returned_count: (await auditEntries(f)).length });
   });
 });
