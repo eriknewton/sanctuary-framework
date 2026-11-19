@@ -6,93 +6,28 @@
   <title>{{ page.title | default: site.title }}</title>
   <meta name="description" content="{{ page.description | default: site.description }}">
   <meta name="author" content="Erik Newton">
-  <meta name="theme-color" content="#0b1326">
+  <meta name="theme-color" content="#FFFFFF">
   <meta property="og:title" content="{{ page.title | default: site.title }}">
   <meta property="og:description" content="{{ page.description | default: site.description }}">
   <meta property="og:type" content="website">
   <meta property="og:url" content="{{ page.url | absolute_url }}">
   <meta property="og:site_name" content="Sanctuary Protocol">
 
-  <!-- Self-hosted fonts: the site loads nothing from third parties (footer promise on docs/index.html). -->
+  <!-- Self-hosted fonts and styles: the site loads nothing from third parties (footer promise on docs/index.html). -->
   <link rel="stylesheet" href="{{ '/assets/home/fonts.css' | relative_url }}">
-
-  <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
-
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ddb7ff'/%3E%3Cstop offset='1' stop-color='%234fdbc8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M16 2 30 16 16 30 2 16z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="{{ '/assets/home/journal.css' | relative_url }}">
+  <link rel="icon" href="{{ '/assets/home/favicon-a2.svg' | relative_url }}" type="image/svg+xml">
 </head>
 <body>
-
 <a class="skip" href="#main">Skip to content</a>
-
-<nav class="nav" aria-label="Primary">
-  <div class="nav__inner">
-    <a class="nav__brand" href="{{ '/' | relative_url }}">
-      <span class="nav__brand-mark" aria-hidden="true"></span>
-      Sanctuary
-    </a>
-    <div class="nav__links">
-      <a href="{{ '/' | relative_url }}#layers">Architecture</a>
-      <a href="{{ '/' | relative_url }}#quickstart">Quickstart</a>
-      <a href="{{ '/blog/' | relative_url }}">Journal</a>
-      <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
-    </div>
-    <div class="nav__actions">
-      <a class="btn btn--secondary btn--sm" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
-      <a class="btn btn--primary btn--sm" href="https://github.com/eriknewton/sanctuary-framework">Install</a>
-    </div>
-  </div>
-</nav>
+{% include site-header.html %}
 
 <main id="main">
-  <section class="section container">
+  <div class="wrap">
     {{ content }}
-  </section>
+  </div>
 </main>
 
-<footer class="footer">
-  <div class="container">
-    <div class="footer__grid">
-      <div class="footer__brand">
-        <a class="nav__brand" href="{{ '/' | relative_url }}">
-          <span class="nav__brand-mark" aria-hidden="true"></span>
-          Sanctuary
-        </a>
-        <p>A sovereignty substrate for AI agents: operating-system enforcement is live on macOS today, and the Ubuntu 24.04 (x86-64) fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package, within the Assurance Matrix bounds; Windows is roadmap, with portable reputation and current bounds in the Assurance Matrix.</p>
-      </div>
-      <div class="footer__col">
-        <h5>Project</h5>
-        <ul>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a></li>
-          <li><a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">Docs</a></li>
-        </ul>
-      </div>
-      <div class="footer__col">
-        <h5>Architecture</h5>
-        <ul>
-          <li><a href="{{ '/' | relative_url }}#h-answer">How it works</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework#readme">Harness support</a></li>
-          <li><a href="{{ '/blog/' | relative_url }}">Journal</a></li>
-        </ul>
-      </div>
-      <div class="footer__col">
-        <h5>Legal</h5>
-        <ul>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE">License</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/GOVERNANCE.md">Governance</a></li>
-        </ul>
-      </div>
-    </div>
-    <div class="footer__bottom">
-      <div>&copy; {{ 'now' | date: "%Y" }} Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (specification).</div>
-      <div class="footer__status">
-        <span class="footer__status-dot" aria-hidden="true"></span>
-        <span>live on npm</span>
-      </div>
-    </div>
-  </div>
-</footer>
-
+{% include site-footer.html %}
 </body>
 </html>
