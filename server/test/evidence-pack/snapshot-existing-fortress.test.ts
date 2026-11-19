@@ -1,6 +1,7 @@
 /** Evidence export admits initialized filesystem fortresses before acquiring credentials or creating artifacts. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { SOURCE, exporterFixture } from "./snapshot-fixtures.js";
@@ -20,18 +21,28 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
+function metadataOf(info: BigIntStats) {
+  return { mode: String(info.mode), ino: String(info.ino), size: String(info.size), mtime: String(info.mtimeNs), ctime: String(info.ctimeNs) };
+}
 async function inventory(path: string): Promise<unknown> {
-  let info;
-  try { info = await lstat(path, { bigint: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
-  const metadata = { mode: String(info.mode), ino: String(info.ino), size: String(info.size), mtime: String(info.mtimeNs), ctime: String(info.ctimeNs) };
-  if (info.isSymbolicLink()) return { ...metadata, link: await readlink(path) };
-  if (info.isDirectory()) {
-    const entries: Record<string, unknown> = {};
-    for (const name of (await readdir(path)).sort()) entries[name] = await inventory(join(path, name));
-    return { ...metadata, entries };
+  // One descriptor answers both metadata and contents, so they describe the same object; O_NOFOLLOW reports a link as ELOOP instead of following it.
+  let handle;
+  try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    if (code !== "ELOOP") throw error;
+    return { ...metadataOf(await lstat(path, { bigint: true })), link: await readlink(path) };
   }
-  return { ...metadata, bytes: (await readFile(path)).toString("hex") };
+  try {
+    const info = await handle.stat({ bigint: true });
+    if (info.isDirectory()) {
+      const entries: Record<string, unknown> = {};
+      for (const name of (await readdir(path)).sort()) entries[name] = await inventory(join(path, name));
+      return { ...metadataOf(info), entries };
+    }
+    return { ...metadataOf(info), bytes: (await handle.readFile()).toString("hex") };
+  } finally { await handle.close(); }
 }
 async function bootOutcome(boot: () => Promise<{ cleanup: () => Promise<void> }>) {
   try {
