@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, aroundAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rename, stat, mkdir, open, realpath, symlink, readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
@@ -6,8 +6,9 @@ import { runInNewContext } from "node:vm";
 import { fork } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { SHORT_SOCKET_TMP_PARENT } from "../helpers/short-socket-tmp-parent.js";
 import { FilesystemStorage, withFilesystemLockTestHooks } from "../../src/storage/filesystem.js";
 import type { NamespaceLockOptions } from "../../src/storage/interface.js";
 import * as sdwWriteGate from "../../src/sdw/write-gate.js";
@@ -120,6 +121,18 @@ vi.mock("node:fs/promises", async (original) => {
   } };
 });
 
+// A macOS per-user temp realpath is 56 bytes: /private/var/folders/<2>/<30>/T.
+// A direct runtime root needs 56 + 11 (/s1r-XXXXXX) + 1 (separator) + 47
+// (40 digest characters + .reaper) = 115 bytes, above KERNEL_SOCKET_PATH_MAX_BYTES (100).
+// Under /private/tmp, this file's parent and runtime child need 12 + 10 (/s1-XXXXXX)
+// + 11 + 1 + 47 = 81 bytes. Removing the owned parent includes all fixture children.
+let tempRoot!: string;
+aroundAll(async runSuite => {
+  tempRoot = realpathSync(mkdtempSync(join(SHORT_SOCKET_TMP_PARENT, "s1-")));
+  try { await runSuite(); }
+  finally { rmSync(tempRoot, { recursive: true, force: true }); }
+});
+
 const PRIVATE_FILE_MODE = 0o600;
 const DATA = Buffer.from("fixture strict bytes");
 const NEXT = Buffer.from("fixture replacement");
@@ -127,7 +140,7 @@ const NS = "fixture";
 let root: string;
 let storage: FilesystemStorage;
 beforeEach(async () => {
-  root = await realpath(await mkdtemp(join(tmpdir(), "s1a-")));
+  root = await realpath(await mkdtemp(join(tempRoot, "s1a-")));
   storage = new FilesystemStorage(root);
   faults.swapBeforeSync = ""; faults.syncedInodes = [];
   faults.custodyPublished = false; faults.swapAfterLeafClose = ""; faults.swapAfterCustody = ""; faults.swapCompare = ""; faults.compareCleanup = false;
@@ -160,7 +173,7 @@ async function strictLock<T>(...args: Parameters<FilesystemStorage["withStrictNa
 }
 async function boundOperation<T>(operation: () => Promise<T>): Promise<T> {
   if (insideStrictLock) return operation();
-  const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+  const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
   return strictLock<T>(NS, ".strict.lock", operation, { runtimeRoot });
 }
 const strictWrite = (namespace: string, key: string, data: Uint8Array): Promise<void> => boundOperation(() => storage.writeStrict(namespace, key, data));
@@ -311,7 +324,7 @@ describe("strict file and directory barriers", () => {
   it.runIf(process.platform === "linux" || process.platform === "darwin")("strict namespace binding keeps writes on the held inode", async () => {
     requireStrict();
     expect(typeof storage.withStrictNamespaceLock, "ENTRYPOINT_ABSENT withStrictNamespaceLock").toBe("function");
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     const moved = `${root}-held`;
     let entered = false;
     await expect(strictLock(NS, ".strict.lock", async () => {
@@ -325,7 +338,7 @@ describe("strict file and directory barriers", () => {
 
   it.runIf(process.platform === "linux" || process.platform === "darwin")("legacy namespace bindings cannot advertise strict parent durability", async () => {
     requireStrict();
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     let entered = false;
     await storage.withNamespaceLock(NS, ".legacy.lock", async () => {
       entered = true;
@@ -336,7 +349,7 @@ describe("strict file and directory barriers", () => {
   it.runIf(process.platform === "linux" || process.platform === "darwin")("strict namespace binding completes create, replace and stable file writes", async () => {
     requireStrict();
     storage = new FilesystemStorage(join(root, "state"));
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await strictLock(NS, ".strict.lock", async (lease) => {
       expect(await strictCreate(NS, "key", DATA)).toBe(true);
       expect(await strictReplace(NS, "key", DATA, NEXT)).toBe(true);
@@ -349,7 +362,7 @@ describe("strict file and directory barriers", () => {
   it.runIf(process.platform === "darwin")("Darwin worker creates strict parent directories through its held capability", async () => {
     requireStrict();
     storage = new FilesystemStorage(join(root, "state"));
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await strictLock(NS, ".strict.lock", async (lease) => {
       const PRIVATE_DIRECTORY_MODE = 0o700;
       await lease.stableFortressCapability!.mkdir("parent/child", PRIVATE_DIRECTORY_MODE);
@@ -429,7 +442,7 @@ inProcessStrictPath("refuses a publishing directory replaced after rename", asyn
   expect(await readFile(join(root, `${NS}-held`, "key.enc"))).toEqual(DATA);
 });
 it.runIf(process.platform === "linux" || process.platform === "darwin")("strict binding syncs captured root authority", async () => {
-  const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+  const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
   faults.capturedOnly = root;
   let entered = false;
   await expect(strictLock(NS, ".strict.lock", async () => { entered = true; }, { runtimeRoot })).rejects.toMatchObject({ code: "EIO" });
@@ -517,7 +530,7 @@ describe("strict authority closure", () => {
   }
   it("strict lock refuses a missing root parent on every retry", async () => {
     storage = new FilesystemStorage(join(root, "missing", "state"));
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     for (let attempt = 0; attempt < 2; attempt++) {
       await expect(storage.withStrictNamespaceLock(NS, ".lock", async () => true, { runtimeRoot })).rejects.toThrow();
       expect(await readdir(root)).toEqual([]);
@@ -526,7 +539,7 @@ describe("strict authority closure", () => {
   for (const directory of ["namespace", "root", "parent"] as const) {
     it(`strict lock retries the held ${directory} barrier`, async () => {
       storage = new FilesystemStorage(join(root, "state"));
-      const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+      const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
       const path = { namespace: join(root, "state", NS), root: join(root, "state"), parent: root }[directory];
       faults.path = path;
       await expect(storage.withStrictNamespaceLock(NS, ".lock", async () => true, { runtimeRoot })).rejects.toMatchObject({ code: "EINVAL" });
@@ -551,21 +564,21 @@ describe("strict authority closure", () => {
     }
   });
   inProcessStrictPath("comparison revalidates its parent after taking the path lock", async () => {
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await storage.withStrictNamespaceLock(NS, ".lock", async () => {
       faults.swapCompare = join(root, "other");
       await expect(storage.replaceIfEqualsStrict("other", "absent", DATA, NEXT)).rejects.toThrow(/identity changed/);
     }, { runtimeRoot });
   });
   inProcessStrictPath("exclusive publication retains the custody descriptor identity", async () => {
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await storage.withStrictNamespaceLock(NS, ".lock", async () => {
       faults.swapAfterCustody = join(root, "other");
       await expect(storage.writeIfAbsentStrict("other", "key", DATA)).rejects.toThrow(/identity changed|publication and cleanup/);
     }, { runtimeRoot });
   });
   inProcessStrictPath("comparison cleanup retains the primary strict error", async () => {
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await storage.withStrictNamespaceLock(NS, ".lock", async () => {
       await storage.writeStrict(NS, "key", DATA);
       faults.path = "FILE"; faults.compareCleanup = true;
@@ -621,7 +634,7 @@ it("publication barrier keeps its verified descriptor through a pre-sync directo
 });
 
 it("continuing strict operations cover both namespaces and every comparison result", async () => {
-  const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+  const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
   storage = new FilesystemStorage(join(root, "state"));
   await storage.withStrictNamespaceLock(NS, ".lock", async lease => {
     for (const namespace of [NS, "other"]) {
@@ -670,7 +683,7 @@ syncBuiltinESMExports();`;
 });
 
 it("strict authority refuses mutations before the lock callback acquires its lease", async () => {
-  const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+  const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
   const pathLock = lockModule.withPathLock;
   let observed = false;
   vi.spyOn(lockModule, "withPathLock").mockImplementation(async (directory, name, operation, options) => {
@@ -783,7 +796,7 @@ syncBuiltinESMExports();
 
 const darwinWorkerPath = it.runIf(process.platform === "darwin");
 async function inWorkerLock<T>(faults: WorkerFaults | undefined, operation: () => Promise<T>, target: FilesystemStorage = storage): Promise<T> {
-  const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+  const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
   const lock = (): Promise<T> => target.withStrictNamespaceLock(NS, ".strict.lock", operation, { runtimeRoot });
   return faults ? withFilesystemLockTestHooks({ directoryCapabilityPreload: workerFaultPreload(faults) }, lock) : lock();
 }
@@ -889,7 +902,7 @@ describe("strict owner barriers, worker exemption, lease and nesting", () => {
 
   inProcessStrictPath("owner-mode strict write syncs the root for a namespace created after acquisition", async () => {
     const ownerStorage = new FilesystemStorage(root, { owner: owner() });
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await ownerStorage.withStrictNamespaceLock("locked", ".strict.lock", async () => {
       await new FilesystemStorage(root).write("later", "seed", DATA);
       faults.path = root;
@@ -925,7 +938,7 @@ describe("strict owner barriers, worker exemption, lease and nesting", () => {
 
   it.runIf(process.platform === "linux" || process.platform === "darwin")("a kept strict lease refuses every method after its callback settles", async () => {
     storage = new FilesystemStorage(join(root, "state"));
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     let kept: lockModule.CrossProcessLockLease | undefined;
     await storage.withStrictNamespaceLock(NS, ".strict.lock", async lease => { kept = lease; }, { runtimeRoot });
     const decoy = join(root, "decoy");
@@ -957,8 +970,8 @@ describe("strict owner barriers, worker exemption, lease and nesting", () => {
   });
 
   it.runIf(process.platform === "linux" || process.platform === "darwin")("a public lock nested in a strict callback does not inherit strict mode", async () => {
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
-    const nestedRuntimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
+    const nestedRuntimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await storage.withStrictNamespaceLock(NS, ".strict.lock", async () => {
       await storage.withNamespaceLock("nested", ".nested.lock", async () => {
         await expect(storage.writeStrict("nested", "key", DATA)).rejects.toThrow(/strict namespace binding/);
@@ -968,8 +981,8 @@ describe("strict owner barriers, worker exemption, lease and nesting", () => {
   });
 
   it.runIf(process.platform === "linux" || process.platform === "darwin")("a lock nested in strict authority discards test hooks", async () => {
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
-    const nestedRuntimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
+    const nestedRuntimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     const calls: string[] = [];
     await storage.withStrictNamespaceLock(NS, ".strict.lock", async () => {
       await storage.withNamespaceLock("nested", ".nested.lock", async () => undefined, {
@@ -988,7 +1001,7 @@ describe("test hooks off the public surface, kept-lease fence, typed owner refus
 
   darwinWorkerPath("a worker preload in public lock options is never honored", async () => {
     const directoryIno = await namespaceInode();
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     expect(process.env.VITEST).toBeDefined();
     const smuggled = { runtimeRoot, __testDirectoryCapabilityPreload: workerFaultPreload({ directoryIno, directoryCode: "EIO" }) } as unknown as NamespaceLockOptions;
     await storage.withStrictNamespaceLock(NS, ".strict.lock", () => storage.writeStrict(NS, "key", DATA), smuggled);
@@ -999,7 +1012,7 @@ describe("test hooks off the public surface, kept-lease fence, typed owner refus
     for (const entry of ["strict", "legacy"] as const) {
       const calls: string[] = [];
       const acquired: number[] = [];
-      const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+      const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
       const smuggled = {
         runtimeRoot,
         kernelBacked: true,
@@ -1014,14 +1027,14 @@ describe("test hooks off the public surface, kept-lease fence, typed owner refus
 
   it.runIf(process.platform === "linux" || process.platform === "darwin")("the test-hook injection still reaches the lock", async () => {
     const calls: string[] = [];
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await withFilesystemLockTestHooks({ closeNamespaceCapability: lockKinds(calls) }, () =>
       storage.withStrictNamespaceLock(NS, ".strict.lock", async () => undefined, { runtimeRoot }));
     expect(calls).toContain("namespace-fd");
   });
 
   it.runIf(process.platform === "linux" || process.platform === "darwin")("a kept strict lease no longer asserts that it is held", async () => {
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     let kept: lockModule.CrossProcessLockLease | undefined;
     await storage.withStrictNamespaceLock(NS, ".strict.lock", async lease => {
       kept = lease;
@@ -1040,7 +1053,7 @@ describe("test hooks off the public surface, kept-lease fence, typed owner refus
 
   const ownerMissing = async (method: "writeStrict" | "writeIfAbsentStrict" | "replaceIfEqualsStrict"): Promise<void> => {
     const ownerStorage = new FilesystemStorage(root, { owner: owner() });
-    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const runtimeRoot = await realpath(await mkdtemp(join(tempRoot, "s1r-")));
     await ownerStorage.withStrictNamespaceLock("locked", ".strict.lock", async () => {
       const pending = method === "replaceIfEqualsStrict"
         ? ownerStorage.replaceIfEqualsStrict("missing", "key", DATA, NEXT)
