@@ -13,8 +13,6 @@ claims_era_note: true
 > Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
 
 
-# The Castle Wall, Linux Phase 1 Source Path
-
 > **Current correction, 2026-08-07:** this May 2026 post did not describe shipped
 > Linux enforcement. Linux Phase 1 was not live enforcement then and was not a
 > production enforcement baseline. Open defect: **IC-02, IC-03, IC-04**.

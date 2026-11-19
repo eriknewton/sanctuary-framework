@@ -36,7 +36,6 @@
 3	announcements/hackernews-submission.md
 9	announcements/linkedin-post.md
 8	announcements/x-twitter-thread.md
-7	docs/assets/css/site.css
 26	docs/audit/branch-protection-setup.md
 10	docs/audit/commit-4ac95830-postmortem.md
 16	docs/audit/test-baseline-hardening-plan.md

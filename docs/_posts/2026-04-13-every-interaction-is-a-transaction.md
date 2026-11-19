@@ -12,8 +12,6 @@ archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Termin
 > Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
 
 
-# Every Interaction Is a Transaction
-
 Every interaction between agents is a transaction.
 
 Not metaphorically. Not in the loose business-speak sense where "transaction" means "something happened between two parties." Structurally. Every time one agent asks another to do something (retrieve information, perform a task, share a resource, make a decision) there's an implicit negotiation happening. Terms are being set. Expectations are being established. Commitments are being made.

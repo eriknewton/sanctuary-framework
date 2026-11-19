@@ -1,9 +1,17 @@
+import "../../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+/**
+ * Parent directory for this file's Unix socket fixture. On macOS the per-user temp directory resolves to
+ * `/private/var/folders/<2>/<30>/T` (56 bytes) and this file's private temp root adds 26 more (separator,
+ * 19-byte prefix, 6 mkdtemp characters; must match `PREFIX` in test/helpers/private-tmpdir.ts), which leaves
+ * too little of `sun_path` for a socket directory, so the fixture sits under `/private/tmp` there. Elsewhere
+ * `tmpdir()` is already the private temp root, so the fixture stays inside it.
+ */
+import { SHORT_SOCKET_TMP_PARENT } from "../../helpers/short-socket-tmp-parent.js";
 import { join } from "node:path";
 import { createServer } from "node:net";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
@@ -67,6 +75,11 @@ const SIGNED_MANIFEST: SignedManifest = {
     signature_b64url: "sig",
   },
 };
+
+/** macOS declares `sockaddr_un.sun_path` as `char[104]`; Linux declares 108, so macOS sets the portable bound. */
+const DARWIN_SUN_PATH_BYTES = 104;
+/** One byte of `sun_path` holds the terminating NUL, which leaves 104 - 1 = 103 bytes for the path itself. */
+const UNIX_SOCKET_PATH_MAX_BYTES = DARWIN_SUN_PATH_BYTES - 1;
 
 function makeManifestProvider(): MacOSManifestProvider {
   return {
@@ -319,8 +332,14 @@ describe("level-triggered enforcement availability store", () => {
   });
 
   it("I6: malformed castle.sock availability answers are rejected as undetermined input", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "sanctuary-availability-"));
+    // mkdtemp creates the directory with mode 0700, so only this user can reach the socket inside it.
+    const dir = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "sanctuary-availability-"));
+    // On macOS this directory is outside the private temp root, so the file removes it itself: the hook runs
+    // whether the test passes, fails or times out.
+    onTestFinished(() => rm(dir, { recursive: true, force: true }));
     const socketPath = join(dir, "castle.sock");
+    // A path within the bound binds on every supported platform; a longer one never reaches listen().
+    expect(Buffer.byteLength(socketPath)).toBeLessThanOrEqual(UNIX_SOCKET_PATH_MAX_BYTES);
     const server = createServer((socket) => {
       socket.once("data", () => {
         socket.write(
@@ -343,19 +362,22 @@ describe("level-triggered enforcement availability store", () => {
         );
       });
     });
-    // port-discipline: ignore - Unix domain socket path, not a TCP port.
-    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-    try {
-      await expect(
-        queryMacOSEnforcementAvailability(socketPath, {
-          timeoutMs: 100,
-          generateRequestId: () => "req-malformed",
-        }),
-      ).rejects.toThrow(/malformed enforcement availability response/);
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(dir, { recursive: true, force: true });
-    }
+    // Registered after the directory hook, so stack order closes the listener before the directory is removed.
+    onTestFinished(async () => {
+      if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      // A bind refusal rejects here, so it surfaces as the test's own error.
+      server.once("error", reject);
+      // port-discipline: ignore - Unix domain socket path, not a TCP port.
+      server.listen(socketPath, resolve);
+    });
+    await expect(
+      queryMacOSEnforcementAvailability(socketPath, {
+        timeoutMs: 100,
+        generateRequestId: () => "req-malformed",
+      }),
+    ).rejects.toThrow(/malformed enforcement availability response/);
   });
 });
 

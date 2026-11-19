@@ -11,6 +11,7 @@
  * Closes drill finding XXX (post-merge-drill-results-2026-05-11).
  */
 
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { mkdtemp, writeFile, chmod, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";

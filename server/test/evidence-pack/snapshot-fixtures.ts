@@ -1,3 +1,4 @@
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { createIdentity, sign, type StoredIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { computeAuditEntryHash, computeAuditRoot, checkpointSigningBytes } from "../../src/audit/chain.js";
