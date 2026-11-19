@@ -13,8 +13,6 @@ claims_era_note: true
 > Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
 
 
-# The Sovereignty Manifesto
-
 The agent era is just beginning and we have one extremely high stakes choice to make at the outset:
 
 1) Do we hand over our keys, our data, and our sovereignty to platform providers as we always have, or

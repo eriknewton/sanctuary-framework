@@ -7,8 +7,6 @@ image: /images/blog/nobody-else-was-going-to-build-it.jpg
 claims_era_note: true
 ---
 
-# Nobody Else Was Going to Build It
-
 This adventure in coding Sanctuary started one morning in February. I woke from a dead sleep before dawn and said: you have to build this. Shut up and just do it.
 
 My little one was with Grandma that night, so I had the morning to myself. I opened Claude Code and just got to work. Nobody else was going to build this.
