@@ -75,12 +75,7 @@ export function createMemoryAttestTools(
     {
       name: "memory_attest",
       description:
-        "Create an Ed25519-signed attestation for a memory operation. " +
-        "Records who accessed what (content hash, not content), when, and through " +
-        "which memory provider, without exposing the memory content itself. " +
-        "Works with any MCP-compatible memory provider (Mem0, Zep, Letta, etc.). " +
-        "Use after add_memory, search_memories, or any memory CRUD operation to " +
-        "build a cryptographically verifiable audit trail of memory access.",
+        "Sign a self-reported record of a memory operation on any memory provider: the operation, the provider name and a content hash you supply (never raw content), signed with identity_id or the primary identity. Returns attestation_id, the signed payload, the signature and the public key, and writes an audit entry without memory content. The signature proves which local identity made the report. It does not prove the provider performed the operation or that the hash matches any content. Use after a memory operation when you want a signed, self-reported trail.",
       inputSchema: {
         type: "object",
         properties: {
