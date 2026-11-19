@@ -1060,12 +1060,7 @@ export function createBridgeTools(
     {
       name: "bridge_commit",
       description:
-        "Create a cryptographic commitment binding a Concordia negotiation outcome " +
-        "to Sanctuary's L3 proof layer. The commitment includes a SHA-256 hash of " +
-        "the canonical outcome (hiding + binding), an Ed25519 signature by the " +
-        "committer's identity, and an optional Pedersen commitment on the round " +
-        "count for zero-knowledge range proofs. This is the Sanctuary side of the " +
-        "Concordia bridge: call this when a Concordia `accept` fires.",
+        "Create a cryptographic commitment binding a Concordia negotiation outcome to Sanctuary's selective disclosure surface. The commitment includes a SHA-256 hash of the canonical outcome (hiding + binding), an Ed25519 signature by the committer's identity, and an optional Pedersen commitment on the round count for zero-knowledge range proofs. This is the Sanctuary side of the Concordia bridge: call this when a Concordia `accept` fires.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1348,13 +1343,7 @@ export function createBridgeTools(
     {
       name: "bridge_attest",
       description:
-        "Record a Concordia negotiation as a Sanctuary L4 reputation attestation, " +
-        "linked to a bridge commitment. The commitment (L3) proves the revealed " +
-        "outcome matches the committer's signed commitment and terms hash; it does " +
-        "not independently prove Concordia agreement or counterparty assent. The " +
-        "attestation (L4) feeds the sovereignty-weighted reputation score. Its " +
-        "weight reflects the SIGNER's sovereignty tier (who makes the claim), not " +
-        "the counterparty's; a locally-signed attestation is self-attested.",
+        "Record a Concordia negotiation as a Sanctuary verifiable reputation attestation, linked to a bridge commitment. The selective disclosure commitment proves the revealed outcome matches the committer's signed commitment and terms hash; it does not independently prove Concordia agreement or counterparty assent. The reputation attestation feeds the sovereignty-weighted reputation score. Its weight reflects the SIGNER's sovereignty tier (who makes the claim), not the counterparty's; a locally-signed attestation is self-attested.",
       inputSchema: {
         type: "object",
         properties: {

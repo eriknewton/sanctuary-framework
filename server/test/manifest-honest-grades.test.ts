@@ -13,6 +13,9 @@
  * "full", with no backing "proven" ASSURANCE_MATRIX row. This guards that those
  * three grades are no longer the unqualified "full" the live tools were
  * corrected to stop claiming.
+ * The 2026-11 walk-back also pins participant-held keys, integrity
+ * verification, selective state sharing, state portability and participant
+ * ownership to partial, and Sybil resistance to the existing documented level.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -82,9 +85,13 @@ describe("manifest honest grades (audit S3)", () => {
     expect(l4["S4.1_earned_reputation"]).toBe("partial");
     expect(l4["S4.7_trust_bootstrapping"]).toBe("partial");
 
-    // Genuinely-full capabilities are untouched (no over-correction).
+    // Encryption is proven; the five 2026-11 walk-backs remain partial.
     expect(l1["S1.2_encryption_at_rest"]).toBe("full");
-    expect(l1["S1.3_integrity_verification"]).toBe("full");
-    expect(l4["S4.2_participant_owned"]).toBe("full");
+    expect(l1["S1.1_participant_held_keys"]).toBe("partial");
+    expect(l1["S1.3_integrity_verification"]).toBe("partial");
+    expect(l1["S1.4_selective_state_sharing"]).toBe("partial");
+    expect(l1["S1.5_state_portability"]).toBe("partial");
+    expect(l4["S4.2_participant_owned"]).toBe("partial");
+    expect(l4["S4.5_sybil_resistance"]).toBe("documented");
   });
 });

@@ -18,8 +18,7 @@ export function createOperationalHardeningTools(
     {
       name: "l2_hardening_status",
       description:
-        "Report a heuristic L2 process-hardening assessment: ASLR/environment/filesystem " +
-        "checks plus configured or assumed memory-protection signals and overall status.",
+        "Report a heuristic operational process-hardening assessment: ASLR/environment/filesystem checks plus configured or assumed memory-protection signals and overall status.",
       inputSchema: {
         type: "object",
         properties: {
@@ -96,9 +95,7 @@ export function createOperationalHardeningTools(
     {
       name: "l2_verify_isolation",
       description:
-        "Assess L2 process isolation at runtime: detect container/VM/sandbox signals, " +
-        "check storage-dir permissions, and report configured/assumed memory-protection " +
-        "indicators.",
+        "Assess operational process isolation at runtime: detect container/VM/sandbox signals, check storage-dir permissions, and report configured/assumed memory-protection indicators.",
       inputSchema: {
         type: "object",
         properties: {

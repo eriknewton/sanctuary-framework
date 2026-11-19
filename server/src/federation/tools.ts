@@ -368,9 +368,7 @@ export function createFederationTools(
     {
       name: "federation_trust_evaluate",
       description:
-        "Evaluate the trust level of a federation peer. " +
-        "Considers handshake status, sovereignty tier, reputation score, " +
-        "and mutual attestation history. Returns a composite trust assessment.",
+        "Score a federation peer from its stored handshake status and sovereignty tier plus two optional caller-supplied hints, mutual_attestation_count and reputation_score. Returns trust_level (high, medium, low or none) with the factors used. The hints are taken as given: this tool does not fetch attestation history or check the score, so treat the result as advisory.",
       inputSchema: {
         type: "object",
         properties: {
@@ -411,8 +409,7 @@ export function createFederationTools(
     {
       name: "federation_status",
       description:
-        "Overview of federation state: total peers, active connections, " +
-        "trust distribution, and readiness for cross-instance operations.",
+        "Return registered peer counts, unexpired active records, trust distribution, and recorded capability coverage. Readiness reflects registry state, not a live connectivity test.",
       inputSchema: {
         type: "object",
         properties: {},
