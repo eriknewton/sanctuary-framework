@@ -1,13 +1,13 @@
 import {requireCliTestRunner} from "../../src/cli/argv.js";
 import {aroundAll, inject} from "vitest";
-import {createOwnedTempRoot, removeOwnedTempRoot, SELECTOR_ROOT_PREFIX, TEMP_ROOT_REGISTRY, type OwnedTempRoot} from "../helpers/owned-temp-roots.js";
+import {createOwnedTempRoot, removeOwnedTempRoot, requireTempRootRegistry, SELECTOR_ROOT_PREFIX, TEMP_ROOT_REGISTRY, type OwnedTempRoot} from "../helpers/owned-temp-roots.js";
 import {installSelectorRootsForTest, isolatedSelectorRoots} from "../../src/linux-business/profile-selection.js";
 
 const key = Symbol.for("sanctuary.test.selector-root-lifetime");
 const state = globalThis as Record<symbol, OwnedTempRoot | undefined>;
 // File lifetime survives module resets and never depends on environment overrides.
 if (!state[key]) {
-  const root = createOwnedTempRoot(SELECTOR_ROOT_PREFIX, inject(TEMP_ROOT_REGISTRY));
+  const root = createOwnedTempRoot(SELECTOR_ROOT_PREFIX, requireTempRootRegistry(inject(TEMP_ROOT_REGISTRY)));
   state[key] = root;
 }
 installSelectorRootsForTest(isolatedSelectorRoots(state[key]!.path), requireCliTestRunner("selectorRoots"));
@@ -22,6 +22,10 @@ function releaseSelectorRoot(): void {
   removeOwnedTempRoot(root);
 }
 aroundAll(async runSuite => {
-  try { await runSuite(); }
-  finally { releaseSelectorRoot(); }
+  const errors: unknown[] = [];
+  try { await runSuite(); } catch (error) { errors.push(error); }
+  try { releaseSelectorRoot(); } catch (error) { errors.push(error); }
+  // Two failures are aggregated, one is rethrown, and zero means success.
+  if (errors.length > 1) throw new AggregateError(errors, "File run and selector temp root release both failed");
+  if (errors.length > 0) throw errors[0];
 });

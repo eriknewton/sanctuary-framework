@@ -22,17 +22,17 @@
  * never a path the operator owns (no login keychain, no `~/.sanctuary`); only this root is deleted.
  */
 import { aroundAll, inject } from "vitest";
-import { createOwnedTempRoot, removeOwnedTempRoot, PRIVATE_ROOT_PREFIX, TEMP_ROOT_REGISTRY } from "./owned-temp-roots.js";
+import { createOwnedTempRoot, removeOwnedTempRoot, requireTempRootRegistry, PRIVATE_ROOT_PREFIX, TEMP_ROOT_REGISTRY } from "./owned-temp-roots.js";
 
-// 19 bytes; with the separator and mkdtemp's 6 random characters the root adds 26 bytes to every path
-// under it. Must match the 26-byte figure beside `SHORT_SOCKET_TMP_PARENT` in
-// test/castle-wall/runtime/enforcement-availability.test.ts.
+// Prefix length and socket-path budget are pinned beside PRIVATE_ROOT_PREFIX in owned-temp-roots.ts.
 const PREFIX = PRIVATE_ROOT_PREFIX; // Must match the run teardown allowlist in owned-temp-roots.ts.
 const previous = process.env.TMPDIR;
-// realpath: on macOS tmpdir() sits under the /var symlink to /private/var, and tests compare canonical paths.
 let registry: string | undefined;
-try { registry = inject(TEMP_ROOT_REGISTRY); } catch { /* Plain Node imports use the exit teardown below. */ }
-const ownedRoot = createOwnedTempRoot(PREFIX, registry);
+let plainNode = false;
+try { registry = inject(TEMP_ROOT_REGISTRY); } catch { plainNode = true; }
+// Only a missing runner selects the exit lifecycle; a live runner requires its registry.
+const runRegistry = plainNode ? null : requireTempRootRegistry(registry);
+const ownedRoot = createOwnedTempRoot(PREFIX, runRegistry);
 const root = ownedRoot.path;
 process.env.TMPDIR = root;
 
