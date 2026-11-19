@@ -52,7 +52,9 @@ export async function acquireMasterWriteBarrier(...args: Parameters<typeof acqui
     // environment cannot erase. See test/setup/test-run-marker.ts.
     // git-env-scrub.ts is FIRST here too: setupFiles run in workers only, so this entry clears the
     // main process (and the globalSetup modules after it). Witness: test/structure/git-env-scrub.test.ts.
-    globalSetup: ["./test/setup/git-env-scrub.ts", "./test/setup/test-run-marker.ts", "./test/setup/selector-host-precondition.ts"],
+    // The temp-root entry must match TEMP_ROOT_SETUP_ENTRY in test/structure/git-env-scrub.test.ts.
+    // Vitest tears down in reverse order: temp cleanup follows marker teardown, so its errors cannot retain the marker.
+    globalSetup: ["./test/setup/git-env-scrub.ts", "./test/setup/test-temp-roots.ts", "./test/setup/test-run-marker.ts", "./test/setup/selector-host-precondition.ts"],
     environment: "node",
     // No network egress from unit tests: the wrap-time pinned-version
     // resolvability probe (wrap/cli.ts) and the startup update check both
