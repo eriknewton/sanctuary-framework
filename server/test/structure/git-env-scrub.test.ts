@@ -43,6 +43,8 @@ import { testRunMarkerPath } from "../setup/test-run-marker.js";
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = path.resolve(serverDir, "..");
 const SETUP_ENTRY = "./test/setup/git-env-scrub.ts";
+// Must match the temp-root globalSetup entry in vitest.config.ts.
+const TEMP_ROOT_SETUP_ENTRY = "./test/setup/test-temp-roots.ts";
 const PROBE_GLOB = "test/fixtures/git-env-scrub/*.probe.ts";
 const MAIN_PROBE = "./test/fixtures/git-env-scrub/main-process.probe-global.ts";
 const childStartupHeadroomMs = 30_000; // Allow module loading on a loaded runner.
@@ -239,15 +241,18 @@ async function runProbe(withScrub: boolean): Promise<ProbeRun> {
   expect(realSetup[0]).toBe(SETUP_ENTRY); // invariant: the worker scrub runs first
   expect(realGlobal[0]).toBe(SETUP_ENTRY); // invariant: the main-process scrub runs first
   const setupFiles = realSetup.filter((e) => withScrub || e !== SETUP_ENTRY);
-  // The child's globalSetup is ONLY the scrub entry (dropped for fail-before)
-  // and the main-process probe. It deliberately omits test-run-marker.ts, so
+  // The child keeps temp-root registration, the optional scrub entry and the
+  // main-process probe. It deliberately omits test-run-marker.ts, so
   // the child creates no marker token and a killed child cannot strand one.
   // Invariant that makes this safe: the PARENT run's own marker token exists
   // for the child's whole lifetime (this test runs inside the parent run), so
   // the marker directory src/wrap/keychain-exec.ts checks is present and the
   // child, which also keeps VITEST and the keychain-fake setup file, still
   // classifies as under test. Asserted below before every spawn.
-  const globalSetup = [...(withScrub ? [SETUP_ENTRY] : []), MAIN_PROBE];
+  const globalSetup = [
+    ...realGlobal.filter(entry => entry === TEMP_ROOT_SETUP_ENTRY || (withScrub && entry === SETUP_ENTRY)),
+    MAIN_PROBE,
+  ];
   const cfg = path.join(tmp, "probe.config.mjs");
   // One thread worker keeps probe execution inside the child's own process group.
   fs.writeFileSync(cfg, `

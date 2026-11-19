@@ -10,6 +10,7 @@
  * - Hardening tools report correct isolation level
  */
 
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   checkMemoryProtection,
