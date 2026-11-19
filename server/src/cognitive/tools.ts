@@ -1400,7 +1400,7 @@ export function createCognitiveTools(
 
     {
       name: "identity_list",
-      description: "List all managed sovereign identities with labels, DIDs, public keys, and which is primary. Read-only; no private key material returned.",
+      description: "List this server's managed identities, optionally filtered by a label substring. Returns identity_id, label, DID, public key, key type, key protection and creation time for each, never private key material. Does not say which identity is primary.",
       inputSchema: {
         type: "object",
         properties: {

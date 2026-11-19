@@ -854,7 +854,8 @@ export async function createSanctuaryServer(options?: {
         "not_yet_walled means this vault has not been put on this machine's " +
         "Castle Wall, whatever the machine's own enforcement state is, so do " +
         "not read a healthy wall runtime as protection for this vault. " +
-        "The castle_wall_liveness field is the evaluator's wall, agent and coverage verdict at report time, not a continuously fresh badge.",
+        "The castle_wall_liveness field is the evaluator's wall, agent and coverage verdict at report time, not a continuously fresh badge. " +
+        "The include_hardware, include_software and include_network arguments are accepted and currently have no effect; the full report is always returned.",
       inputSchema: {
         type: "object",
         properties: {
@@ -981,7 +982,7 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_audit_log",
-      description: "Query your OWN identity's sovereignty audit entries, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect operations you performed. Read-only; only your own entries are visible (system/gate entries are never returned), and each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }): no details, identity, or policy attribution.",
+      description: "Query audit entries recorded under your own bound session identity, filtered by since, layer, operation_type and limit. Use to inspect operations you performed. Each entry is a fixed safe view: timestamp, operation, result, has_details. System and gate entries are never returned. Needs a session identity bound when the server is launched; without one the result is empty, so an empty result is not proof of no activity.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1053,11 +1054,11 @@ export async function createSanctuaryServer(options?: {
             encryption: ["aes-256-gcm"],
             identity: ["ed25519"],
             properties: {
-              "S1.1_participant_held_keys": "full",
+              "S1.1_participant_held_keys": "partial",
               "S1.2_encryption_at_rest": "full",
-              "S1.3_integrity_verification": "full",
-              "S1.4_selective_state_sharing": "full",
-              "S1.5_state_portability": "full",
+              "S1.3_integrity_verification": "partial",
+              "S1.4_selective_state_sharing": "partial",
+              "S1.5_state_portability": "partial",
               // Honest grade: deletion is best-effort random-byte overwrite
               // before unlink; on copy-on-write/SSD media original bytes may
               // survive, so at-rest confidentiality rests on encryption, not on
@@ -1100,8 +1101,8 @@ export async function createSanctuaryServer(options?: {
               // than over-declaring a fully-realized capability the human-facing
               // tools were just corrected to stop claiming.
               "S4.1_earned_reputation": "partial",
-              "S4.2_participant_owned": "full",
-              "S4.5_sybil_resistance": "basic",
+              "S4.2_participant_owned": "partial",
+              "S4.5_sybil_resistance": "documented",
               "S4.7_trust_bootstrapping": "partial",
             },
           },
@@ -1113,10 +1114,10 @@ export async function createSanctuaryServer(options?: {
           delegation_depth: 1,
         },
         limitations: [
-          "L1 identity uses ed25519 only; KERI support planned for v0.2.0",
-          "L2 isolation is process-level only; TEE support planned for a future release",
-          "L3 uses commitment schemes only; ZK proofs planned for v0.2.0",
-          "L4 Sybil resistance is escrow-based only",
+          "Cognitive sovereignty provides local identity signing and encrypted state; hardware-backed key custody and complete state integrity and portability are not proven.",
+          "Operational isolation reports process-level evidence; confidential execution in a TEE is not established.",
+          "Selective disclosure exposes tools for hash commitments, Pedersen commitments, proofs of knowledge and range proofs. These do not show that a committed value is true, and no general-purpose proof system is offered.",
+          "Verifiable reputation records are locally signed and self-held. Escrow entries are local intent records that hold no collateral, and Sybil resistance is not established.",
           "Spec license: CC-BY-4.0 | Code license: Apache-2.0",
         ],
       });

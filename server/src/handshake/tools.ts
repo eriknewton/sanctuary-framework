@@ -1256,7 +1256,7 @@ export function createHandshakeTools(
     {
       name: "handshake_status",
       description:
-        "Check the state of an in-flight handshake session by id, or (responder side) verify an initiator's completion message. Read-only; returns session phase and, for verification, the validated counterparty SHR result.",
+        "Check a handshake session by id. Without a completion, returns its role, state, start time and any recorded result. If you pass an initiator's completion for a pending session this server responded to, the completion is verified once: the session is consumed (completed or failed) and a verified result may be recorded as a peer trust result. Expired sessions are swept or marked expired during the call. Not read-only.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1390,11 +1390,7 @@ export function createHandshakeTools(
     {
       name: "handshake_exchange",
       description:
-        "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, " +
-        "generates our SHR, and produces a signed attestation artifact, all in a single call. " +
-        "Returns a shareable attestation with human-readable summary. " +
-        "Use this instead of the 4-step handshake protocol when you want a quick, " +
-        "portable sovereignty verification (e.g., for social posting or async exchanges).",
+        "Verify a counterparty's signed SHR, generate this server's SHR, and return a signed attestation artifact in one call, signed with identity_id or the primary identity. The artifact can be shared and checked with handshake_verify_attestation. This is a structural check only: the result always reports trust_tier unverified and liveness_proven false, and it does not make the counterparty a trusted peer. May record an unverified preview entry for the counterparty. To prove key control and liveness, use handshake_initiate, handshake_respond and handshake_complete.",
       inputSchema: {
         type: "object",
         properties: {

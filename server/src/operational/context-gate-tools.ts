@@ -208,15 +208,7 @@ export function createContextGateTools(
     {
       name: "context_gate_set_policy",
       description:
-        "Create a context-gating policy that controls what information flows to " +
-        "remote providers (LLM APIs, tool APIs, logging services). " +
-        "Each rule specifies a provider category and which context fields to " +
-        "allow, redact, hash, or flag for summarization. " +
-        "Redact rules take absolute priority — if a field is in both 'allow' and " +
-        "'redact', it is redacted. Default action applies to any field not " +
-        "mentioned in any rule. " +
-        "Use this to prevent your full agent context from being sent to remote " +
-        "LLM providers during inference calls.",
+        "Create a stored context-gating policy. Tier 1: requires operator approval. Each rule names a provider category and the field patterns to allow, redact, hash, or mark for summarization. Redact wins over the other three. A field not matched by the selected provider rule, or with no applicable provider rule, gets default_action: redact (the default) or deny, which blocks the whole request. A stored policy takes effect only where filtering is invoked. It does not itself intercept egress.",
       inputSchema: {
         type: "object",
         properties: {
@@ -367,12 +359,7 @@ export function createContextGateTools(
     {
       name: "context_gate_apply_template",
       description:
-        "Apply a starter context-gating template. Available templates: " +
-        "inference-minimal (strictest — only task and query pass through), " +
-        "inference-standard (balanced — adds tool results, summarizes history), " +
-        "logging-strict (redacts all content for telemetry services), " +
-        "tool-api-scoped (allows tool parameters, redacts agent state). " +
-        "Templates are starting points — customize after applying.",
+        "Create a stored context-gating policy from the starter template named by template_id. Tier 1: requires operator approval. Fields a template marks for summarization are replaced with the literal [SUMMARIZE]; no summary is written. Review and adjust the policy before relying on it. A stored policy takes effect only where filtering is invoked. It does not itself intercept egress.",
       inputSchema: {
         type: "object",
         properties: {
@@ -503,12 +490,7 @@ export function createContextGateTools(
     {
       name: "context_gate_filter",
       description:
-        "Filter agent context through a gating policy before sending to a " +
-        "remote provider. Returns per-field decisions (allow, redact, hash, " +
-        "summarize) and content hashes for the audit trail. " +
-        "Call this BEFORE making any outbound API call to ensure you are only " +
-        "sending the minimum necessary context. " +
-        "The filtered output tells you exactly what can be sent safely.",
+        "Apply an existing context-gating policy to a context object for one provider category. Policies are created by the operator; find a policy_id with context_gate_list_policies. Returns blocked: true when a field falls to a deny default or the configured privacy filter fails closed. Otherwise returns safe_context (the filtered object), per-field decisions and audit hashes. Redacted fields become [REDACTED], hashed fields a [HASH:digest] token, and fields marked for summarization the literal [SUMMARIZE]; no summary is written. safe_context is a field name, not a guarantee: review it before sending. This tool filters only what you pass in and does not intercept outbound traffic. Use before sending context to a remote provider.",
       inputSchema: {
         type: "object",
         properties: {
