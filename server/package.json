@@ -121,7 +121,7 @@
     "@stryker-mutator/core": "10.1.1",
     "@stryker-mutator/vitest-runner": "10.1.1",
     "@types/node": "26.6.6",
-    "@vitest/coverage-v8": "4.1.11",
+    "@vitest/coverage-v8": "5.1.0",
     "ajv": "8.20.0",
     "eslint": "10.14.0",
     "js-yaml": "5.5.0",
