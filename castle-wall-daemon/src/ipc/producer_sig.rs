@@ -446,8 +446,32 @@ fn validate_key_parent(path: &Path) -> Result<(), ProducerSigError> {
 
 #[cfg(test)]
 mod tests {
+    fn test_directory() -> TempDir {
+        let root = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // 0700 reserves traversal and mutation to the test owner; chmod removes umask dependence.
+            const OWNER_ONLY_DIRECTORY: u32 = 0o700;
+            // 0777 selects ordinary permission bits, excluding the metadata file type.
+            const PERMISSION_BITS: u32 = 0o777;
+            fs::set_permissions(
+                root.path(),
+                fs::Permissions::from_mode(OWNER_ONLY_DIRECTORY),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::metadata(root.path()).unwrap().permissions().mode() & PERMISSION_BITS,
+                OWNER_ONLY_DIRECTORY,
+                "profile anchors and key parents must have explicit fixture permissions",
+            );
+        }
+        root
+    }
+
     fn legacy_selection() -> crate::config::LegacyV1Selection {
-        let root = tempfile::TempDir::new().unwrap();
+        let root = test_directory();
         match crate::config::select_profile(
             &crate::config::SelectorRoots::isolated_under(root.path()),
             &[],
@@ -483,7 +507,7 @@ mod tests {
 
     #[test]
     fn sign_then_verify_round_trips_against_published_pub() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         let signer =
@@ -522,7 +546,7 @@ mod tests {
 
     #[test]
     fn generated_private_key_is_owner_only() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("nested/audit-producer.key");
         let pub_path = dir.path().join("nested/audit-producer.pub");
         ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path).unwrap();
@@ -541,7 +565,7 @@ mod tests {
 
     #[test]
     fn load_reuses_existing_private_key() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         let first =
@@ -560,7 +584,7 @@ mod tests {
     #[test]
     fn rejects_group_or_world_readable_private_key() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         // First boot generates a 0600 key.
@@ -578,7 +602,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_length_private_key() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         fs::write(&key_path, b"too short").unwrap();
@@ -625,7 +649,7 @@ mod tests {
             return;
         }
 
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let selection = legacy_selection();
         let key_path = dir.path().join("private/keys/audit-producer.key");
         let pub_path = dir.path().join("public/pins/audit-producer.pub");
@@ -669,7 +693,7 @@ mod tests {
         // 0777 excludes file-type bits when checking that existing permissions are untouched.
         const PERMISSION_BITS: u32 = 0o777;
         for unsafe_parent in ["private", "public"] {
-            let dir = TempDir::new().unwrap();
+            let dir = test_directory();
             let parent = dir.path().join(unsafe_parent);
             fs::create_dir(&parent).unwrap();
             fs::set_permissions(&parent, fs::Permissions::from_mode(SHARED_WRITE_MODE)).unwrap();
