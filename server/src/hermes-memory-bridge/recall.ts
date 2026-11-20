@@ -21,12 +21,14 @@ export const RECALL_MAX_RETAINED_CANDIDATES = RECALL_MAX_PASSAGES;
 // answer may differ from verifying every passage; bridge saves are always signed by the bridge, so failures come
 // only from tamper or owner imports. Eight entries bound the unverified candidates one recall holds and verifies.
 export const RECALL_VERIFY_CANDIDATES = RECALL_MAX_PASSAGES + 5;
-// Twenty-five milliseconds is about twice box 1's estimated full per-passage verification cost of 12.3 ms, rounded
-// up; the scan stops this long before the wall so the candidates it ranked can still be verified inside it.
+// Twenty-five milliseconds is about twice the full per-passage verification cost of 12.3 ms estimated on one 4-CPU
+// Linux build machine, rounded up; the scan stops this long before the wall so the candidates it ranked can still be
+// verified inside it.
 export const RECALL_VERIFY_RESERVE_MS = RECALL_VERIFY_CANDIDATES * 25;
 // Four equals Node's default thread-pool size (UV_THREADPOOL_SIZE unset), the pool every asynchronous file read
-// runs on. It is a bounded observation, not a proof: on box 1 (11-18, 2000 passages) windows of 2 to 16 measured
-// within session drift of each other, and the smaller window bounds the reads and retained state one call holds.
+// runs on. It is a bounded observation, not a proof: on one 4-CPU Linux build machine (2000 passages) windows of 2
+// to 16 measured within session drift of each other, and the smaller window bounds the reads and retained state one
+// call holds.
 export const RECALL_READ_AHEAD_PASSAGES = 4;
 // Two: a read-ahead slot issues its document and provenance reads together, then one status, provenance or chunk
 // read at a time, so at most two of its reads are ever in flight at once.

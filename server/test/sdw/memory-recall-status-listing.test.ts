@@ -103,7 +103,7 @@ describe.each(RECALL_TEST_WINDOWS)("read-ahead window %i", readAhead => {
       run.reads.clear();
       const result = await run.f.adapter.recallPassages(run.f.budget("alpha"));
       expect(result).toEqual(oracleRecall(seeds, "state_PRE_MIGRATION", "alpha"));
-      // Past the cap the hint is dropped and every screened passage reads its status record, as before the hint.
+      // Past the cap the hint is dropped and every screened passage reads its status record.
       for (const seed of seeds) expect(run.statusReads(seed.passageId)).toBe((hinted ? 0 : 1) + (seed === target ? 1 : 0));
       // No orphan status record is ever read: the listing holds keys only.
       expect([...run.reads.keys()].filter(key => key.includes(".orphan"))).toEqual([]);

@@ -94,8 +94,16 @@ describe.each(RECALL_TEST_WINDOWS)("read-ahead window %i", readAhead => {
   });
 });
 
+// The candidate and unit caps are decided at the commit, so they hold at every window; the clock kinds jump when b's
+// read is issued, which the read-ahead does before a commits, so they run one passage at a time (window 1), and
+// memory-recall-read-ahead-clock.test.ts covers the default window on a clock driven by read completion.
+const EXHAUSTION_CASES = [
+  ...RECALL_TEST_WINDOWS.flatMap(readAhead => (["candidates", "units"] as const).map(kind => [kind, readAhead] as const)),
+  ...(["wall", "abort", "full wall"] as const).map(kind => [kind, 1] as const),
+];
+
 // Each exhausted scan budget preserves exactly the match ranked before exhaustion, verified inside the wall.
-it.each(["candidates", "units", "wall", "abort", "full wall"] as const)("retains known context before exhausting %s", async kind => {
+it.each(EXHAUSTION_CASES)("retains known context before exhausting %s at read-ahead window %i", async (kind, readAhead) => {
   const storage = new CountingStorage();
   const created = "2026-11-01T00:00:00.000Z";
   const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey: new Uint8Array(32).fill(17),
@@ -112,10 +120,8 @@ it.each(["candidates", "units", "wall", "abort", "full wall"] as const)("retains
       if (kind === "abort") abort.abort();
     }
   };
-  // Pinned to one passage at a time: this clock jumps when b's read is issued, which the read-ahead does before a
-  // commits; memory-recall-read-ahead-clock.test.ts covers the default window on a clock driven by read completion.
   const budget = new HermesRecallBudget("board meeting", () => storage.now, abort.signal,
-    { ...(kind === "candidates" ? { candidates: 1 } : kind === "units" ? { scannedUnits: text.length + 1 } : {}), readAhead: 1 });
+    { ...(kind === "candidates" ? { candidates: 1 } : kind === "units" ? { scannedUnits: text.length + 1 } : {}), readAhead });
   const result = await adapter.recallPassages(budget);
   // Abort and the full wall stop verification too, so nothing ranked but unverified is returned.
   expect(result).toEqual(kind === "abort" || kind === "full wall"

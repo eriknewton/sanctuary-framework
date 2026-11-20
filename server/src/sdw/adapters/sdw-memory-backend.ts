@@ -2300,7 +2300,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   /**
    * The status keys under this owner's prefix, listed once per recall, or null when the listing exceeds
    * MEMORY_CORPUS_SCAN_CAP: the hint held is bounded by the corpus scan cap, and past it the screen reads every
-   * passage's status record as it did before the hint existed, so the cap costs reads and never changes output.
+   * passage's status record, so the cap costs reads and never changes output.
    */
   private async recallStatusHint(): Promise<ReadonlySet<string> | null> {
     const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentProvenanceStatusKeyPrefix());
