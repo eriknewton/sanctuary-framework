@@ -1,9 +1,9 @@
-// fail-before-exempt: imports audit/split-evidence-source.js and split-statement-census.js, which base lacks and cannot collect.
+// fail-before-exempt: this change only seeds an initialized fortress at its resolved path so the hidden split export still runs under the export admission check; the admission check is witnessed in snapshot-existing-fortress.test.ts.
 import {expect,it} from "vitest";
 import {mkdir,writeFile,readFile,symlink,realpath,rename,cp} from "node:fs/promises";
 import {join,basename} from "node:path";
 import {physicalSplitFixture,splitFixtureByteInventory} from "./split-statement-fixtures.js";
-import {identity,SOURCE} from "./snapshot-fixtures.js";
+import {seedExportFortress,identity,SOURCE} from "./snapshot-fixtures.js";
 import {sourceIO,SOURCE_ATTEMPTS,type SourceIO} from "../../src/audit/split-evidence-source.js";
 import {CHAIN_NAMESPACES,BOUNDARY,META_CONTROLS} from "../../src/audit/split-evidence-registry.js";
 import {gatherExportStatement,exportSnapshot,exportDependencies} from "../../src/evidence-pack/snapshot-export-cli.js";
@@ -66,8 +66,9 @@ it.each(["incomplete","unstable"])("retains V0 split refusal after %s selection"
  expect(expected.audit,"base split probe").toEqual({state:"read_failed",reason:"split_store"});
  expect(attempts,"hidden split retry").toBe(SOURCE_ATTEMPTS);
  expect(accessErrors,"independent selector schedule").toBe(schedule==="incomplete"?SOURCE_ATTEMPTS:0);
- const signer=identity(),options={fortress:s.fortress,output:join(s.root,"pack"),receipt:join(s.root,"receipt.json"),publicKeyFile:join(s.root,"key.txt")};
- const deps={...exportDependencies,source:{...exportDependencies.source,io},runtimeRevision:SOURCE,buildRevision:SOURCE,boot:async()=>({config:{storage_path:s.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
+ const signer=identity(),options={fortress:await realpath(s.fortress),output:join(s.root,"pack"),receipt:join(s.root,"receipt.json"),publicKeyFile:join(s.root,"key.txt")};
+ await seedExportFortress(options.fortress);
+ const deps={...exportDependencies,source:{...exportDependencies.source,io},runtimeRevision:SOURCE,buildRevision:SOURCE,boot:async()=>({config:{storage_path:options.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
  expect(await exportSnapshot(options,deps as unknown as typeof exportDependencies),"hidden split export PARTIAL").toBe(C.EXIT_PARTIAL);
  const receipt=JSON.parse(await readFile(options.receipt,"utf8"));
  const pins={packKey:signer.public_key,descriptorBytes:await readFile(join(options.output,C.TRUST_FILENAME)),expectedManifestDigest:receipt.manifest_digest};

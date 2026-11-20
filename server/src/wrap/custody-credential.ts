@@ -76,6 +76,7 @@
  * performs it through the ordinary passphrase path.
  */
 
+import { LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY } from "../core/custody-markers.js";
 import { homedir, platform as osPlatform } from "node:os";
 import { join } from "node:path";
 
@@ -342,7 +343,7 @@ export interface CustodyCredentialResolverOptions {
 export const ENROLLED_CUSTODY_FACTOR_LOCATION = "OS keyring custody factor";
 
 /** `_meta` records that mark a pre-envelope (legacy) fortress. */
-const LEGACY_CUSTODY_MARKERS = ["key-params", "recovery-key-hash"] as const;
+const LEGACY_CUSTODY_MARKERS = [LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY] as const;
 
 /**
  * Resolve the credential this fortress should be opened with. Read-only: it
@@ -776,8 +777,8 @@ type LegacyCustodyMarkers =
  * `recovery-key-hash` outranks `key-params`.
  */
 const LEGACY_CUSTODY_MARKER_PRIORITY = [
-  "recovery-key-hash",
-  "key-params",
+  LEGACY_RECOVERY_KEY,
+  LEGACY_PASSPHRASE_KEY,
 ] as const satisfies readonly (typeof LEGACY_CUSTODY_MARKERS)[number][];
 
 /**
@@ -814,7 +815,7 @@ async function readLegacyCustodyMarkers(
     if (seen.has(marker)) {
       return {
         present: true,
-        mode: marker === "recovery-key-hash" ? "recovery-key" : "passphrase",
+        mode: marker === LEGACY_RECOVERY_KEY ? "recovery-key" : "passphrase",
       };
     }
   }

@@ -8,7 +8,7 @@
 import { ConstructionWork } from "./dashboard/construction-work.js";
 import { mkdir } from "node:fs/promises";
 import { tightenStoragePermissions } from "./storage/permissions.js";
-import { loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
+import { defaultConfig, loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
 import { StateStore } from "./cognitive/state-store.js";
@@ -141,7 +141,9 @@ import { createMemoryProvenanceSignerPruneTool } from "./sdw/memory-provenance-s
 import { KnownSignersStore } from "./reputation/known-signers-store.js";
 import { StorageSnapshotSdwInventorySource } from "./sdw/export.js";
 import { fromBase64url } from "./core/encoding.js";
-import { join as joinPath } from "node:path";
+import { initializedFortressExists } from "./evidence-pack/existing-fortress.js";
+import { FORTRESS_STATE_DIRECTORY } from "./core/custody-markers.js";
+import { join as joinPath, resolve as resolvePath } from "node:path";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
 import { createErc8004ResolveTools } from "./key-17/erc8004-resolve.js";
@@ -333,6 +335,10 @@ async function resolveHandsFreeBootCredential(args: {
   }
 }
 
+async function requireExistingFortress(path: string): Promise<void> {
+  if (!(await initializedFortressExists(path, false))) throw new Error("Existing fortress required.");
+}
+
 /**
  * Initialize the Sanctuary MCP Server.
  *
@@ -341,6 +347,9 @@ async function resolveHandsFreeBootCredential(args: {
  */
 export async function createSanctuaryServer(options?: {
   configPath?: string;
+  /** Require this existing filesystem fortress and prohibit first-run custody initialization. */
+  // Must match openExistingFortress in evidence-pack/snapshot-export-cli.ts; export supplies its checked path.
+  existingFortressPath?: string;
   passphrase?: string;
   storage?: StorageBackend;
   /**
@@ -368,11 +377,29 @@ export async function createSanctuaryServer(options?: {
   // the process-global credential store, which the suite forbids
   // (`test/wrap/keychain-exec-guard.test.ts`).
 }): Promise<SanctuaryServer> {
+  if (options?.existingFortressPath !== undefined) {
+    // Existing-only boot binds the ambient path before configuration can produce filesystem effects.
+    const ambientPath = resolvePath(process.env.SANCTUARY_STORAGE_PATH ?? defaultConfig().storage_path);
+    if (options.storage !== undefined || ambientPath !== options.existingFortressPath) {
+      throw new Error("Existing fortress path mismatch.");
+    }
+    // A directory on the fortress path that another account can modify bounds admission to the check instant; existing-only boot holds no first-run custody authority.
+    await requireExistingFortress(options.existingFortressPath);
+  }
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
 
   // 2. Ensure storage directory exists with correct permissions
-  await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
+  if (options?.existingFortressPath !== undefined) {
+    // Existing-only boot never creates the root, and configuration cannot select a different fortress.
+    if (options.storage !== undefined || resolvePath(config.storage_path) !== options.existingFortressPath) {
+      throw new Error("Existing fortress path mismatch.");
+    }
+  } else {
+    await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
+  }
+  // Filesystem preparation requires current custody admission.
+  if (options?.existingFortressPath !== undefined) await requireExistingFortress(options.existingFortressPath);
   await tightenStoragePermissions(config.storage_path);
 
   // 3. Initialize storage backend. When the CALLER injects a storage backend
@@ -382,9 +409,9 @@ export async function createSanctuaryServer(options?: {
   // would otherwise be orphaned inside the fortress dir); it only applies when
   // the boot path owns a filesystem fortress.
   const bootOwnsStorage = options?.storage === undefined;
-  // Must match the snapshot-export-cli.ts gather storage root because boot does not expose this storage object.
+  // Must match FORTRESS_STATE_DIRECTORY in core/custody-markers.ts; custody admission and boot share the filesystem root.
   const storage = options?.storage ?? new FilesystemStorage(
-    `${config.storage_path}/state`
+    `${config.storage_path}/${FORTRESS_STATE_DIRECTORY}`
   );
 
   // 4. Establish the master key through the unified custody path: one
@@ -448,6 +475,8 @@ export async function createSanctuaryServer(options?: {
 
   let custody: Awaited<ReturnType<typeof establishMaster>>;
   try {
+    // Custody locking requires current admission as well as the absence of first-run authority.
+    if (options?.existingFortressPath !== undefined) await requireExistingFortress(options.existingFortressPath);
     custody = await establishMaster({
       storage,
       ...(bootPassphrase ? { passphrase: bootPassphrase } : {}),
@@ -458,7 +487,10 @@ export async function createSanctuaryServer(options?: {
       // degraded install mode. A fresh recovery key — a wrap of the one true
       // master — is minted and disclosed below regardless of credential mode,
       // so the captured artifact always unlocks everything.
-      firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
+      // Existing-only boot withholds mint authority even if custody disappears after admission.
+      firstRun: options?.existingFortressPath === undefined
+        ? { installMode: "stdio-server", mintRecoveryKey: true }
+        : undefined,
       storagePathHint: config.storage_path,
       // An existing fortress on a network/FUSE/exFAT volume, under sudo, or with
       // looser perms opens for reads (hands-free memory read) instead of bricking;
