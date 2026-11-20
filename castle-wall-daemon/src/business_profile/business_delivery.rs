@@ -170,6 +170,9 @@ impl PolledBusinessSink for NativeSink {
 pub(crate) struct BusinessSession {
     state: Arc<Mutex<DeliveryState>>,
     owner: u64,
+    // Retains one envelope of at most PRODUCER_ENVELOPE_MAX_BYTES plus a fixed-shape identity;
+    // each offer replaces the pair. Upstream writer_protocol::decode_envelope enforces the cap.
+    // Must match PRODUCER_ENVELOPE_MAX_BYTES, included from append_contract_constants.rs in append_contract.rs.
     served: Option<(Value, Vec<u8>)>,
 }
 impl BusinessSession {
@@ -250,39 +253,73 @@ impl Drop for BusinessSession {
 mod tests {
     use super::*;
     use std::{
-        sync::Barrier,
+        sync::{mpsc, Barrier},
         thread,
         time::{Duration, Instant},
     };
 
     // 200 ms spans many scheduler slices while keeping each delayed handoff below a second.
     const HOLD_INTERVAL: Duration = Duration::from_millis(200);
-    // A non-blocking writer spends less than one tenth of the holder's interval.
-    const WRITER_RETURN_BUDGET: Duration =
-        Duration::from_millis(HOLD_INTERVAL.as_millis() as u64 / 10);
+    // Ten attempts allow transient descheduling without accepting a run that never contended.
+    const MAX_CONTENTION_ATTEMPTS: usize = 10;
+    // Five seconds is a deadlock backstop, not a latency requirement on a scheduled writer.
+    const WRITER_WATCHDOG: Duration = Duration::from_secs(5);
     // The holder and the calling thread are the two participants in each handoff.
     const HANDOFF_PARTICIPANTS: usize = 2;
 
     fn envelope_fixture() -> Vec<u8> {
         let vectors: Value =
             serde_json::from_str(include_str!("record_join_vectors.json")).unwrap();
+        // Index zero selects the first valid join case and its initial record.
         crate::smb::jcs::encode(&vectors["cases"][0]["records"][0])
             .unwrap()
             .into_bytes()
     }
 
-    fn while_held<T>(state: &Arc<Mutex<DeliveryState>>, call: impl FnOnce() -> T) -> T {
+    fn during_contention<T>(state: &Arc<Mutex<DeliveryState>>, mut call: impl FnMut() -> T) -> T {
+        for _ in 0..MAX_CONTENTION_ATTEMPTS {
+            let ready = Barrier::new(HANDOFF_PARTICIPANTS);
+            let (entered, released, result) = thread::scope(|scope| {
+                let ready = &ready;
+                let holder = scope.spawn(move || {
+                    let guard = state.lock().unwrap();
+                    ready.wait();
+                    thread::sleep(HOLD_INTERVAL);
+                    // Timestamp before unlocking is conservative: an ambiguous overlap cannot pass.
+                    let released = Instant::now();
+                    drop(guard);
+                    released
+                });
+                ready.wait();
+                let entered = Instant::now();
+                let result = call();
+                (entered, holder.join().unwrap(), result)
+            });
+            if entered < released {
+                return result;
+            }
+            // Discarding an uncontended result cannot prove the connection waited for the writer.
+            drop(result);
+        }
+        panic!("no contended attempt");
+    }
+
+    fn until_writer_returns<T>(state: &Arc<Mutex<DeliveryState>>, call: impl FnOnce() -> T) -> T {
         let ready = Barrier::new(HANDOFF_PARTICIPANTS);
+        let (returned, completed) = mpsc::channel();
         thread::scope(|scope| {
             let ready = &ready;
             let holder = scope.spawn(move || {
                 let _guard = state.lock().unwrap();
                 ready.wait();
-                thread::sleep(HOLD_INTERVAL);
+                // Only completion authorizes release; timeout merely lets a blocking regression unwind.
+                completed.recv_timeout(WRITER_WATCHDOG)
             });
             ready.wait();
             let result = call();
-            holder.join().unwrap();
+            let _ = returned.send(());
+            assert!(holder.join().unwrap().is_ok(), "writer watchdog reached");
+            // Holding through return proves non-blocking behavior without a scheduler-sensitive elapsed bound.
             result
         })
     }
@@ -302,7 +339,7 @@ mod tests {
     #[test]
     fn connection_connect_waits_for_writer() {
         let (_, handle) = BusinessDeliveryHandle::channel();
-        let session = while_held(&handle.state, || handle.connect()).unwrap();
+        let session = during_contention(&handle.state, || handle.connect()).unwrap();
         assert_eq!(handle.state.lock().unwrap().owner, Some(session.owner));
     }
 
@@ -312,7 +349,7 @@ mod tests {
         let (_, handle) = BusinessDeliveryHandle::channel();
         NativeSink(handle.state.clone()).offer(&envelope).unwrap();
         let mut session = handle.connect().unwrap();
-        let event = while_held(&handle.state, || session.offer())
+        let event = during_contention(&handle.state, || session.offer())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -329,9 +366,10 @@ mod tests {
         native.offer(&envelope).unwrap();
         let mut session = handle.connect().unwrap();
         session.offer().unwrap().unwrap();
+        // Version 1 is the ACK schema literal in server/src/signing/business-append-contract.json.
         let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
         assert_eq!(
-            while_held(&handle.state, || session.acknowledge(&ack)),
+            during_contention(&handle.state, || session.acknowledge(&ack)),
             Ok(())
         );
         assert_eq!(native.poll().unwrap(), Some(ack));
@@ -360,6 +398,7 @@ mod tests {
         NativeSink(handle.state.clone()).offer(&envelope).unwrap();
         let mut session = handle.connect().unwrap();
         session.offer().unwrap().unwrap();
+        // Version 1 is the ACK schema literal in server/src/signing/business-append-contract.json.
         let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
         poison(&handle.state);
         assert_eq!(session.acknowledge(&ack), Err(Refusal::Held));
@@ -373,6 +412,7 @@ mod tests {
         native.offer(&envelope).unwrap();
         let mut session = handle.connect().unwrap();
         session.offer().unwrap().unwrap();
+        // Version 1 is the ACK schema literal in server/src/signing/business-append-contract.json.
         let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
         // A retired offer cannot authorize its replacement, even on the same connection.
         handle.state.lock().unwrap().fact_issued = true;
@@ -385,18 +425,10 @@ mod tests {
     fn writer_poll_and_offer_return_held_without_waiting() {
         let (_, handle) = BusinessDeliveryHandle::channel();
         let mut native = NativeSink(handle.state.clone());
-        let (poll, offer, elapsed) = while_held(&handle.state, || {
-            let start = Instant::now();
-            let poll = native.poll();
-            let offer = native.offer(b"{}");
-            (poll, offer, start.elapsed())
-        });
+        let (poll, offer) =
+            until_writer_returns(&handle.state, || (native.poll(), native.offer(b"{}")));
         assert_eq!(poll, Err(Refusal::Held));
         assert_eq!(offer, Err(Refusal::Held));
-        assert!(
-            elapsed < WRITER_RETURN_BUDGET,
-            "writer elapsed: {elapsed:?}"
-        );
     }
 
     #[cfg(target_os = "linux")]
@@ -411,7 +443,10 @@ mod tests {
             writer_peer::Clock,
         };
         use sha2::{Digest, Sha256};
-        use std::fs::{self, File};
+        use std::{
+            fs::{self, File},
+            os::unix::fs::PermissionsExt,
+        };
 
         struct Unused;
         impl ClientHooks for Unused {
@@ -431,6 +466,8 @@ mod tests {
             }
         }
         let directory = tempfile::tempdir().unwrap();
+        // 0700 gives only this test access, independently of the process umask.
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let _writer = signer_peer::listen(&directory.path().join("writer")).unwrap();
         let _drain = signer_peer::listen(&directory.path().join("drain")).unwrap();
         let policy = PeerPolicy {
@@ -462,16 +499,8 @@ mod tests {
         .unwrap();
         let (mut delivery, handle) = BusinessDeliveryHandle::channel();
         delivery.submitted = true;
-        let (result, elapsed) = while_held(&handle.state, || {
-            let start = Instant::now();
-            let result = delivery.pump(&mut actor);
-            (result, start.elapsed())
-        });
+        let result = until_writer_returns(&handle.state, || delivery.pump(&mut actor));
         assert_eq!(result, Err(Refusal::Held));
-        assert!(
-            elapsed < WRITER_RETURN_BUDGET,
-            "writer elapsed: {elapsed:?}"
-        );
         assert!(delivery.submitted, "retirement remains pending");
     }
 
@@ -479,6 +508,7 @@ mod tests {
     fn connection_owner_reconnect_exact_replay_and_wrong_identity() {
         let vectors: Value =
             serde_json::from_str(include_str!("record_join_vectors.json")).unwrap();
+        // Index zero selects the first valid join case and its initial record.
         let envelope = crate::smb::jcs::encode(&vectors["cases"][0]["records"][0])
             .unwrap()
             .into_bytes();
@@ -487,6 +517,7 @@ mod tests {
         native.offer(&envelope).unwrap();
         let mut first = handle.connect().unwrap();
         assert!(handle.connect().is_err(), "one connection owns delivery");
+        // Version 1 is the ACK schema literal in server/src/signing/business-append-contract.json.
         let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
         assert!(
             first.acknowledge(&ack).is_err(),
@@ -527,6 +558,7 @@ mod tests {
     fn refused_ack_releases_pending_fact_latch() {
         let vectors: Value =
             serde_json::from_str(include_str!("record_join_vectors.json")).unwrap();
+        // Index zero selects the first valid join case and its initial record.
         let envelope = crate::smb::jcs::encode(&vectors["cases"][0]["records"][0])
             .unwrap()
             .into_bytes();
@@ -535,6 +567,7 @@ mod tests {
         native.offer(&envelope).unwrap();
         let mut session = handle.connect().unwrap();
         session.offer().unwrap().unwrap();
+        // Version 1 is the ACK schema literal in server/src/signing/business-append-contract.json.
         let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
         session.acknowledge(&ack).unwrap();
         assert_eq!(native.poll().unwrap(), Some(ack.clone()));
