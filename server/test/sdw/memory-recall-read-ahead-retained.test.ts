@@ -1,23 +1,49 @@
 // The read-ahead retains at most its window of slots, and at most RECALL_READ_AHEAD_RETAINED_TEXT_UNITS of passage
 // text, at every commit: a slot is released when its passage is decided, and a passage past the per-passage cap
-// keeps no text.
+// keeps no text. The witness finds the slots itself, by walking every reference the ring holds, so it does not rest
+// on the ring's own retainedSlots and retainedTextUnits accounting.
 import { afterEach, describe, expect, it } from "vitest";
 import {
   RECALL_MAX_PASSAGE_SCAN_UNITS,
   RECALL_READ_AHEAD_PASSAGES,
   RECALL_READ_AHEAD_RETAINED_TEXT_UNITS,
 } from "../../src/hermes-memory-bridge/recall.js";
-import { RecallReadAheadRing } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { RecallReadAheadRing, type RecallReadAheadResult } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { NOW, recallFixture } from "./recall-score-first-fixture.js";
 
-/** Sample the ring's retained state on entry to and exit from every take(), the commit's turn for each passage. */
+function isSlot(value: object): value is RecallReadAheadResult {
+  return "document" in value && "textReleased" in value && Array.isArray((value as { chunks?: unknown }).chunks);
+}
+
+/**
+ * Every slot reachable from the ring's own fields, through arrays, maps, sets and plain objects (not closures or
+ * promises), with the passage text those slots hold, counted here rather than by the ring.
+ */
+function ringOwnedSlots(ring: RecallReadAheadRing): { readonly slots: number; readonly text: number } {
+  const seen = new Set<object>();
+  const slots = new Set<RecallReadAheadResult>();
+  const visit = (value: unknown): void => {
+    if (value === null || typeof value !== "object" || seen.has(value) || value instanceof Promise) return;
+    seen.add(value);
+    if (isSlot(value)) { slots.add(value); return; }
+    if (value instanceof Map) { for (const [key, item] of value) { visit(key); visit(item); } return; }
+    if (value instanceof Set) { for (const item of value) visit(item); return; }
+    for (const key of Reflect.ownKeys(value)) visit((value as Record<PropertyKey, unknown>)[key]);
+  };
+  for (const key of Reflect.ownKeys(ring)) visit((ring as unknown as Record<PropertyKey, unknown>)[key]);
+  let text = 0;
+  for (const slot of slots) for (const read of slot.chunks) if (read.ok && read.value !== null) text += read.value.text?.length ?? 0;
+  return { slots: slots.size, text };
+}
+
+/** Sample what the ring holds on entry to and exit from every take(), the commit's turn for each passage. */
 function sampleRetainedState() {
   const samples: { readonly slots: number; readonly text: number }[] = [];
   const original = RecallReadAheadRing.prototype.take;
   RecallReadAheadRing.prototype.take = async function (this: RecallReadAheadRing, ordinal: number) {
-    samples.push({ slots: this.retainedSlots, text: this.retainedTextUnits });
+    samples.push(ringOwnedSlots(this));
     const taken = await original.call(this, ordinal);
-    samples.push({ slots: this.retainedSlots, text: this.retainedTextUnits });
+    samples.push(ringOwnedSlots(this));
     return taken;
   };
   return { samples, restore: () => { RecallReadAheadRing.prototype.take = original; } };
