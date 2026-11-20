@@ -615,6 +615,8 @@ pub fn receive(fd: std::os::fd::RawFd, direction: Direction) -> Result<super::si
 }
 /// Validate the exact canonical envelope shape without conferring signature authority.
 pub fn decode_envelope(bytes: &[u8]) -> Result<Value> {
+    // Must match BusinessSession::served's bound in business_delivery.rs: reject oversized
+    // bytes before identity decoding can retain a session envelope (append_contract::PRODUCER_ENVELOPE_MAX_BYTES).
     let value = signer_service::canonical(bytes, WRITER_ENVELOPE_MAX_BYTES)
         .map_err(|_| Refusal::Canonical)?;
     let signature: [u8; SIGNATURE_BYTES] = URL_SAFE_NO_PAD
