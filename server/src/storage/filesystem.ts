@@ -183,11 +183,23 @@ export interface CapabilityError {
   rawNamespace?: string;
   errors?: CapabilityError[];
   cause?: CapabilityError;
+  /** Names a typed storage error the parent rebuilds as that class; absent for every other failure. */
+  type?: typeof CAPABILITY_ERROR_TYPE_READ_BOUND;
 }
+
+/**
+ * The wire discriminator for StorageReadBoundError. Must match on both sides of
+ * the worker IPC: serializeCapabilityError writes it in the worker and
+ * deserializeCapabilityError reads it in the parent.
+ */
+const CAPABILITY_ERROR_TYPE_READ_BOUND = "storage_read_bound";
 
 /** Preserve every strict failure across the private worker IPC boundary. */
 export function serializeCapabilityError(error: unknown): CapabilityError {
   const value: CapabilityError = { message: error instanceof Error ? error.message : String(error) };
+  // The class is carried by an explicit field because IPC keeps only plain data; a caller that
+  // classifies a bounded-read refusal with instanceof must see the same type on every backend path.
+  if (error instanceof StorageReadBoundError) value.type = CAPABILITY_ERROR_TYPE_READ_BOUND;
   if (error instanceof Error) {
     for (const key of ["code", "kind", "rawName", "rawNamespace"] as const) {
       const field = (error as unknown as Record<string, unknown>)[key];
@@ -202,6 +214,8 @@ export function serializeCapabilityError(error: unknown): CapabilityError {
 
 /** Reconstitute worker failures without discarding nested errno evidence. */
 export function deserializeCapabilityError(value: CapabilityError): Error {
+  // Rebuilt from the discriminator, never from the message text, so the type is chosen by the serializer.
+  if (value.type === CAPABILITY_ERROR_TYPE_READ_BOUND) return new StorageReadBoundError();
   const options = value.cause ? { cause: deserializeCapabilityError(value.cause) } : undefined;
   const error = value.errors
     ? new AggregateError(value.errors.map(deserializeCapabilityError), value.message, options)
