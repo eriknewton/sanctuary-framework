@@ -1193,8 +1193,11 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
    * document record its text was scored from, before any of them can reach the result. It writes nothing.
    */
   async recallPassages(budget: HermesRecallBudget): Promise<HermesRecallResult> {
+    // Continuing arm, inherited unchanged: no terms, or a budget already aborted or spent at entry, returns an empty
+    // result (truncated in the second case) having read no listing and no integrity state; it carries no passage.
     if (budget.terms.length === 0 || !budget.active()) return budget.result();
     const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
+    // Continuing arm: an empty listing returns an empty result having read no integrity state; it carries no passage.
     if (entries.length === 0) return budget.result();
     // A tamper signal in the integrity state refuses every recall with something to scan, whatever the query
     // matches; the end read below refuses a state that moved while this call ran.
@@ -1232,7 +1235,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
           // A broken passage aborts recall only when its provenance verifies; one that fails verification is
           // skipped, as the provenance check that used to run first would have skipped it. This full verification
           // runs in the commit, not the read-ahead, and is bounded by the passages the scan reaches, not by
-          // RECALL_VERIFY_CANDIDATES.
+          // RECALL_VERIFY_CANDIDATES. Continuing arm: a passage it skips reaches no output and writes nothing.
           if (await this.recallProvenance(document, integrityState, "verify") === "skip") continue;
           throw error;
         }
@@ -1267,6 +1270,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         "SDW memory integrity state changed during provenance verification",
       );
     }
+    // Continuing arm (a complete or stopped scan, with or without a match): every passage returned verified against
+    // its bound record, every issued read settled, and the integrity state was read unchanged at the start and here.
     return budget.result();
   }
 
@@ -2345,6 +2350,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       });
     } catch (error) {
       // Eligibility on an unverified companion must not abort where a verified one would not: resolve it fully.
+      // Continuing arm: this full verification (both signatures, subject, destination, eligibility) runs in the screen,
+      // inside a read-ahead slot, once per such passage the scan reaches; RECALL_VERIFY_CANDIDATES does not cap it.
       if (mode === "screen") return this.recallProvenance(document, integrityState, "verify");
       throw error;
     }

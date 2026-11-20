@@ -1,14 +1,15 @@
 // Recall uses the production encrypted adapter and preserves trust checks through the bridge.
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { HermesBridgeCore, type HermesBridgeAuditRecord } from "../../src/hermes-memory-bridge/bridge-core.js";
 import { parsePublicFrame, type NodeToRelayInput } from "../../src/hermes-memory-bridge/envelopes.js";
-import { RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS, type HermesRecallBudget } from "../../src/hermes-memory-bridge/recall.js";
+import { HermesRecallBudget, RECALL_VERIFY_CANDIDATES, RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
 import { SdwDocumentCorpusStore, padChunkOrdinal } from "../../src/sdw/document-corpus-store.js";
-import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
+import { SDW_DOCUMENT_CORPUS_NAMESPACE, type SdwMemoryIntegrityState } from "../../src/sdw/records.js";
 import { documentProvenanceKey } from "../../src/sdw/grammar.js";
 import { passageContentHash } from "../../src/sdw/write-gate.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { TestSdwMemoryBackendAdapter } from "../sdw/test-memory-backend.js";
+import { QUERY, recallFixture, settle, type Seed } from "../sdw/recall-score-first-fixture.js";
 
 const CREATED = "2026-11-01T00:00:00.000Z";
 const MATCH = { outcome: "recalled", context: "- (saved 2026-11-01) board meeting\n",
@@ -111,4 +112,104 @@ it.each(["cancel", "stop"] as const)("finishes bounded recall work after %s, ret
     if (control === "cancel") expect(h.body()).toEqual({ ...MATCH, truncated: true });
     else expect(h.writes).toEqual([]);
   } finally { release(); h.core.relayEof(); }
+});
+
+describe("continuing arms of the read-ahead recall, each with the evidence it checks", () => {
+  /** The adapter-level fixture, with listings and integrity-state reads counted. */
+  async function counted(seeds: readonly Seed[], state: SdwMemoryIntegrityState | ((read: number) => SdwMemoryIntegrityState) = "state_PRE_MIGRATION") {
+    const f = await recallFixture();
+    for (const seed of seeds) await f.seed(seed);
+    let integrityReads = 0, listings = 0;
+    f.setState(async () => { integrityReads++; return typeof state === "function" ? state(integrityReads) : state; });
+    const list = f.storage.list.bind(f.storage);
+    f.storage.list = async (namespace, prefix) => { listings++; return list(namespace, prefix); };
+    f.storage.writes = 0;
+    return { f, counts: () => ({ integrityReads, listings }) };
+  }
+  const seed = (passageId: string, kind: Seed["kind"] = "valid", text = "alpha bravo"): Seed => ({ kind, passageId, text, createdAt: CREATED });
+  const nine = (kind: Seed["kind"]) => Array.from({ length: 9 }, (_, n) => seed(`n${n}`, kind)); // Nine: one more than RECALL_VERIFY_CANDIDATES.
+  const empty = { outcome: "recalled", context: "", passages: [], truncated: false };
+
+  it("an empty normalized query answers empty, reading no listing and no integrity state", async () => {
+    const { f, counts } = await counted([seed("a")], "state_MARKER_ABSENT_POST_COMPLETE");
+    expect(await f.adapter.recallPassages(f.budget("the and when"))).toEqual(empty);
+    expect(counts()).toEqual({ integrityReads: 0, listings: 0 });
+  });
+
+  it.each(["aborted", "expired"] as const)("a budget already %s at entry answers empty and truncated, as inherited, reading no integrity state", async kind => {
+    // Inherited early return: it checks the budget only; it reads neither the listing nor the integrity state, so it
+    // answers even when the state would refuse a scan. It returns no passage.
+    const { f, counts } = await counted([seed("a")], "state_MARKER_ABSENT_POST_COMPLETE");
+    const abort = new AbortController();
+    let now = 0;
+    const budget = new HermesRecallBudget(QUERY, () => now, abort.signal);
+    if (kind === "aborted") abort.abort(); else now = RECALL_WALL_BUDGET_MS;
+    expect(await f.adapter.recallPassages(budget)).toEqual({ ...empty, truncated: true });
+    expect(counts()).toEqual({ integrityReads: 0, listings: 0 });
+  });
+
+  it("an empty listing answers empty, reading no integrity state", async () => {
+    const { f, counts } = await counted([], "state_MARKER_ABSENT_POST_COMPLETE");
+    expect(await f.adapter.recallPassages(f.budget())).toEqual(empty);
+    expect(counts()).toEqual({ integrityReads: 0, listings: 1 });
+  });
+
+  it.each(["no match", "only skipped passages"] as const)("a complete scan with %s answers empty only after the end integrity read", async kind => {
+    const seeds = kind === "no match" ? [seed("a", "valid", "garden budget"), seed("b", "valid", "kitchen flight")]
+      : [seed("a", "quarantined"), seed("b", "bad-signer"), seed("c", "unresolved-signer")];
+    const steady = await counted(seeds);
+    expect(await steady.f.adapter.recallPassages(steady.f.budget())).toEqual(empty);
+    expect(steady.counts().integrityReads).toBe(2);
+    expect(steady.f.storage.writes).toBe(0);
+    // The property: the end read is checked on this arm too, so a state that moved during the scan refuses.
+    const moved = await counted(seeds, read => read === 1 ? "state_PRE_MIGRATION" : "state_MIGRATING");
+    await expect(moved.f.adapter.recallPassages(moved.f.budget())).rejects.toThrow("integrity state changed");
+  });
+
+  it("nine passages that pass the screen, fail verification and lack a chunk cost nine verifications and answer empty", async () => {
+    const { f } = await counted(nine("invalid-with-broken-chunk"));
+    const verifications = f.countVerifications();
+    const outcome = await settle(() => f.adapter.recallPassages(f.budget()));
+    // The chunk-failure arm verifies before deciding, once per broken passage; RECALL_VERIFY_CANDIDATES does not cap it.
+    expect(verifications.count()).toBe(9);
+    expect(verifications.count()).toBeGreaterThan(RECALL_VERIFY_CANDIDATES);
+    expect(outcome).toEqual({ ok: true, value: empty });
+    expect(f.storage.writes).toBe(0);
+  });
+
+  it("nine passages whose signer-eligibility check throws fall back to full verification in the screen and answer empty", async () => {
+    const { f } = await counted(nine("is-marked-throws-invalid"));
+    const verifications = f.countVerifications();
+    const outcome = await settle(() => f.adapter.recallPassages(f.budget()));
+    // The eligibility fallback is a full verification inside the screen, so inside a read-ahead slot, once per passage.
+    expect(verifications.count()).toBe(9);
+    expect(outcome).toEqual({ ok: true, value: empty });
+    expect(f.storage.chunkReads).toBe(0);
+    expect(f.storage.writes).toBe(0);
+  });
+
+  it("a recall whose peer vanished continues to its audit row with verified passages only", async () => {
+    const h = await fixture();
+    await h.adapter.insertPassage({ passage_id: "b", text: "board meeting again" }, "user_content");
+    // b ranks first but its origin signature no longer verifies: it is scored, then refused by verification.
+    const record = (await h.corpus.getProvenanceRaw("mem.agent.b"))!.record;
+    const signature = record.companion.origin.signature;
+    await h.corpus.putProvenance({ ...record, companion: { ...record.companion, origin: { ...record.companion.origin,
+      signature: (signature[0] === "A" ? "B" : "A") + signature.slice(1) } } }, "system_generated");
+    const originalRead = h.storage.read.bind(h.storage);
+    let release!: () => void, parked = false;
+    const pause = new Promise<void>(resolve => { release = resolve; });
+    h.storage.read = async (namespace, key) => {
+      if (key === "doc.mem.agent.b") { parked = true; await pause; }
+      return originalRead(namespace, key);
+    };
+    try {
+      h.call("vanished"); await drainUntil(() => parked);
+      h.core.relayFrame({ kind: "closed", connectionId: "c1" });
+      release();
+      await drainUntil(() => h.audits.some(row => row.kind === "memory_recall"));
+      expect(h.audits.find(row => row.kind === "memory_recall")).toMatchObject({ passage_ids: ["a"], truncated: false });
+      expect(h.writes.filter(row => row.type === "response")).toEqual([]);
+    } finally { release(); h.core.relayEof(); }
+  });
 });
