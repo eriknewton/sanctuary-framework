@@ -1,6 +1,6 @@
 {
   "compilerDigest": "9e0411682f1ade1dad504e01c538bed57ffd59beed610af55d880045b9a6dacc",
-  "driftDigest": "fc518a446344a2285789ff8efa77ee85f60d3b3c87c0e986afc76d6d3ef0bd6d",
+  "driftDigest": "ee5a355ee5309ac74ec333e397004dc8b5f188815663f0d0b88547fc9314a963",
   "sources": [
     "server/src/agent-contract/adapters/claude-code.ts",
     "server/src/agent-contract/adapters/cline.ts",

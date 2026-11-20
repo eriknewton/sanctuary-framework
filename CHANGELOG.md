@@ -6,26 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-- Doctor and `sanctuary status` report wall, agent and coverage readings from the same evaluator. Dashboard and posture pages show English badges whose readings expire when evidence stops.
-- The evidence-pack verifier candidate build now checks the packed tarball's exact contents, adds a check-evidence-pack-artifact command; the installed verifier refuses to run from a package marked non-release or whose classification cannot be established.
-
-- Scheduled checkpoints on the installed full service use the signer client the wall already resolved, and the install preflight reports its path.
-
-- The optional Telegram liveness probe now bounds the full request sequence and response size and validates reply fields.
-- The full daemon now reports audit write-lock recoveries it observes in its own process, and the wall reads degraded for the history window after one. A recovery that ends the daemon is reported as a recent restart. `castle-wall status` still exits 1 until the observer is installed and commissioned.
-- Added `castle-wall liveness-status`, which reports wall, agent and coverage separately from stored evidence. `castle-wall status` and `castle-wall full-status` now exit 0 only when that wall evidence is fresh and complete, so a running daemon alone no longer exits 0; missing required evidence makes them exit 1. `install-full --preflight` checks for a stable Node path before any change.
-- Added the wall observer, installed with `castle-wall install-watch` and removed with `castle-wall uninstall-watch`. A correctly commissioned Mac still needs an attended drill to demonstrate a healthy wall reading. Missing monitoring reads the wall DOWN, while an agent that is not monitored reads UNMONITORED. The canary needs two commands run as root, which the CLI prints.
-- The full Castle Wall daemon now maintains `liveness/daemon.json.publisher` alongside its stored liveness record.
-- Added a default-off storage and audit foundation with separate strict storage methods under a required namespace lock, descriptor-bound barriers and audit promise checks; receipt, retention-pin and seal integration remains deferred. Darwin directory-capability worker errors, including legacy operations, now keep nested `errors` and `cause` across the worker boundary and drop a non-string `code` or `kind`. Owner-mode strict writes into a missing directory now refuse with the typed `strict_directory_missing` code.
-- Adds Linux business record codecs and verifiers only, plus pure shared history joins, strict recovery proposals and custody journal acknowledgments. Linux hosts now select a producer profile before any path is prepared: a host carrying business enrollment evidence refuses to start the Castle Wall daemon, because installed business signing is not enabled; the raw producer key constructor is excluded from shipped builds.
-- On Linux, `sanctuary wrap`, `sanctuary protect` and `castle-wall daemon` require a mounted `/proc` and refuse to start without it.
-- The memory provenance signer-prune tool now reports storage, audit and finalization failures with accurate deletion status.
-- Added a private offline evidence snapshot verifier candidate, explicit capture diagnostics, fresh build outputs, artifact provenance, recipient instructions and a synthetic second-Mac drill procedure.
-
-- Added an isolated per-role record-signing contract, encrypted key provider and inert native signer service with an attended terminal ceremony, capability-free peers and restart-persistent worker uncertainty, monotonic kill deadlines, fault-latched cleanup settlement and cooperative cleanup that tolerates a concurrent LOCK. Daemon boot, application writers and readers, Mac and pack adapters, and installed acceptance remain pending.
-- Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
-- Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Recipient verification CLI and packaging are not included.
-
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
 - `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.
@@ -33,6 +13,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### `@sanctuary-framework/quickstart` 0.2.0 (separate npm package, not in this release)
 
 - `@sanctuary-framework/quickstart` 0.2.0: publishing is opt-in. In a terminal it shows the destination and the exact request body and asks `[y/N]` (default No); `--publish` publishes without asking, `--no-publish` never publishes, and a run without a terminal does not publish unless `--publish` is given. The local identity exists before the publish decision in every case. A saved identity in `~/.sanctuary/quickstart-identity.json` is reused and never rewritten; `--new-identity` mints a fresh one after copying the old file to a backup.
+
+## [1.9.0-rc.5] - unreleased
+
+Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 until 1.9.0 ships. Adds Castle Wall health reporting on macOS, which changes what `castle-wall status` exits with, requires a mounted `/proc` on Linux, lets `protect --hermes-memory` install against real Hermes configs, and carries default-off groundwork merged since rc.4. No signed macOS app is attached to this preview yet; the v1.8.4 app does not pair with it. CI and test-only changes carry no notes line. Everything else in the rc.4, rc.3, rc.2 and rc.1 notes below still applies.
+
+### Castle Wall health reporting (macOS): exit codes change
+
+- **`castle-wall status` and `castle-wall full-status` now exit 0 only when wall evidence is fresh and complete.** A running daemon alone no longer exits 0, and missing required evidence makes both commands exit 1. A script that reads these exit codes keeps getting 1 until the wall observer below is installed and commissioned. `install-full --preflight` checks for a stable Node path before any change.
+- **New `castle-wall liveness-status`.** It reports wall, agent and coverage separately from stored evidence. Doctor and `sanctuary status` take their wall, agent and coverage readings from the same evaluator, and the dashboard and posture pages show English badges whose readings expire when evidence stops.
+- **New wall observer.** Install it with `castle-wall install-watch` and remove it with `castle-wall uninstall-watch`. Missing monitoring reads the wall DOWN, while an agent that is not monitored reads UNMONITORED. The canary needs two commands run as root, which the CLI prints.
+- **The full daemon reports its own audit lock recoveries.** It records audit write-lock recoveries it observes in its own process, and the wall reads degraded for the history window after one. A recovery that ends the daemon is reported as a recent restart. The daemon also maintains `liveness/daemon.json.publisher` alongside its stored liveness record.
+- **Scheduled checkpoints work on an installed full wall.** They use the signer client the wall already resolved, and the install preflight reports its path.
+- The optional Telegram liveness probe bounds the full request sequence and response size and validates reply fields.
+
+### Linux: a mounted `/proc` is now required
+
+- **On Linux, `sanctuary wrap`, `sanctuary protect` and `castle-wall daemon` require a mounted `/proc`** and refuse to start without it.
+- Linux hosts select a producer profile before any path is prepared. A host carrying business enrollment evidence refuses to start the Castle Wall daemon, because installed business signing is not enabled in this release.
+
+### Hermes memory
+
+- **`protect --hermes-memory` accepts real Hermes configs.** Hermes writes top-level lists in `config.yaml` without indenting them, and Sanctuary's config reader refused every such file, so the install could not complete. Those lists are now read correctly. Managed blocks and `mcp_servers` still refuse a list where they expect a mapping.
+
+### Other fixes
+
+- The memory provenance signer-prune tool reports storage, audit and finalization failures with accurate deletion status.
+
+### Default-off groundwork (no effect unless enabled)
+
+- A strict storage and audit foundation: separate strict storage methods under a required namespace lock, descriptor-bound barriers and audit promise checks. Receipt, retention-pin and seal integration remains deferred. Darwin directory-capability worker errors, including legacy operations, keep nested `errors` and `cause` across the worker boundary and drop a non-string `code` or `kind`. Owner-mode strict writes into a missing directory refuse with the typed `strict_directory_missing` code.
+- An isolated per-role record-signing contract, an encrypted key provider and an inert native signer service with an attended terminal ceremony. Daemon boot, application writers and readers, the Mac and pack adapters, and installed acceptance remain pending.
+- Linux business record codecs and verifiers, shared history joins, strict recovery proposals and custody journal acknowledgments, plus writer, drain and ledger services, all off by default. The raw producer key constructor is excluded from shipped builds.
+- Evidence pack: snapshot export, a public trust descriptor export, independent pack key output, a static extension authority registry, a pure verification boundary over captured bytes and independent public pins, and an offline verifier candidate with recipient instructions and a synthetic second-Mac drill procedure. The candidate build checks the packed tarball's exact contents and adds a `check-evidence-pack-artifact` command; the installed verifier refuses to run from a package marked non-release or whose classification cannot be established. macOS and SELinux file labels no longer fail verification.
+
+### Capability bounds
+
+- No attended drill has yet shown a healthy wall reading on a commissioned Mac, so rc.5 claims no drilled healthy reading from `castle-wall status`, `full-status` or `liveness-status`.
+- The proven macOS enforcement row in the Assurance Matrix is unchanged by the health reporting work.
 
 ## [1.9.0-rc.4] - 2026-11-07
 
