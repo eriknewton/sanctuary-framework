@@ -1196,9 +1196,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     // Continuing arm, inherited unchanged: no terms, or a budget already aborted or spent at entry, returns an empty
     // result (truncated in the second case) having read no listing and no integrity state; it carries no passage.
     if (budget.terms.length === 0 || !budget.active()) return budget.result();
-    const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
+    const listed = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
     // Continuing arm: an empty listing returns an empty result having read no integrity state; it carries no passage.
-    if (entries.length === 0) return budget.result();
+    if (listed.length === 0) return budget.result();
+    const entries = recallScanOrder(listed);
     // A tamper signal in the integrity state refuses every recall with something to scan, whatever the query
     // matches; the end read below refuses a state that moved while this call ran.
     const integrityState = await this.readRecallIntegrityState();
@@ -2625,6 +2626,26 @@ export function chunkText(text: string, maxChunkChars: number): readonly string[
 // existing importer of passageContentHash from THIS module keeps working
 // without an import-path change.
 export { passageContentHash };
+
+/**
+ * Recall's scan order (V8): most recently modified files first, from the unchanged list(), in one pass. Rule 7: this
+ * order is a hint with no credibility. Subject: the document file. Evidence source: the host's file modification
+ * time as list() reports it. Verifier: none. It is never a freshness guarantee: anyone with host file access can
+ * set the time, and a save of old content is a new file. A wrong order only reorders a complete scan; when the scan
+ * stops it decides which passages are left unscanned, and truncated reports that. Equal times keep key order, and an
+ * entry with no parseable time sorts after every timed one, so a backend that reports no times keeps key order.
+ */
+function recallScanOrder<T extends { readonly key: string; readonly modified_at?: string }>(listed: readonly T[]): T[] {
+  const timed = listed.map(entry => ({ entry, at: entry.modified_at === undefined ? Number.NaN : Date.parse(entry.modified_at) }));
+  timed.sort((a, b) => {
+    const aTimed = Number.isFinite(a.at), bTimed = Number.isFinite(b.at);
+    if (aTimed && bTimed && a.at !== b.at) return b.at - a.at;
+    if (aTimed !== bTimed) return aTimed ? -1 : 1;
+    // Ties by key, compared the way the shipped list() implementations sort their keys.
+    return a.entry.key.localeCompare(b.entry.key);
+  });
+  return timed.map(item => item.entry);
+}
 
 /** A read-ahead outcome held to the passage's commit turn: a value, or the error the read or decode raised. */
 type RecallHeld<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };

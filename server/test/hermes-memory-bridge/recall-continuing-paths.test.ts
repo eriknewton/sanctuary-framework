@@ -7,9 +7,8 @@ import { SdwDocumentCorpusStore, padChunkOrdinal } from "../../src/sdw/document-
 import { SDW_DOCUMENT_CORPUS_NAMESPACE, type SdwMemoryIntegrityState } from "../../src/sdw/records.js";
 import { documentProvenanceKey } from "../../src/sdw/grammar.js";
 import { passageContentHash } from "../../src/sdw/write-gate.js";
-import { MemoryStorage } from "../../src/storage/memory.js";
 import { TestSdwMemoryBackendAdapter } from "../sdw/test-memory-backend.js";
-import { QUERY, recallFixture, settle, type Seed } from "../sdw/recall-score-first-fixture.js";
+import { KeyOrderMemoryStorage, QUERY, recallFixture, settle, type Seed } from "../sdw/recall-score-first-fixture.js";
 
 const CREATED = "2026-11-01T00:00:00.000Z";
 const MATCH = { outcome: "recalled", context: "- (saved 2026-11-01) board meeting\n",
@@ -20,7 +19,7 @@ async function drainUntil(condition: () => boolean) {
   expect(condition()).toBe(true);
 }
 async function fixture(options: { readonly readAhead?: number } = {}) {
-  const storage = new MemoryStorage(), masterKey = new Uint8Array(32).fill(17), fortressId = "recall-paths";
+  const storage = new KeyOrderMemoryStorage(), masterKey = new Uint8Array(32).fill(17), fortressId = "recall-paths";
   let complete = false, now = 0, rejectAudit = false;
   const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey, fortressId, ownerRef: "agent", now: () => CREATED,
     resolveMemoryIntegrityState: async () => complete ? "state_COMPLETE" : "state_PRE_MIGRATION" });

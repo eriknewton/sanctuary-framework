@@ -5,6 +5,7 @@ import { expect } from "vitest";
 import { HermesBridgeCore, type HermesBridgeAuditRecord } from "../../src/hermes-memory-bridge/bridge-core.js";
 import { parsePublicFrame, type NodeToRelayInput } from "../../src/hermes-memory-bridge/envelopes.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { KeyOrderMemoryStorage } from "../sdw/recall-score-first-fixture.js";
 import { TestSdwMemoryBackendAdapter } from "../sdw/test-memory-backend.js";
 
 export const CREATED = "2026-11-01T00:00:00.000Z";
@@ -12,7 +13,7 @@ export const CREATED = "2026-11-01T00:00:00.000Z";
 export type ReadRule = "park" | "reject" | "park-then-reject" | { readonly turns: number } | undefined;
 
 /** Counts every read from issue to settlement, and every write; reads follow the installed rule. */
-export class ScheduledStorage extends MemoryStorage {
+export class ScheduledStorage extends KeyOrderMemoryStorage {
   issued = 0;
   settled = 0;
   inFlight = 0;

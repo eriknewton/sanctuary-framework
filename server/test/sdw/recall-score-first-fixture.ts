@@ -34,8 +34,19 @@ export const QUERY_WORDS = ["alpha", "bravo", "charlie"] as const;
 export const FILLER_WORDS = ["garden", "budget", "review", "dentist", "flight", "library", "printer", "kitchen"] as const;
 const GARBAGE = stringToBytes("{}"); // Parses as JSON but carries no ciphertext, so the record codec refuses it.
 
+/**
+ * Reports one modification time for every listed entry. Recall scans the most recently modified files first, ties by
+ * key, so on this store the scan order is key order, which the recall case tables are written in; the in-memory store
+ * would otherwise stamp each entry with its millisecond of insertion. memory-recall-newest-first.test.ts sets times.
+ */
+export class KeyOrderMemoryStorage extends MemoryStorage {
+  override async list(...args: Parameters<MemoryStorage["list"]>) {
+    return (await super.list(...args)).map(entry => ({ ...entry, modified_at: NOW }));
+  }
+}
+
 /** Counts every storage mutation; recall must leave the count at zero. */
-export class RecallStorage extends MemoryStorage {
+export class RecallStorage extends KeyOrderMemoryStorage {
   writes = 0;
   chunkReads = 0;
   now = 0;

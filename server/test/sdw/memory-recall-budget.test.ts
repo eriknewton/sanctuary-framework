@@ -1,11 +1,10 @@
 // The real encrypted adapter bounds per-call scan work and retained context.
 import { describe, expect, it } from "vitest";
-import { MemoryStorage } from "../../src/storage/memory.js";
 import { HermesRecallBudget, RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS, type HermesRecallLimits } from "../../src/hermes-memory-bridge/recall.js";
-import { RECALL_TEST_WINDOWS } from "./recall-score-first-fixture.js";
+import { KeyOrderMemoryStorage, RECALL_TEST_WINDOWS } from "./recall-score-first-fixture.js";
 import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 
-class CountingStorage extends MemoryStorage {
+class CountingStorage extends KeyOrderMemoryStorage {
   chunkReads = 0;
   now = 0;
   step = 0;

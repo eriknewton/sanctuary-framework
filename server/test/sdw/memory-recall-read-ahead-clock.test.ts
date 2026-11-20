@@ -2,14 +2,14 @@
 // and the call reports truncation when the reserve is reached after the next passage's reads complete.
 import { expect, it } from "vitest";
 import { HermesRecallBudget, RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
-import { MemoryStorage } from "../../src/storage/memory.js";
+import { KeyOrderMemoryStorage } from "./recall-score-first-fixture.js";
 import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 
 const CREATED = "2026-11-01T00:00:00.000Z";
 const FALLBACK_TURNS = 100; // A hundred event-loop turns: far more than a's reads and commit need in this in-memory store.
 
 it("keeps the first passage's context and reports truncation when the reserve is reached as the next passage's reads complete", async () => {
-  const storage = new MemoryStorage();
+  const storage = new KeyOrderMemoryStorage();
   const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey: new Uint8Array(32).fill(17),
     fortressId: "completion-clock", ownerRef: "agent", now: () => CREATED });
   await adapter.insertPassage({ passage_id: "a", text: "board meeting" }, "user_content");
