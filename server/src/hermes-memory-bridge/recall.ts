@@ -24,6 +24,13 @@ export const RECALL_VERIFY_CANDIDATES = RECALL_MAX_PASSAGES + 5;
 // Twenty-five milliseconds is about twice box 1's estimated full per-passage verification cost of 12.3 ms, rounded
 // up; the scan stops this long before the wall so the candidates it ranked can still be verified inside it.
 export const RECALL_VERIFY_RESERVE_MS = RECALL_VERIFY_CANDIDATES * 25;
+// Four equals Node's default thread-pool size (UV_THREADPOOL_SIZE unset), the pool every asynchronous file read
+// runs on. It is a bounded observation, not a proof: on box 1 (11-18, 2000 passages) windows of 2 to 16 measured
+// within session drift of each other, and the smaller window bounds the reads and retained state one call holds.
+export const RECALL_READ_AHEAD_PASSAGES = 4;
+// Two: a read-ahead slot issues its document and provenance reads together, then one status, provenance or chunk
+// read at a time, so at most two of its reads are ever in flight at once.
+export const RECALL_READS_PER_SLOT = 2;
 // Must match SHIM_CONNECT_HELLO_TIMEOUT_MS in hermes-memory-client/protocol.ts.
 export const RECALL_PREFETCH_BUDGET_MS = 5000; // Five seconds is the local prefetch window.
 export const RECALL_REPLY_RESERVE_MS = 1000; // One second is reserved for audit and response delivery.
@@ -77,11 +84,14 @@ export interface HermesRecallLimits {
   readonly wallMs: number;
   readonly verifyCandidates: number;
   readonly verifyReserveMs: number;
+  /** Passages read ahead of the ordered commit; 1 keeps the one-passage-at-a-time order of reads. */
+  readonly readAhead: number;
 }
 const limits: HermesRecallLimits = Object.freeze({ candidates: RECALL_MAX_CANDIDATES_SCANNED,
   passageUnits: RECALL_MAX_PASSAGE_SCAN_UNITS, scannedUnits: RECALL_MAX_SCANNED_UNITS_PER_CALL,
   retained: RECALL_MAX_RETAINED_CANDIDATES, wallMs: RECALL_WALL_BUDGET_MS,
-  verifyCandidates: RECALL_VERIFY_CANDIDATES, verifyReserveMs: RECALL_VERIFY_RESERVE_MS });
+  verifyCandidates: RECALL_VERIFY_CANDIDATES, verifyReserveMs: RECALL_VERIFY_RESERVE_MS,
+  readAhead: RECALL_READ_AHEAD_PASSAGES });
 
 /** One call owns all counters and retained excerpts; overrides can only tighten production bounds. */
 export class HermesRecallBudget {
@@ -121,6 +131,15 @@ export class HermesRecallBudget {
       return false;
     }
     return true;
+  }
+  /**
+   * The scan's stop conditions (abort, the wall minus the verification reserve, the scanned-unit cap) as a pure
+   * question. It changes no state: scanning() sets truncated as a side effect, so the read-ahead, which runs ahead
+   * of the commit and must leave every budget decision to the commit in listing order, asks only this.
+   */
+  scanOpen(): boolean {
+    return !this.signal.aborted && this.nowMs() - this.startedAt < this.limits.wallMs - this.limits.verifyReserveMs &&
+      this.unitsScanned < this.limits.scannedUnits;
   }
   /** The verification phase stops only for abort and the wall; the scan caps bound scanning, not verifying ranked candidates. */
   verifying(): boolean {
