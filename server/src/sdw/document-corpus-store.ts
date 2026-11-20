@@ -348,18 +348,24 @@ export class SdwDocumentCorpusStore {
     documentId: string,
     txn?: SdwCorpusTxn,
   ): Promise<{ readonly raw: Uint8Array; readonly record: SdwDocumentRecord } | null> {
-    const storageKey = documentKey(documentId);
-    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId));
     if (raw === null) return null;
-    const record = decodeSdwRecord<SdwDocumentRecord>(raw, {
-      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
-      storageKey,
-      fortressId: this.fortressId,
-      encryptionKey: this.encryptionKey,
-      expectedKind: "document",
+    // Must match decodeDocument below: this read and recall's read-ahead decode with one set of options.
+    return { raw, record: this.decodeDocument(documentId, raw) };
+  }
+
+  /**
+   * Decodes document bytes the caller already read from this document's key, with exactly the options
+   * {@link getDocumentRaw} applies (namespace, storage key, fortress id, encryption key, expected kind and the
+   * document identity check), so recall's read-ahead, which reads the bytes itself, authenticates them the same way.
+   * Must match getDocumentRaw above.
+   */
+  decodeDocument(documentId: string, raw: Uint8Array): SdwDocumentRecord {
+    return decodeSdwRecord<SdwDocumentRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey: documentKey(documentId), fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey, expectedKind: "document",
       verifyIdentity: (record) => record.document_id === documentId,
     });
-    return { raw, record };
   }
 
   async getChunk(documentId: string, chunkOrdinal: number, chunkId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentChunkRecord | null> {
