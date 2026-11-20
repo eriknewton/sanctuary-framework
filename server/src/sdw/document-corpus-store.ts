@@ -31,6 +31,7 @@ import {
   type Persistable,
   type Taint,
 } from "./write-gate.js";
+import { SdwValidationError } from "./errors.js";
 import { decodeSdwRecord } from "./store-codec.js";
 import { readReplayAnchor } from "./replay-anchor.js";
 
@@ -382,9 +383,29 @@ export class SdwDocumentCorpusStore {
     const storageKey = documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId);
     const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
     if (raw === null) return null;
-    const record = decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
+    return { raw, record: this.decodeChunk(documentId, chunkOrdinal, chunkId, raw) };
+  }
+
+  /**
+   * {@link getChunk} with the stored record refused, before its bytes are read into memory or decoded, when it is
+   * longer than maxBytes. A storage backend without StorageBackend.readBounded is refused too: a read that cannot
+   * be bounded is never substituted for one that can. Must match readBounded in storage/interface.ts; recall's
+   * read-ahead in adapters/sdw-memory-backend.ts is the consumer and derives maxBytes.
+   */
+  async getChunkBounded(documentId: string, chunkOrdinal: number, chunkId: string, maxBytes: number): Promise<SdwDocumentChunkRecord | null> {
+    if (typeof this.storage.readBounded !== "function") {
+      throw new SdwValidationError("operation_refused", "SDW memory storage offers no bounded read");
+    }
+    const raw = await this.storage.readBounded(
+      SDW_DOCUMENT_CORPUS_NAMESPACE, documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId), maxBytes);
+    return raw === null ? null : this.decodeChunk(documentId, chunkOrdinal, chunkId, raw);
+  }
+
+  /** The one set of chunk decode options; getChunkRaw and getChunkBounded both decode through it. */
+  private decodeChunk(documentId: string, chunkOrdinal: number, chunkId: string, raw: Uint8Array): SdwDocumentChunkRecord {
+    return decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
-      storageKey,
+      storageKey: documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId),
       fortressId: this.fortressId,
       encryptionKey: this.encryptionKey,
       expectedKind: "document_chunk",
@@ -393,7 +414,6 @@ export class SdwDocumentCorpusStore {
         record.chunk_id === chunkId &&
         record.chunk_ordinal === chunkOrdinal,
     });
-    return { raw, record };
   }
 
   async getProvenanceRaw(documentId: string, txn?: SdwCorpusTxn): Promise<{ readonly raw: Uint8Array; readonly record: SdwMemoryProvenanceRecord } | null> {

@@ -17,7 +17,7 @@ import type {
 import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 import { SdwValidationError } from "../sdw/errors.js";
-import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "./interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, StorageReadBoundError } from "./interface.js";
 import { assertStorageNamespacePathComponent } from "./namespace-component.js";
 
 export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabilities {
@@ -131,6 +131,15 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     const entry = this.store.get(this.storageKey(namespace, key));
     if (!entry) return null;
     return new Uint8Array(entry.data); // Copy to prevent external mutation
+  }
+
+  /** Must match StorageBackend.readBounded in interface.ts. */
+  async readBounded(namespace: string, key: string, maxBytes: number): Promise<Uint8Array | null> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new StorageReadBoundError();
+    const entry = this.store.get(this.storageKey(namespace, key));
+    // The stored length is checked before read() copies the bytes, so an over-bound entry is never copied out.
+    if (entry !== undefined && entry.data.length > maxBytes) throw new StorageReadBoundError();
+    return this.read(namespace, key);
   }
 
   async delete(

@@ -33,9 +33,9 @@ export const RECALL_READ_AHEAD_PASSAGES = 4;
 export const RECALL_READS_PER_SLOT = 2;
 // The passage text one call's read-ahead retains, at most: each slot drops its text once its passage passes
 // RECALL_MAX_PASSAGE_SCAN_UNITS, so it holds at most that many units, and at most RECALL_READ_AHEAD_PASSAGES slots
-// exist. The read path enforces no maximum on one stored chunk, so this bounds retained text, not the one chunk
-// record each slot decodes transiently, which can be any size the store holds (as for the one-at-a-time loop).
-// Must match the release in readRecallSlot in sdw/adapters/sdw-memory-backend.ts.
+// exist. This bounds retained text; the one chunk record each slot reads and decodes at a time is bounded apart, by
+// the read-side maximum recallChunkRecordMaxBytes. Must match the release and the bounded chunk read in
+// readRecallSlot in sdw/adapters/sdw-memory-backend.ts.
 export const RECALL_READ_AHEAD_RETAINED_TEXT_UNITS = RECALL_READ_AHEAD_PASSAGES * RECALL_MAX_PASSAGE_SCAN_UNITS;
 // Must match SHIM_CONNECT_HELLO_TIMEOUT_MS in hermes-memory-client/protocol.ts.
 export const RECALL_PREFETCH_BUDGET_MS = 5000; // Five seconds is the local prefetch window.

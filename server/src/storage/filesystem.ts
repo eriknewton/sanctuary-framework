@@ -43,7 +43,7 @@
 
 import { constants as fsConstants, existsSync, lstatSync } from "node:fs";
 import { link, mkdir, open, opendir, unlink, readdir, stat, lstat } from "node:fs/promises";
-import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES } from "./interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES, StorageReadBoundError } from "./interface.js";
 import type { Stats } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
@@ -65,7 +65,7 @@ import type {
   StorageBackend,
   StorageEntryMeta,
 } from "./interface.js";
-import { readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict, syncDirectoryStrict, syncExistingDirectoryChainStrict } from "./custody-fs.js";
+import { CustodyFsError, readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict, syncDirectoryStrict, syncExistingDirectoryChainStrict } from "./custody-fs.js";
 import {
   assertStorageMasterWriteBarrierHeld,
   CrossProcessLockError,
@@ -1356,9 +1356,28 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     return this.readAtPath(legacy);
   }
 
-  private async readAtPath(filePath: string): Promise<Uint8Array | null> {
+  /** Must match StorageBackend.readBounded in interface.ts and the readBounded op in directory-capability-worker.ts. */
+  async readBounded(namespace: string, key: string, maxBytes: number): Promise<Uint8Array | null> {
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new StorageReadBoundError();
+    const capability = this.darwinCapability(namespace);
+    if (capability) {
+      // The worker applies the same bound to its own read, so an over-bound entry never crosses the IPC channel.
+      const encoded = await this.callDarwinNamespace<string | null>(capability, "readBounded", [key, maxBytes]);
+      return encoded === null ? null : new Uint8Array(Buffer.from(encoded, "base64"));
+    }
+    const buf = await this.readAtPath(this.entryPath(namespace, key), maxBytes);
+    if (buf !== null) return buf;
+    const legacy = this.legacyEntryPath(namespace, key);
+    if (legacy === this.entryPath(namespace, key)) return null;
+    return this.readAtPath(legacy, maxBytes);
+  }
+
+  private async readAtPath(filePath: string, maxBytes?: number): Promise<Uint8Array | null> {
     try {
-      const buf = await readFileCustody(filePath);
+      // With a bound, custody refuses on the descriptor's size before reading and reads at most maxBytes + 1.
+      const buf = await readFileCustody(filePath, maxBytes === undefined ? undefined : { maxBytes });
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     } catch (err: unknown) {
       if (
@@ -1368,6 +1387,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       ) {
         return null;
       }
+      if (err instanceof CustodyFsError && err.code === "read_size_rejected") throw new StorageReadBoundError();
       throw err;
     }
   }

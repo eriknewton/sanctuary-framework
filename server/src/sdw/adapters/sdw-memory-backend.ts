@@ -129,6 +129,28 @@ export const DEFAULT_MAX_CHUNK_CHARS = 8192;
 /** A shipped Hermes save fits one public frame at DEFAULT_MAX_CHUNK_CHARS, so its passage has at most this many chunks. */
 export const HERMES_SAVE_MAX_CHUNKS = Math.ceil(MAX_PUBLIC_FRAME_BYTES / DEFAULT_MAX_CHUNK_CHARS);
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
+// Six: the longest JSON encoding of one UTF-16 code unit is the six-byte escape \uXXXX (a control character or a
+// lone surrogate); any other unit is at most three UTF-8 bytes.
+const CHUNK_RECORD_JSON_BYTES_PER_UNIT = 6;
+// The chunk record's fields other than its text: the shipped writer's measure 475 bytes with two 256-unit
+// identifiers (the SDW identifier maximum) and the largest safe-integer ordinal, rounded up to leave room for the
+// optional offset and count fields.
+const CHUNK_RECORD_FIELD_BYTES = 1024;
+// Sixteen: the AES-256-GCM authentication tag appended to the ciphertext.
+const CHUNK_RECORD_TAG_BYTES = 16;
+// The encrypted envelope's own fields (version, algorithm, IV, timestamp and the JSON around the ciphertext)
+// measure 91 bytes, rounded up.
+const CHUNK_RECORD_ENVELOPE_BYTES = 256;
+
+/**
+ * The longest stored chunk record a writer configured with maxChunkChars can produce: the worst-case JSON of its
+ * text and fields, encrypted and tagged, base64url-encoded (four characters per three bytes) inside the envelope.
+ * 67 179 bytes at DEFAULT_MAX_CHUNK_CHARS. Recall refuses a stored record past it before reading it into memory.
+ */
+export function recallChunkRecordMaxBytes(maxChunkChars: number): number {
+  const plaintext = maxChunkChars * CHUNK_RECORD_JSON_BYTES_PER_UNIT + CHUNK_RECORD_FIELD_BYTES + CHUNK_RECORD_TAG_BYTES;
+  return CHUNK_RECORD_ENVELOPE_BYTES + Math.ceil(plaintext * 4 / 3);
+}
 // Exported: `sdw/memory-tools.ts` applies the same default at the tool
 // boundary so an unattended memory_search never reaches the adapter unbounded.
 export const MEMORY_SEARCH_DEFAULT_LIMIT = 10;
@@ -412,6 +434,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   readonly ownerRef: string;
   private readonly passageIdKey: Uint8Array;
   private readonly maxChunkChars: number;
+  private readonly recallChunkMaxBytes: number;
   private readonly corpusScanCap: number;
   private readonly listMaxLimit: number;
   private readonly provenanceCandidateCap: number;
@@ -494,6 +517,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     this.ownerRef = options.ownerRef;
     this.passageIdKey = derivePurposeKey(options.masterKey, MEMORY_PASSAGE_ID_HKDF_INFO);
     this.maxChunkChars = maxChunkChars;
+    this.recallChunkMaxBytes = recallChunkRecordMaxBytes(maxChunkChars);
     this.corpusScanCap = corpusScanCap;
     this.listMaxLimit = listMaxLimit;
     const provenanceCandidateCap = options.provenanceCandidateCap ?? MEMORY_PROVENANCE_QUARANTINE_CANDIDATE_CAP;
@@ -2405,7 +2429,14 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       if (!budget.scanOpen()) return;
       // The chunk's text is interpreted inside the settled read, so a malformed record is this slot's held refusal,
       // raised at the passage's turn like an unreadable chunk, and never a rejection that skips the other slots' drain.
-      const read = await settleRecallRead(async () => recallChunkText(await this.corpus.getChunk(document.document_id, ordinal, chunkId(ordinal))));
+      // Read-side maximum (ruling B2): a stored record longer than recallChunkMaxBytes is refused before its bytes are
+      // read into memory or decoded, and is an unreadable chunk under the same refusal table. Whole-call bound: each
+      // slot reads one chunk at a time, so at most RECALL_READ_AHEAD_PASSAGES records (4 x 67 179 bytes at
+      // DEFAULT_MAX_CHUNK_CHARS) are read or decoded at once, each decode stage linear in that length, beside the
+      // retained text RECALL_READ_AHEAD_RETAINED_TEXT_UNITS bounds. Document and provenance records are read whole;
+      // this maximum covers chunk records, the part of a passage that grows with its text.
+      const read = await settleRecallRead(async () => recallChunkText(
+        await this.corpus.getChunkBounded(document.document_id, ordinal, chunkId(ordinal), this.recallChunkMaxBytes)));
       if (!read.ok || read.value === null) { slot.chunks.push(read.ok ? { ok: true, value: null } : read); return; }
       const length = read.value.length;
       units += length;
