@@ -1,4 +1,4 @@
-// fail-before-exempt: fixture snapshot mutation witnesses read FIFO metadata outside server/src.
+// fail-before-exempt: fixtures state their own directory modes independent of the process umask, and snapshot mutation witnesses read FIFO metadata outside server/src.
 import {describe, expect, it} from "vitest";
 import * as fs from "node:fs";
 import {join, dirname} from "node:path";
@@ -141,7 +141,8 @@ it("rejects the same malformed element set as Rust before execution", () => {
 it.skipIf(process.platform !== "linux")("bounds caller paths and closes every descriptor on refusal", () => {
   const root = fs.mkdtempSync(join(tmpdir(), "k1-selector-"));
   try {
-    fs.mkdirSync(join(root, selection.BUSINESS_CUSTODY_ROOT.slice(1)), {recursive: true});
+    // Trusted parents let candidate refusal reach the descriptor accounting under either umask.
+    fs.mkdirSync(join(root, selection.BUSINESS_CUSTODY_ROOT.slice(1)), {recursive: true, mode: 0o700});
     const roots = selection.isolatedSelectorRoots(root);
     const before = fs.readdirSync("/proc/self/fd").length;
     for (const candidate of ["/outside-selection-anchor", `${root}/x/../key`, `${root}/${"x".repeat(selection.CANDIDATE_MAX_BYTES)}`]) {
@@ -167,9 +168,12 @@ for (const [rawRoot, suffix] of [[selection.RAW_STATE_ROOT, selection.RAW_STATE_
     }
     const key = Buffer.concat([parent, Buffer.from(`/${parts.at(-1)!}`)]);
     try {
-      fs.mkdirSync(join(root, selection.BUSINESS_CUSTODY_ROOT), {recursive: true});
-      fs.mkdirSync(rawBase, {recursive: true});
-      for (const dir of directories) fs.mkdirSync(dir);
+      // Business evidence must remain selectable before the raw inventory is inspected.
+      fs.mkdirSync(join(root, selection.BUSINESS_CUSTODY_ROOT), {recursive: true, mode: 0o700});
+      // The selector must reach the byte-named entry under either shell umask.
+      fs.mkdirSync(rawBase, {recursive: true, mode: 0o700});
+      // Every parent of the raw key participates in the selector's trusted chain.
+      for (const dir of directories) fs.mkdirSync(dir, {mode: 0o700});
       fs.writeFileSync(key, "untouched raw inventory");
       expect(selection.selectLinuxProfile(selection.isolatedSelectorRoots(root), [])).toEqual({kind: "Refused", reason: "RawInventoryPresent"});
       expect(fs.readFileSync(key, "utf8")).toBe("untouched raw inventory");

@@ -25,7 +25,7 @@ aroundAll(async runSuite => {
   const errors: unknown[] = [];
   try { await runSuite(); } catch (error) { errors.push(error); }
   try { releaseSelectorRoot(); } catch (error) { errors.push(error); }
-  // Two failures are aggregated, one is rethrown, and zero means success.
+  // The file's own failure must remain visible, with any release failure reported beside it.
   if (errors.length > 1) throw new AggregateError(errors, "File run and selector temp root release both failed");
   if (errors.length > 0) throw errors[0];
 });

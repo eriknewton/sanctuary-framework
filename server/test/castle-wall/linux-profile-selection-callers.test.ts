@@ -1,3 +1,4 @@
+// fail-before-exempt: the fixture states its own file and directory modes so the result does not depend on the process umask; no server/src change.
 import {afterEach, describe, expect, it, vi} from "vitest";
 import {mkdtempSync, mkdirSync, readdirSync, writeFileSync, lstatSync, unlinkSync, rmdirSync} from "node:fs";
 import {join} from "node:path";
@@ -26,8 +27,10 @@ const refusal = (reason: string) => `sanctuary castle-wall: Linux business profi
 function fixture(business: boolean) {
   const root = mkdtempSync(join(tmpdir(), "k1-callers-"));
   fixtureRoots.push(root);
-  const storage = join(root, "storage"); mkdirSync(storage);
-  if (business) mkdirSync(join(root, "var/lib/sanctuary-business-signer"), {recursive: true});
+  // Candidate inventory must traverse the fixture storage under either shell umask.
+  const storage = join(root, "storage"); mkdirSync(storage, {mode: 0o700});
+  // Trusted evidence parents let the caller reach business selection before its other hooks.
+  if (business) mkdirSync(join(root, "var/lib/sanctuary-business-signer"), {recursive: true, mode: 0o700});
   // Inline data keeps this FB witness executable against the original modules.
   const selectorRoots = {anchor: root, expectedOwner: process.geteuid!(), owners: {}, deniedLookup: [], deniedOpen: []};
   return {root, storage, selectorRoots};
@@ -93,7 +96,8 @@ it("wrap legacy reaches the existing credential consumer", async () => {
 for (const explicit of [true, false]) it(`wrap inventories the effective fortress (${explicit ? "option" : "environment"}) before promotion`, async () => {
   const f = fixture(true), {deps, hooks} = wrapHooks(f.selectorRoots), output: string[] = [];
   const effective = join(f.root, "effective"), ambient = join(f.root, "ambient");
-  mkdirSync(join(effective, "policy/egress"), {recursive: true}); mkdirSync(ambient);
+  // Both candidate roots must permit inventory inspection under either shell umask.
+  mkdirSync(join(effective, "policy/egress"), {recursive: true, mode: 0o700}); mkdirSync(ambient, {mode: 0o700});
   writeFileSync(join(effective, "policy/egress/audit-producer.key"), "untouched");
   vi.stubEnv("SANCTUARY_STORAGE_PATH", f.storage);
   vi.stubEnv("SANCTUARY_FORTRESS_PATH", explicit ? ambient : effective);
