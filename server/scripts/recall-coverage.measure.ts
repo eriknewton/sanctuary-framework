@@ -53,7 +53,9 @@ import { FilesystemStorage } from "../src/storage/filesystem.js";
 import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
 
 const SERVER = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const OUT = process.env.MEASURE_OUT ?? join(tmpdir(), `recall-coverage-${Date.now()}.json`);
+// An explicit MEASURE_OUT is the operator's chosen path; the default lives in a fresh private directory, never a
+// predictable name in the shared temp directory.
+const OUT_OVERRIDE = process.env.MEASURE_OUT;
 const PASS = "correct horse battery staple hermes measure"; // Fixture passphrase for a throwaway fortress.
 const SIZES = process.env.MEASURE_SIZES ? process.env.MEASURE_SIZES.split(",").map(Number) : [250, 500, 1000, 2000];
 // The extra query shapes run at the largest size only: 2000 by default, the corpus ceiling MEMORY_CORPUS_SCAN_CAP.
@@ -337,8 +339,10 @@ it("measures recall coverage at 250, 500, 1000 and 2000 passages", async () => {
       rows,
       audit_memory_recall_rows: audited,
     };
-    await writeFile(OUT, JSON.stringify(result, null, 1) + "\n");
-    console.log(`recall coverage written to ${OUT}`);
+    const out = OUT_OVERRIDE ?? join(await mkdtemp(join(tmpdir(), "recall-coverage-")), "recall-coverage.json");
+    // 0o600: owner read and write only; "wx" refuses to follow or overwrite an existing file.
+    await writeFile(out, JSON.stringify(result, null, 1) + "\n", { flag: "wx", mode: 0o600 });
+    console.log(`recall coverage written to ${out}`);
   } finally {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   }
