@@ -2,7 +2,7 @@
 import { expect, it } from "vitest";
 import { HermesBridgeCore, type HermesBridgeAuditRecord } from "../../src/hermes-memory-bridge/bridge-core.js";
 import { parsePublicFrame, type NodeToRelayInput } from "../../src/hermes-memory-bridge/envelopes.js";
-import { RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
+import { RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS, type HermesRecallBudget } from "../../src/hermes-memory-bridge/recall.js";
 import { SdwDocumentCorpusStore, padChunkOrdinal } from "../../src/sdw/document-corpus-store.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import { documentProvenanceKey } from "../../src/sdw/grammar.js";
@@ -18,7 +18,7 @@ async function drainUntil(condition: () => boolean) {
   for (let turn = 0; turn < 1000 && !condition(); turn++) await Promise.resolve();
   expect(condition()).toBe(true);
 }
-async function fixture() {
+async function fixture(options: { readonly readAhead?: number } = {}) {
   const storage = new MemoryStorage(), masterKey = new Uint8Array(32).fill(17), fortressId = "recall-paths";
   let complete = false, now = 0, rejectAudit = false;
   const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey, fortressId, ownerRef: "agent", now: () => CREATED,
@@ -26,7 +26,13 @@ async function fixture() {
   await adapter.insertPassage({ passage_id: "a", text: "board meeting" }, "user_content");
   const corpus = new SdwDocumentCorpusStore({ storage, masterKey, fortressId });
   const writes: NodeToRelayInput[] = [], audits: HermesBridgeAuditRecord[] = [];
-  const core = new HermesBridgeCore({ completeAuditInsert() {}, agentId: "agent", abort: new AbortController(), adapter,
+  const { readAhead } = options;
+  // The bridge builds each recall budget itself; a pinned window replaces only that budget's readAhead limit.
+  const recallAdapter = readAhead === undefined ? adapter : Object.assign(Object.create(adapter) as typeof adapter, {
+    recallPassages: (budget: HermesRecallBudget) => adapter.recallPassages(
+      Object.defineProperty(budget, "limits", { value: Object.freeze({ ...budget.limits, readAhead }) })),
+  });
+  const core = new HermesBridgeCore({ completeAuditInsert() {}, agentId: "agent", abort: new AbortController(), adapter: recallAdapter,
     writeFrame: frame => writes.push(frame), appendAudit: async row => {
       audits.push(row); if (rejectAudit) throw new Error("audit fixture");
     }, nowMs: () => now, setTimer: () => ({}), clearTimer() {} });
@@ -81,7 +87,9 @@ it.each(["provenance", "hash", "unsigned"] as const)("recall observes the %s tru
 });
 
 it.each(["cancel", "stop"] as const)("finishes bounded recall work after %s, returning only verified matches", async control => {
-  const h = await fixture();
+  // Pinned to one passage at a time: this clock jumps when b's read is issued, which the read-ahead does before a
+  // commits; memory-recall-read-ahead-clock.test.ts covers the default window on a clock driven by read completion.
+  const h = await fixture({ readAhead: 1 });
   await h.adapter.insertPassage({ passage_id: "b", text: "board later" }, "user_content");
   const originalRead = h.storage.read.bind(h.storage);
   let release!: () => void, parked = false;

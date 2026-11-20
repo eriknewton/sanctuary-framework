@@ -7,6 +7,7 @@ import { hash } from "../../src/core/hashing.js";
 import { publicKeyToDid } from "../../src/core/identity.js";
 import {
   HermesRecallBudget,
+  RECALL_READ_AHEAD_PASSAGES,
   compareRecallCandidates,
   recallTimestamp,
   type HermesRecallCandidate,
@@ -88,7 +89,10 @@ export interface Seed {
 
 let foreignSeedByte = 0;
 
-export async function recallFixture(options: { readonly maxChunkChars?: number } = {}) {
+/** The read-ahead windows every recall case table runs at: one passage at a time, and the production default. */
+export const RECALL_TEST_WINDOWS = [1, RECALL_READ_AHEAD_PASSAGES] as const;
+
+export async function recallFixture(options: { readonly maxChunkChars?: number; readonly readAhead?: number } = {}) {
   const storage = new RecallStorage();
   const local = testMemoryProvenanceDependencies(MASTER);
   const foreignKeys = new Map<string, Uint8Array>();
@@ -190,7 +194,7 @@ export async function recallFixture(options: { readonly maxChunkChars?: number }
     storage, adapter, corpus, seed, countVerifications, documentIdOf, firstChunkKey,
     setState(next: SdwMemoryIntegrityState | (() => Promise<SdwMemoryIntegrityState>)) { state = next; },
     budget(query = QUERY, nowMs: () => number = () => 0, signal = new AbortController().signal) {
-      return new HermesRecallBudget(query, nowMs, signal);
+      return new HermesRecallBudget(query, nowMs, signal, options.readAhead === undefined ? {} : { readAhead: options.readAhead });
     },
   };
 }
