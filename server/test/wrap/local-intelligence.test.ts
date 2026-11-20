@@ -98,7 +98,8 @@ describe("shared protect/init local-intelligence adapter", () => {
     );
     try {
       const root = join(parent, "models");
-      await mkdir(root);
+      // Model-root custody must permit path normalization under either shell umask.
+      await mkdir(root, { mode: 0o700 });
       await expect(resolveOllamaModelsRootState(
         "darwin",
         { OLLAMA_MODELS: join(parent, "unused", "..", "models") },
@@ -214,7 +215,8 @@ describe("shared protect/init local-intelligence adapter", () => {
     // and then the operator decline, not stop at `model_root_invalid`.
     const parent = await realpath(await mkdtemp(join(tmpdir(), "sanctuary-q5f-wired-root-")));
     const modelsRoot = join(parent, "models");
-    await mkdir(modelsRoot);
+    // Model-root custody must permit the packaged-manifest consumer under either shell umask.
+    await mkdir(modelsRoot, { mode: 0o700 });
     const previousModelsEnv = process.env.OLLAMA_MODELS;
     process.env.OLLAMA_MODELS = modelsRoot;
     let result: Awaited<ReturnType<typeof runLocalIntelligenceSetup>>;

@@ -795,7 +795,8 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
       const sourcePath = join(operatorHome, ".hermes", "config.yaml");
       const destPath = join(accountHome, ".hermes", "config.yaml");
       await mkdir(dirname(sourcePath), { recursive: true });
-      await mkdir(dirname(destPath), { recursive: true });
+      // Destination custody must permit the overwrite and restore witness under either umask.
+      await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
       await writeFile(sourcePath, "stub: true\n");
       await writeFile(destPath, "REAL_CONFIG_WITH_SECRET=two");
 
@@ -925,7 +926,8 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
       const sourcePath = join(operatorHome, ".hermes", "config.yaml");
       const dataVaultPath = join(accountHome, "Library", "Caches", "com.apple.containermanagerd");
       await mkdir(dirname(sourcePath), { recursive: true });
-      await mkdir(dataVaultPath, { recursive: true });
+      // Destination custody must permit the data-vault exclusion witness under either umask.
+      await mkdir(dataVaultPath, { recursive: true, mode: 0o700 });
       await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=three");
       await writeFile(join(dataVaultPath, "blocked.db"), "tcc-vault");
 

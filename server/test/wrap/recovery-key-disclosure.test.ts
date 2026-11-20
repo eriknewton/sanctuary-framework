@@ -227,7 +227,8 @@ describe("Recovery key disclosure (Finding U)", () => {
       "default output power cut after %s leaves complete, idempotently cleanable residue",
       async (cutStage) => {
         const fortressPath = join(tmpDir, `default-${cutStage}`);
-        await mkdir(join(fortressPath, "state", "_meta"), { recursive: true });
+        // Default output custody must permit the child to reach each power-cut stage.
+        await mkdir(join(fortressPath, "state", "_meta"), { recursive: true, mode: 0o700 });
         await writeFile(
           join(fortressPath, "state", "_meta", ".custody-write.lock"),
           "",
@@ -323,7 +324,8 @@ describe("Recovery key disclosure (Finding U)", () => {
       const durableDir = join(tmpDir, "durable");
       const recoveryOut = join(durableDir, "recovery-key.txt");
       const symlinkTarget = join(tmpDir, "outside-target.txt");
-      await mkdir(durableDir, { recursive: true });
+      // Parent custody must permit the dangling-link refusal under either shell umask.
+      await mkdir(durableDir, { recursive: true, mode: 0o700 });
       await symlink(symlinkTarget, recoveryOut);
 
       await expect(
@@ -344,7 +346,8 @@ describe("Recovery key disclosure (Finding U)", () => {
       const durableDir = join(tmpDir, "durable");
       const recoveryOut = join(durableDir, "recovery-key.txt");
       const symlinkTarget = join(tmpDir, "outside-target.txt");
-      await mkdir(durableDir, { recursive: true });
+      // Parent custody must permit the existing-link refusal under either shell umask.
+      await mkdir(durableDir, { recursive: true, mode: 0o700 });
       await writeFile(symlinkTarget, "existing target", { mode: 0o600 });
       await symlink(symlinkTarget, recoveryOut);
 
@@ -364,7 +367,8 @@ describe("Recovery key disclosure (Finding U)", () => {
       const io = makeIo();
       const fortressPath = join(tmpDir, "fortress");
       const recoveryOut = join(tmpDir, "durable", "recovery-key.txt");
-      await mkdir(dirname(recoveryOut), { recursive: true });
+      // Parent custody must permit the existing-file refusal under either shell umask.
+      await mkdir(dirname(recoveryOut), { recursive: true, mode: 0o700 });
       await writeFile(recoveryOut, "stale recovery key", { mode: 0o600 });
 
       await expect(

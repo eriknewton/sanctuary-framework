@@ -664,7 +664,7 @@ describe("runInit", () => {
     const fortressPath = join(tmp, "raced-recovery-out-fortress");
     const durableDir = join(tmp, "raced-durable");
     const recoveryOut = join(durableDir, "recovery-key.txt");
-    await mkdir(durableDir, { recursive: true });
+    await mkdir(durableDir, { recursive: true, mode: 0o700 }); // A trusted parent lets the race reach the authoritative write under either umask.
     const observed: Uint8Array[] = [];
 
     await expect(
