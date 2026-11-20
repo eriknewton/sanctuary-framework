@@ -98,7 +98,7 @@
     "@libp2p/interface": "2.11.0",
     "@libp2p/kad-dht": "16.4.9",
     "@libp2p/mdns": "11.0.47",
-    "@libp2p/peer-id": "5.1.9",
+    "@libp2p/peer-id": "6.0.18",
     "@libp2p/ping": "3.1.17",
     "@libp2p/tcp": "10.1.19",
     "@modelcontextprotocol/sdk": "1.32.2",
