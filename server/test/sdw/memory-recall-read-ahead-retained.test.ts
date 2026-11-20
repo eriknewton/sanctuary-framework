@@ -1,7 +1,8 @@
 // The read-ahead retains at most its window of slots, and at most RECALL_READ_AHEAD_RETAINED_TEXT_UNITS of passage
 // text, at every commit: a slot is released when its passage is decided, and a passage past the per-passage cap
 // keeps no text. The witness finds the slots itself, by walking every reference the ring holds, so it does not rest
-// on the ring's own retainedSlots and retainedTextUnits accounting.
+// on the ring's own retainedSlots and retainedTextUnits accounting. Its text count sees only text held inside
+// slot-shaped objects: text the ring kept in some other shape, such as a bare chunk array, is not counted.
 import { afterEach, describe, expect, it } from "vitest";
 import {
   RECALL_MAX_PASSAGE_SCAN_UNITS,

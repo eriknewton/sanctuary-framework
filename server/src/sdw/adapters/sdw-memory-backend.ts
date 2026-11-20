@@ -1249,8 +1249,9 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         if (document === null || recallTimestamp(document.created_at) === null) continue;
         if (document.chunk_count > budget.limits.passageUnits) { budget.truncated = true; continue; }
         if (slot.screen === undefined) { budget.truncated = true; break; }
-        // Pre-screen before any chunk read: a passage the screen skips reads no chunks and spends no scanned units. The screen checks no signature, so it may only skip; a passage it passes still
-        // faces full verification before output.
+        // Pre-screen before any chunk read: a passage the screen skips reads no chunks and spends no scanned units.
+        // The screen checks no signature, so it may only skip; a passage it passes still faces full verification
+        // before output.
         if (!slot.screen.ok) throw slot.screen.error;
         if (!budget.scanning()) break;
         if (slot.screen.value === "skip") continue;
@@ -1272,7 +1273,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         if (candidate !== null) heap.offer(candidate, document);
       }
     } finally {
-      // Drain (ruling M3): every read this call issued has settled before verification, before any throw and before
+      // Drain: every read this call issued has settled before verification, before any throw and before
       // the return, so no read outlives the call or the bridge admission record that holds it. The cost is a bound,
       // not a guarantee of latency: a stalled local read launched past the stop point delays the return until it
       // settles, and the reserved verification time is not claimed to survive a stalled drain.
@@ -2399,7 +2400,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     statusHint: ReadonlySet<string> | null,
   ): Promise<void> {
     const documentId = key.slice("doc.".length);
-    // Ownership (ruling B1): the document and provenance reads are issued together and settled one by one, so a
+    // Ownership: the document and provenance reads are issued together and settled one by one, so a
     // failed document read never leaves its provenance read running unowned. RECALL_READS_PER_SLOT counts these two.
     const documentRead = settleRecallRead(() => this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, key));
     const provenanceRead = settleRecallRead(() => this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceKey(documentId)));
@@ -2419,7 +2420,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     slot.screen = rawProvenance.ok
       ? await settleRecallRead(() => this.recallProvenanceFrom(document, rawProvenance.value, integrityState, "screen", statusHint))
       : rawProvenance;
-    // Class D reads no chunks: chunks are read only for a passage the screen passed.
+    // A passage the screen skips reads no chunks: chunks are read only for a passage the screen passed.
     if (!slot.screen.ok || slot.screen.value === "skip") return;
     let units = 0;
     for (let ordinal = 0; ordinal < document.chunk_count; ordinal++) {
@@ -2428,19 +2429,20 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       if (!budget.scanOpen()) return;
       // The chunk's text is interpreted inside the settled read, so a malformed record is this slot's held refusal,
       // raised at the passage's turn like an unreadable chunk, and never a rejection that skips the other slots' drain.
-      // Read-side maximum (ruling B2): a stored record longer than recallChunkMaxBytes is refused before its bytes are
-      // read into memory or decoded, and is an unreadable chunk under the same refusal table. Whole-call bound: each
-      // slot reads one chunk at a time, so at most RECALL_READ_AHEAD_PASSAGES records (4 x 67 179 bytes at
+      // Read-side maximum: a stored record longer than recallChunkMaxBytes is refused before its bytes are read into
+      // memory or decoded, and is an unreadable chunk under the same refusal table. Whole-call bound: each slot
+      // reads one chunk at a time, so at most RECALL_READ_AHEAD_PASSAGES records (4 x 67 179 bytes at
       // DEFAULT_MAX_CHUNK_CHARS) are read or decoded at once, each decode stage linear in that length, beside the
-      // retained text RECALL_READ_AHEAD_RETAINED_TEXT_UNITS bounds. Document and provenance records are read whole;
-      // this maximum covers chunk records, the part of a passage that grows with its text.
+      // retained text RECALL_READ_AHEAD_RETAINED_TEXT_UNITS bounds. DEBT(S2-RECALL-DOC-PROV-READ-BOUND): document
+      // and provenance records are read whole; this maximum covers chunk records, the part of a passage that grows
+      // with its text, so the whole-call bound above holds for chunk records only.
       const read = await settleRecallRead(async () => recallChunkText(
         await this.corpus.getChunkBounded(document.document_id, ordinal, chunkId(ordinal), this.recallChunkMaxBytes)));
       if (!read.ok || read.value === null) { slot.chunks.push(read.ok ? { ok: true, value: null } : read); return; }
       const length = read.value.length;
       units += length;
       if (units > budget.limits.passageUnits) {
-        // Retained state (ruling B2): past the per-passage cap the commit needs only the lengths, never the text, so
+        // Retained state: past the per-passage cap the commit needs only the lengths, never the text, so
         // the slot drops every text it holds at once and retains at most passageUnits text units at any time. Must
         // match RECALL_READ_AHEAD_RETAINED_TEXT_UNITS in hermes-memory-bridge/recall.ts, the per-call bound this gives.
         slot.chunks.push({ ok: true, value: { length, text: null } });
