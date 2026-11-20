@@ -51,7 +51,7 @@ describe("server bounds are copied from the README", () => {
     }
     expect.soft(missing, "a bounds sentence is not README text; change the README first").toEqual([]);
     expect.soft(unbounded, "a proof sentence lacks its platform bound").toEqual([]);
-    expect.soft(SERVER_BOUNDS.platforms).toContain("macOS: proven.");
+    expect.soft(SERVER_BOUNDS.platforms).toContain('Assurance Matrix row "Egress enforcement: macOS (Castle Wall Phase 1)". macOS: proven.');
     expect.soft(SERVER_BOUNDS.platforms).toContain("Linux enforcement is proven on Ubuntu 24.04 (x86-64) only;");
     // The proven Linux path is not in the npm package this server ships in, so
     // the bounds name its channel; an agent reading only "proven on Ubuntu"

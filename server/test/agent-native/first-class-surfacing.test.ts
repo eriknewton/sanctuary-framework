@@ -135,7 +135,9 @@ describe("first-class tool surfacing", () => {
       expect(SERVER_BOUNDS.platforms).toContain("Linux enforcement is proven on Ubuntu 24.04 (x86-64) only;");
       expect(SERVER_BOUNDS.platforms).toContain("Windows");
       expect(SERVER_BOUNDS.tiers).toContain("Tier 1");
-      expect(SERVER_BOUNDS.evidence).toContain(ASSURANCE_MATRIX_URL);
+      expect(SERVER_BOUNDS.evidence).toBe(
+        `Recorded claims, with platform and evidence, are rows in the Assurance Matrix at ${ASSURANCE_MATRIX_URL}; to evaluate this install call monitor_health, then sovereignty_audit.`,
+      );
       expect(Object.keys(SERVER_BOUNDS)).toHaveLength(4);
       expect(instructions).not.toContain("\u2014");
     });

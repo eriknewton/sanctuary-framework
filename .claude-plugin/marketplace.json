@@ -8,7 +8,7 @@
     {
       "name": "sanctuary-framework",
       "source": "./plugin",
-      "description": "Security for AI agents: an OS-enforced egress wall on macOS, operator-held keys, a hash-chained audit record. Wraps Claude Code, Cursor, Hermes, OpenClaw, Cline on tested config paths (partial). Linux wall: Ubuntu 24.04 x86-64 only, separate package."
+      "description": "Cooperative MCP policy gates and encrypted local state. macOS OS-level egress enforcement requires a separately installed and armed Castle Wall component. Linux enforcement: Ubuntu 24.04 x86-64 only, separate package. Wrapping and audit assurance remain partial; see the Assurance Matrix."
     }
   ]
 }

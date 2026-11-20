@@ -120,13 +120,13 @@ export const ASSURANCE_MATRIX_URL =
  */
 export const SERVER_BOUNDS = {
   platforms:
-    "macOS: proven. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven. Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm package. Windows enforcement is roadmapped; nothing enforces on Windows today.",
+    "OS egress enforcement by platform follows; macOS is bounded by the Assurance Matrix row \"Egress enforcement: macOS (Castle Wall Phase 1)\". macOS: proven. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven. Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm package. Windows enforcement is roadmapped; nothing enforces on Windows today.",
   tiers:
     "Approval runs in three tiers: Tier 3 auto-allows with an audit record, Tier 2 asks a human on anomaly, and Tier 1 always waits for a human.",
   neverClaimed:
     "No Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail.",
   evidence:
-    `Every claim, its platform and its evidence is a row in the Assurance Matrix at ${ASSURANCE_MATRIX_URL}; to evaluate this install call monitor_health, then sovereignty_audit.`,
+    `Recorded claims, with platform and evidence, are rows in the Assurance Matrix at ${ASSURANCE_MATRIX_URL}; to evaluate this install call monitor_health, then sovereignty_audit.`,
 } as const;
 
 /** The four bounds sentences as one paragraph, in the order an agent needs them. */

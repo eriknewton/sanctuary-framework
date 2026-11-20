@@ -5,8 +5,8 @@ description: >
   audit record. Use when the agent needs encrypted state storage, self-custodied identity, selective disclosure,
   zero-knowledge proofs, portable reputation, sovereignty health reporting, handshakes, MCP-to-MCP federation,
   protection-posture auditing, or principal dashboard approval. Bounds: these tools are the cooperative MCP
-  surface (Charter); operating-system egress enforcement is a separate arming step, live on macOS,
-  proven on Linux for Ubuntu 24.04 (x86-64) only with a separate package (not in this npm server), Windows roadmapped; every claim traces to the Assurance Matrix.
+  surface (Charter); operating-system egress enforcement is a separate arming step, proven on macOS for one host and one OS version,
+  proven on Linux for Ubuntu 24.04 (x86-64) only with a separate package (not in this npm server), Windows roadmapped; capability bounds are recorded in the Assurance Matrix.
   Triggers: sovereignty, encrypted state, identity, reputation, privacy, SHR, handshake, attestation,
   disclosure policy, zero-knowledge, federation, approval, dashboard, webhook, concordia, bridge, negotiation,
   audit, openclaw, sovereignty gap, security posture.
@@ -14,27 +14,40 @@ description: >
 
 # Sanctuary Framework
 
-Sanctuary gives your agent protection it can prove: encrypted state, self-custodied identity, selective disclosure, portable reputation, zero-knowledge proofs, federation, posture auditing, and a verifiable security posture. The tools in this skill are the Charter layer, the cooperative MCP surface. The Castle Wall (kernel-level egress enforcement) is armed separately and is live on macOS; on Linux it is proven for Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Every capability claim traces to a row in the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
+Sanctuary provides cooperative tools for encrypted state, self-custodied identity, selective disclosure, portable reputation, zero-knowledge proofs, federation, posture auditing, and signed posture assertions. The tools in this skill are the Charter layer, the cooperative MCP surface. The Castle Wall (kernel-level egress enforcement) is armed separately and is proven on macOS for one host and one OS version, proven on Linux for Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Capability bounds are recorded in the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
 
-## Install, verify, uninstall
+Software-test evidence and captured operational drills are distinct. Installed enforcement and containment remain partial or unproven unless the relevant matrix row cites a captured drill. An SHR signature authenticates the signer's posture assertions. It does not prove that OS enforcement is installed or armed.
+
+## Install and verify
 
 ```bash
 npx -y @sanctuary-framework/mcp-server@1.8.4 protect --claude-code --no-open --no-dashboard
 npx -y @sanctuary-framework/mcp-server@1.8.4 doctor --json
-npx -y @sanctuary-framework/mcp-server@1.8.4 uninstall
 ```
 
 `-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal.
 
-Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. With `protect`, the MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping). A plain `npx -y @sanctuary-framework/mcp-server@1.8.4` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. `uninstall` keeps keys, state, and the audit log; `protect --unwrap` restores the original harness configuration. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
+Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. With `protect`, the MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping). A plain `npx -y @sanctuary-framework/mcp-server@1.8.4` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
+
+## Uninstall
+
+Run this only to remove Sanctuary on purpose. It is not part of installation or verification.
+
+```bash
+npx -y @sanctuary-framework/mcp-server@1.8.4 uninstall
+```
+
+`uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `uninstall` does not restore the harness configuration; `sanctuary protect --unwrap` restores it from the backup. No Assurance Matrix row cites a captured install-and-removal drill, so what uninstall preserves and removes is unproven.
 
 ## Quick Start
 
-Get protected in three steps:
+Inspect cooperative posture and create an identity with the following steps. OS enforcement requires separate installation, arming, and verification.
+
+Use the exact names returned by MCP `tools/list`. The `sanctuary/` prefix throughout this skill is a possible client display namespace; it is not a universal wire prefix.
 
 1. **Audit your posture**: Run `sanctuary/sovereignty_audit` to see your current protection score, gaps, and prioritized recommendations.
 2. **Create your identity**: Run `sanctuary/identity_create` to establish a cryptographic Ed25519 identity. This is your agent's foundation for signing, verification, and non-repudiation.
-3. **Generate your SHR**: Run `sanctuary/shr_generate` to create your first Sovereignty Health Report, a signed, machine-readable proof of your protection capabilities.
+3. **Generate your SHR**: Run `sanctuary/shr_generate` to create your first Sovereignty Health Report, a signed, self-attested posture report. It does not independently prove runtime enforcement.
 
 ## OpenClaw Users
 
@@ -46,11 +59,11 @@ If you're running OpenClaw, Sanctuary adds protections that OpenClaw doesn't pro
 - Local agent execution
 
 **What Sanctuary adds on top:**
-- **Encrypted state**: Your `MEMORY.md`, daily notes, and `.env` secrets are plaintext in OpenClaw. Sanctuary encrypts agent state at rest with AES-256-GCM (Argon2id key derivation).
+- **Encrypted state**: Your `MEMORY.md`, daily notes, and `.env` secrets are plaintext in OpenClaw. Sanctuary encrypts state written into its encrypted stores at rest with AES-256-GCM (Argon2id key derivation).
 - **Cryptographic identity**: OpenClaw has no agent identity. Sanctuary gives your agent an Ed25519 keypair for signing, verification, and handshakes.
 - **Graduated approval**: OpenClaw's `requireApproval` is binary. Sanctuary's three-tier Principal Policy auto-allows routine ops (Tier 3), escalates anomalies (Tier 2), and requires human approval for irreversible ops (Tier 1).
 - **Selective disclosure**: Prove facts about your state without revealing it. SHA-256 + Pedersen commitments, Schnorr ZK proofs, range proofs.
-- **Portable reputation**: Signed EAS-compatible attestations that you own and can export through current paths, with full exit still partial until **IC-07, IC-08, IC-09** close.
+- **Portable reputation**: Signed EAS-compatible attestations that you own and can export through current paths, with complete exit portability still partial; see the Assurance Matrix (**IC-07, IC-08, IC-09**).
 
 **One-command setup:**
 
@@ -103,13 +116,13 @@ the destructive last resort.
 | `sanctuary/state_write` | Write encrypted state (AES-256-GCM, Merkle integrity) |
 | `sanctuary/state_read` | Read and decrypt state with integrity verification |
 | `sanctuary/state_list` | List keys in a namespace (metadata only) |
-| `sanctuary/state_delete` | Securely delete state (overwrite + unlink; Tier 1) |
+| `sanctuary/state_delete` | Delete encrypted state (best-effort overwrite and unlink; physical erasure unproven; Tier 1) |
 | `sanctuary/state_export` | Export all state as encrypted portable bundle (Tier 1) |
 | `sanctuary/state_import` | Import state bundle with conflict resolution (Tier 1) |
 | `sanctuary/shr_generate` | Generate signed, machine-readable Sovereignty Health Report |
 | `sanctuary/shr_verify` | Verify a counterparty's SHR |
 
-Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human. The operator's own policy file decides.
+Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human. Some tiers are configurable. Non-relaxable operations, including raw signing and sensitive disclosure, remain Tier 1 even in an operator-authored policy.
 
 **First use:**
 1. `sanctuary/identity_create`: create your primary identity
@@ -155,18 +168,18 @@ Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, 
 ### Build Portable Reputation
 | Tool | Purpose |
 |------|---------|
-| `sanctuary/reputation_record` | Record signed interaction attestation (posture-weighted) |
+| `sanctuary/reputation_record` | Record signed interaction attestation (weighted by the signer's verification tier; self-attested and unverified signers are capped) |
 | `sanctuary/reputation_query` | Query reputation with filters |
-| `sanctuary/reputation_query_weighted` | Query reputation with posture-tier weighting |
+| `sanctuary/reputation_query_weighted` | Query weighted reputation |
 | `sanctuary/reputation_export` | Export reputation as portable bundle (Tier 1) |
 | `sanctuary/reputation_import` | Import reputation bundle (verify signatures; Tier 1) |
-| `sanctuary/reputation_publish` | Publish a signed sovereignty report to Verascore (the report leaves this machine; always Tier 1 from 1.9.0, auto-allowed by default before 1.9.0) |
+| `sanctuary/reputation_publish` | Publish a signed sovereignty report to Verascore (the report leaves this machine; call it only on explicit operator instruction) |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
 | `sanctuary/bootstrap_provide_guarantee` | Principal guarantee certificate (Tier 1) |
 
 **Building portable reputation:**
 1. After each interaction, `sanctuary/reputation_record`: create a signed attestation
-2. Use `sanctuary/reputation_query_weighted`: see scores weighted by posture tier
+2. Use `sanctuary/reputation_query_weighted`: see weighted scores
 3. Periodically `sanctuary/reputation_export`: bundle your reputation
 4. On a new platform, `sanctuary/reputation_import`: bring your track record with you
 
@@ -195,16 +208,16 @@ Enable webhook approvals (`webhook.enabled: true`, `webhook.url`, `webhook.secre
 
 ## Architecture
 
-Sanctuary ships as five named mechanisms: **Castle Wall** (the perimeter: OS-level egress enforcement), **Sentinels** (observation, not enforcement), **Charter** (the cooperative MCP surface this skill uses), **Heralds** (recognition by other sovereigns: Concordia receipts and Verascore reputation, both optional), and **Mantle** (install-time binding of the fortress to the operator's machine).
+Sanctuary ships as five named mechanisms: **Castle Wall** (the perimeter: OS-level egress enforcement), **Sentinels** (observation, not enforcement), **Charter** (the cooperative MCP surface this skill uses), **Heralds** (recognition by other sovereigns: Concordia receipts and Verascore reputation, both optional), and **Mantle** (installation binding; no Assurance Matrix row covers it and confinement to one machine is not claimed).
 
 Within Charter, the tools are grouped in four capability surfaces:
 
 - **Cognitive Sovereignty:** Encrypted state, self-custodied keys, Merkle integrity, Ed25519 identity
 - **Operational Isolation:** Three-tier approval gate, behavioral anomaly detection, encrypted audit trail
 - **Selective Disclosure:** Commitment-based proofs, zero-knowledge proofs (Pedersen/Ristretto255/Schnorr), disclosure policies
-- **Verifiable Reputation:** Signed attestations (posture-weighted), portable reputation, trust bootstrapping, handshakes, MCP-to-MCP federation
+- **Verifiable Reputation:** Signed attestations, portable reputation, trust bootstrapping, handshakes, MCP-to-MCP federation
 
-Beneath the cooperative surface, on macOS, the Castle Wall enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, so the perimeter holds even when an agent is prompt-injected or disobedient; that proof is one host and one OS version, not an audited per-rule, per-flow trail. On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. See the [repository README](https://github.com/eriknewton/sanctuary-framework#readme) for the current per-platform enforcement status and its proven bounds.
+Beneath the cooperative surface, on macOS, the Castle Wall enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, so the allow/deny decision is made below the agent rather than by it; that proof is one host and one OS version, not an audited per-rule, per-flow trail. On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. See the [repository README](https://github.com/eriknewton/sanctuary-framework#readme) for the current per-platform enforcement status and its proven bounds.
 
 User state under `~/.sanctuary/state/` is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. Operator policy and harness backup configs can be plaintext, so plaintext claims must stay scoped to user state.
 
