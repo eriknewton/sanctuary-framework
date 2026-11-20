@@ -50,7 +50,9 @@ impl BusinessDeliveryHandle {
         )
     }
     pub(crate) fn connect(&self) -> Result<BusinessSession> {
-        let mut state = self.state.try_lock().map_err(|_| Refusal::Held)?;
+        // Must match BusinessDelivery::pump's error contract: connections wait for the writer's
+        // short, I/O-free section; contention must not become a wire refusal. Writer admission stays non-blocking.
+        let mut state = self.state.lock().map_err(|_| Refusal::Held)?;
         // A timeout is not ownership transfer; only the previous connection's drop releases this slot.
         if state.owner.is_some() {
             return Err(Refusal::Held);
@@ -78,6 +80,9 @@ impl BusinessDelivery {
     ///
     /// Error contract for the driver: `Held`, `Deadline` and `Conflict` are retryable on a
     /// later pump, because none consumes the retained fact, the offer or the actor's token.
+    /// Must match BusinessDeliveryHandle::connect and BusinessSession::{offer, acknowledge}:
+    /// connections wait for short, I/O-free sections, while writer offer, poll and retirement
+    /// use try_lock so contention remains a later-pump retry instead of a wire refusal.
     /// `Conflict` reports a refused ACK: the adapter's wait stays pending and the sink latch
     /// is released, so only a later correlated ACK on the same wait can supply the one fact.
     /// If that release finds the lock poisoned, `Held` replaces `Conflict` and the latch stays
@@ -165,22 +170,28 @@ impl PolledBusinessSink for NativeSink {
 pub(crate) struct BusinessSession {
     state: Arc<Mutex<DeliveryState>>,
     owner: u64,
-    served: Option<Value>,
+    served: Option<(Value, Vec<u8>)>,
 }
 impl BusinessSession {
     pub(crate) fn offer(&mut self) -> Result<Option<BusinessDrainEvent>> {
-        let state = self.state.try_lock().map_err(|_| Refusal::Held)?;
-        if state.owner != Some(self.owner) {
-            return Err(Refusal::Authority);
-        }
-        let Some(envelope) = &state.envelope else {
-            return Ok(None);
+        let envelope = {
+            // Must match BusinessDelivery::pump's error contract: connections wait for the writer's
+            // short, I/O-free section; contention must not become a wire refusal. Writer admission stays non-blocking.
+            let state = self.state.lock().map_err(|_| Refusal::Held)?;
+            if state.owner != Some(self.owner) {
+                return Err(Refusal::Authority);
+            }
+            let Some(envelope) = &state.envelope else {
+                return Ok(None);
+            };
+            if state.fact_issued {
+                return Ok(None);
+            }
+            // Identity and JCS reach lazy constants; only the bounded envelope copy belongs under this lock.
+            envelope.clone()
         };
-        if state.fact_issued {
-            return Ok(None);
-        }
-        let identity = append_contract::identity(envelope).ok_or(Refusal::Shape)?;
-        let record: Value = serde_json::from_slice(envelope).map_err(|_| Refusal::Shape)?;
+        let identity = append_contract::identity(&envelope).ok_or(Refusal::Shape)?;
+        let record: Value = serde_json::from_slice(&envelope).map_err(|_| Refusal::Shape)?;
         let body = &record["body"];
         let event = BusinessDrainEvent {
             seq: identity["sequence"].as_u64().ok_or(Refusal::Shape)?,
@@ -191,25 +202,30 @@ impl BusinessSession {
                 .map(str::to_string),
             event_canonical_json: crate::smb::jcs::encode(body).map_err(|_| Refusal::Shape)?,
             critical: true,
-            business_envelope: URL_SAFE_NO_PAD.encode(envelope),
+            business_envelope: URL_SAFE_NO_PAD.encode(&envelope),
             producer_signature_b64url: None,
             producer_key_id: None,
         };
-        self.served = Some(identity);
+        // Must match acknowledge: the served identity binds these exact bytes, so correlation needs no parsing under the lock.
+        self.served = Some((identity, envelope));
         Ok(Some(event))
     }
     pub(crate) fn acknowledge(&mut self, ack: &Value) -> Result<()> {
-        let mut state = self.state.try_lock().map_err(|_| Refusal::Held)?;
+        // Shared shape validation may initialize schema constants; it must finish before taking the delivery lock.
+        let shape_valid = append_contract::shape("ack", ack);
+        // Must match BusinessDelivery::pump's error contract: connections wait for the writer's
+        // short, I/O-free section; contention must not become a wire refusal. Writer admission stays non-blocking.
+        let mut state = self.state.lock().map_err(|_| Refusal::Held)?;
         // Correlation alone grants nothing: this session passed the shared UID/key gate and owns the offered token.
+        // Must match offer: exact served bytes preserve identity correlation without lazy decoding inside the critical section.
         if state.owner != Some(self.owner)
-            || !append_contract::shape("ack", ack)
-            || self.served.as_ref() != Some(&ack["identity"])
-            || state
-                .envelope
-                .as_deref()
-                .and_then(append_contract::identity)
-                .as_ref()
-                != Some(&ack["identity"])
+            || !shape_valid
+            || self.served.as_ref().map(|(identity, _)| identity) != Some(&ack["identity"])
+            || state.envelope.as_deref()
+                != self
+                    .served
+                    .as_ref()
+                    .map(|(_, envelope)| envelope.as_slice())
         {
             return Err(Refusal::Authority);
         }
@@ -233,6 +249,232 @@ impl Drop for BusinessSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::Barrier,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    // 200 ms spans many scheduler slices while keeping each delayed handoff below a second.
+    const HOLD_INTERVAL: Duration = Duration::from_millis(200);
+    // A non-blocking writer spends less than one tenth of the holder's interval.
+    const WRITER_RETURN_BUDGET: Duration =
+        Duration::from_millis(HOLD_INTERVAL.as_millis() as u64 / 10);
+    // The holder and the calling thread are the two participants in each handoff.
+    const HANDOFF_PARTICIPANTS: usize = 2;
+
+    fn envelope_fixture() -> Vec<u8> {
+        let vectors: Value =
+            serde_json::from_str(include_str!("record_join_vectors.json")).unwrap();
+        crate::smb::jcs::encode(&vectors["cases"][0]["records"][0])
+            .unwrap()
+            .into_bytes()
+    }
+
+    fn while_held<T>(state: &Arc<Mutex<DeliveryState>>, call: impl FnOnce() -> T) -> T {
+        let ready = Barrier::new(HANDOFF_PARTICIPANTS);
+        thread::scope(|scope| {
+            let ready = &ready;
+            let holder = scope.spawn(move || {
+                let _guard = state.lock().unwrap();
+                ready.wait();
+                thread::sleep(HOLD_INTERVAL);
+            });
+            ready.wait();
+            let result = call();
+            holder.join().unwrap();
+            result
+        })
+    }
+
+    fn poison(state: &Arc<Mutex<DeliveryState>>) {
+        thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = state.lock().unwrap();
+                    panic!("delivery state unavailable");
+                })
+                .join()
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn connection_connect_waits_for_writer() {
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        let session = while_held(&handle.state, || handle.connect()).unwrap();
+        assert_eq!(handle.state.lock().unwrap().owner, Some(session.owner));
+    }
+
+    #[test]
+    fn connection_offer_waits_for_writer() {
+        let envelope = envelope_fixture();
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        NativeSink(handle.state.clone()).offer(&envelope).unwrap();
+        let mut session = handle.connect().unwrap();
+        let event = while_held(&handle.state, || session.offer())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(event.business_envelope).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn connection_acknowledge_waits_for_writer() {
+        let envelope = envelope_fixture();
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        let mut native = NativeSink(handle.state.clone());
+        native.offer(&envelope).unwrap();
+        let mut session = handle.connect().unwrap();
+        session.offer().unwrap().unwrap();
+        let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
+        assert_eq!(
+            while_held(&handle.state, || session.acknowledge(&ack)),
+            Ok(())
+        );
+        assert_eq!(native.poll().unwrap(), Some(ack));
+        assert_eq!(native.poll().unwrap(), None);
+    }
+
+    #[test]
+    fn connection_connect_poison_returns_held() {
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        poison(&handle.state);
+        assert!(matches!(handle.connect(), Err(Refusal::Held)));
+    }
+
+    #[test]
+    fn connection_offer_poison_returns_held() {
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        let mut session = handle.connect().unwrap();
+        poison(&handle.state);
+        assert!(matches!(session.offer(), Err(Refusal::Held)));
+    }
+
+    #[test]
+    fn connection_acknowledge_poison_returns_held() {
+        let envelope = envelope_fixture();
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        NativeSink(handle.state.clone()).offer(&envelope).unwrap();
+        let mut session = handle.connect().unwrap();
+        session.offer().unwrap().unwrap();
+        let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
+        poison(&handle.state);
+        assert_eq!(session.acknowledge(&ack), Err(Refusal::Held));
+    }
+
+    #[test]
+    fn connection_acknowledge_requires_current_served_envelope() {
+        let envelope = envelope_fixture();
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        let mut native = NativeSink(handle.state.clone());
+        native.offer(&envelope).unwrap();
+        let mut session = handle.connect().unwrap();
+        session.offer().unwrap().unwrap();
+        let ack = serde_json::json!({"version":1,"identity":append_contract::identity(&envelope).unwrap()});
+        // A retired offer cannot authorize its replacement, even on the same connection.
+        handle.state.lock().unwrap().fact_issued = true;
+        native.offer(b"{}").unwrap();
+        assert_eq!(session.acknowledge(&ack), Err(Refusal::Authority));
+        assert_eq!(native.poll().unwrap(), None);
+    }
+
+    #[test]
+    fn writer_poll_and_offer_return_held_without_waiting() {
+        let (_, handle) = BusinessDeliveryHandle::channel();
+        let mut native = NativeSink(handle.state.clone());
+        let (poll, offer, elapsed) = while_held(&handle.state, || {
+            let start = Instant::now();
+            let poll = native.poll();
+            let offer = native.offer(b"{}");
+            (poll, offer, start.elapsed())
+        });
+        assert_eq!(poll, Err(Refusal::Held));
+        assert_eq!(offer, Err(Refusal::Held));
+        assert!(
+            elapsed < WRITER_RETURN_BUDGET,
+            "writer elapsed: {elapsed:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_pump_returns_held_without_waiting() {
+        use crate::business_profile::{
+            append_actor::{Dependencies, EvidenceSource, LocalEvidence},
+            append_clients::{ClientHooks, DrainClient, HeldSocketRoot, ServerPins, WriterClient},
+            effect_permit::{EffectPermit, EffectSink},
+            signer_peer::{self, PeerPolicy},
+            wal_executor::WalExecutor,
+            writer_peer::Clock,
+        };
+        use sha2::{Digest, Sha256};
+        use std::fs::{self, File};
+
+        struct Unused;
+        impl ClientHooks for Unused {
+            fn before_send(&mut self) -> crate::business_profile::append_clients::Result<()> {
+                panic!("retirement does not send peer requests")
+            }
+            fn closed(&mut self) {}
+        }
+        impl EvidenceSource for Unused {
+            fn observe(&mut self) -> Result<LocalEvidence> {
+                panic!("retirement does not request evidence")
+            }
+        }
+        impl EffectSink for Unused {
+            fn deliver(&mut self, _: EffectPermit) {
+                panic!("retirement does not deliver an effect")
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let _writer = signer_peer::listen(&directory.path().join("writer")).unwrap();
+        let _drain = signer_peer::listen(&directory.path().join("drain")).unwrap();
+        let policy = PeerPolicy {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            executable_sha256: hex::encode(Sha256::digest(fs::read("/proc/self/exe").unwrap())),
+            cgroup: fs::read_to_string("/proc/self/cgroup").unwrap(),
+        };
+        let root =
+            HeldSocketRoot::checked(File::open(directory.path()).unwrap(), policy.uid).unwrap();
+        let pins = || ServerPins {
+            writer: policy.clone(),
+            drain: policy.clone(),
+        };
+        let clock: Clock = Arc::new(|| Ok(0)); // The retirement path does not advance time.
+        let mut actor = AppendActor::new(Dependencies {
+            writer: WriterClient::connect(&root, "writer", pins(), clock.clone(), Box::new(Unused))
+                .unwrap(),
+            drain: DrainClient::connect(&root, "drain", pins(), clock.clone(), Box::new(Unused))
+                .unwrap(),
+            // Retirement reaches Held before submitting any store operation, so no WAL is opened.
+            store: WalExecutor::start().unwrap(),
+            clock,
+            evidence: Box::new(Unused),
+            sink: Box::new(Unused),
+            fortress: "0".repeat(crate::business_profile::activation_anchor::ID_HEX_LENGTH),
+            revision: 1, // The first valid configuration revision.
+        })
+        .unwrap();
+        let (mut delivery, handle) = BusinessDeliveryHandle::channel();
+        delivery.submitted = true;
+        let (result, elapsed) = while_held(&handle.state, || {
+            let start = Instant::now();
+            let result = delivery.pump(&mut actor);
+            (result, start.elapsed())
+        });
+        assert_eq!(result, Err(Refusal::Held));
+        assert!(
+            elapsed < WRITER_RETURN_BUDGET,
+            "writer elapsed: {elapsed:?}"
+        );
+        assert!(delivery.submitted, "retirement remains pending");
+    }
+
     #[test]
     fn connection_owner_reconnect_exact_replay_and_wrong_identity() {
         let vectors: Value =
