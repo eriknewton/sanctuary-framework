@@ -1218,7 +1218,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
    * document record its text was scored from, before any of them can reach the result. It writes nothing.
    */
   async recallPassages(budget: HermesRecallBudget): Promise<HermesRecallResult> {
-    // Continuing arm, inherited unchanged: no terms, or a budget already aborted or spent at entry, returns an empty
+    // Continuing arm: no terms, or a budget already aborted or spent at entry, returns an empty
     // result (truncated in the second case) having read no listing and no integrity state; it carries no passage.
     if (budget.terms.length === 0 || !budget.active()) return budget.result();
     const listed = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
@@ -1234,7 +1234,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       (ordinal, slot) => this.readRecallSlot(entries[ordinal]!.key, slot, budget, integrityState, statusHint));
     try {
       // The commit: every budget call, decision and heap offer happens here, one passage at a time in listing
-      // order, in the sequence the one-passage-at-a-time loop made them. The read-ahead only fetched bytes early.
+      // order, in the same sequence at every read-ahead window. The read-ahead only fetches bytes early.
       for (let ordinal = 0; ordinal < entries.length; ordinal++) {
         if (!budget.candidate()) break;
         ring.fill(ordinal, entries.length, () => budget.scanOpen());
@@ -1249,8 +1249,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         if (document === null || recallTimestamp(document.created_at) === null) continue;
         if (document.chunk_count > budget.limits.passageUnits) { budget.truncated = true; continue; }
         if (slot.screen === undefined) { budget.truncated = true; break; }
-        // Pre-screen before any chunk read: a passage recall skipped before this change still reads no chunks and
-        // spends no scanned units. The screen checks no signature, so it may only skip; a passage it passes still
+        // Pre-screen before any chunk read: a passage the screen skips reads no chunks and spends no scanned units. The screen checks no signature, so it may only skip; a passage it passes still
         // faces full verification before output.
         if (!slot.screen.ok) throw slot.screen.error;
         if (!budget.scanning()) break;
@@ -1260,7 +1259,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
           text = this.commitRecallText(document, budget, slot);
         } catch (error) {
           // A broken passage aborts recall only when its provenance verifies; one that fails verification is
-          // skipped, as the provenance check that used to run first would have skipped it. This full verification
+          // skipped, exactly as a verification run before the chunk reads would skip it. This full verification
           // runs in the commit, not the read-ahead, and is bounded by the passages the scan reaches, not by
           // RECALL_VERIFY_CANDIDATES. Continuing arm: a passage it skips reaches no output and writes nothing.
           if (await this.recallProvenance(document, integrityState, "verify") === "skip") continue;
@@ -2406,7 +2405,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const provenanceRead = settleRecallRead(() => this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceKey(documentId)));
     const rawDocument = await documentRead;
     const rawProvenance = await provenanceRead;
-    // Interpreted in the sequential loop's decision order: the document first, then the screen's provenance.
+    // Interpreted in the commit's decision order: the document first, then the screen's provenance.
     if (!rawDocument.ok) { slot.document = rawDocument; return; }
     slot.document = rawDocument.value === null ? { ok: true, value: null }
       : heldRecallValue(() => this.corpus.decodeDocument(documentId, rawDocument.value!));
@@ -2453,7 +2452,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     }
   }
 
-  /** The sequential loop's per-chunk accounting, replayed in order over the chunk reads the read-ahead made. */
+  /** The commit's per-chunk accounting, replayed in order over the chunk reads the read-ahead made. */
   private commitRecallText(document: SdwDocumentRecord, budget: HermesRecallBudget, slot: RecallReadAheadResult): string | null {
     const parts: string[] = [];
     let units = 0;

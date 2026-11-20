@@ -135,8 +135,8 @@ describe("continuing arms of the read-ahead recall, each with the evidence it ch
     expect(counts()).toEqual({ integrityReads: 0, listings: 0 });
   });
 
-  it.each(["aborted", "expired"] as const)("a budget already %s at entry answers empty and truncated, as inherited, reading no integrity state", async kind => {
-    // Inherited early return: it checks the budget only; it reads neither the listing nor the integrity state, so it
+  it.each(["aborted", "expired"] as const)("a budget already %s at entry answers empty and truncated, reading no integrity state", async kind => {
+    // The early return checks the budget only; it reads neither the listing nor the integrity state, so it
     // answers even when the state would refuse a scan. It returns no passage.
     const { f, counts } = await counted([seed("a")], "state_MARKER_ABSENT_POST_COMPLETE");
     const abort = new AbortController();

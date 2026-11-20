@@ -1,5 +1,5 @@
 // Shared fixture for the score-first recall tests: an instrumented in-memory store, every seed kind the
-// equivalence test needs, the verify-everything reference loop recall used before it scored first, and an
+// equivalence test needs, a verify-every-passage-first reference loop the score-first answer must match, and an
 // independent oracle computed from the seeds alone.
 import { ed25519 } from "@noble/curves/ed25519";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
@@ -220,16 +220,16 @@ interface ReferenceInternals {
 }
 
 /**
- * The verify-everything loop recall ran before it scored first, kept as the equivalence reference.
- * It reaches the adapter's unchanged private provenance methods; like the original it quarantines (writes),
- * so a test runs it after the write-free loop it is compared with.
+ * The verify-every-passage-first loop, the equivalence reference recall's score-first answer must match.
+ * It reaches the adapter's private provenance methods and, like memory_get, quarantines (writes), so a test
+ * runs it after the write-free loop it is compared with.
  */
 export async function referenceRecall(adapter: SdwMemoryBackendAdapter, budget: HermesRecallBudget): Promise<HermesRecallResult> {
   const self = adapter as unknown as ReferenceInternals;
   if (budget.terms.length === 0 || !budget.active()) return budget.result();
   const entries = await self.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, self.documentKeyPrefix.call(adapter));
   for (const entry of entries) {
-    // The original candidate check: the full wall, then the candidate cap.
+    // The reference candidate check: the full wall, then the candidate cap.
     if (!budget.active()) break;
     if (budget.candidatesScanned === budget.limits.candidates) { budget.truncated = true; break; }
     budget.candidatesScanned++;

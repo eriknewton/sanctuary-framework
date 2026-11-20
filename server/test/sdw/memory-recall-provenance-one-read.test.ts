@@ -36,12 +36,12 @@ describe.each(RECALL_TEST_WINDOWS)("read-ahead window %i", readAhead => {
     });
   });
 
-  describe("a provenance file replaced between the two reads round 1 made", () => {
+  describe("a provenance file replaced after the screen has read it", () => {
     // Two matching passages: the target outranks the other, so the target's fate decides the first passage returned.
     const target: Seed = { kind: "valid", passageId: "target", createdAt: NOW, text: "alpha alpha bravo" };
     const other: Seed = { kind: "valid", passageId: "other", createdAt: NOW, text: "alpha" };
     const seeds = [...corpus(target), other];
-    /** Replaces the target's provenance with an undecodable file, or restores it, just before its second read. */
+    /** Replaces the target's provenance with an undecodable file, or restores it, after the screen's one read of it. */
     function replaceAtSecondRead(f: Awaited<ReturnType<typeof seeded>>, to: "undecodable" | "decodable") {
       const key = documentProvenanceKey(f.f.documentIdOf(target.passageId));
       f.f.storage.beforeRead = readKey => {
@@ -57,8 +57,8 @@ describe.each(RECALL_TEST_WINDOWS)("read-ahead window %i", readAhead => {
       const run = await seeded(seeds);
       replaceAtSecondRead(run, "undecodable");
       const result = await run.f.adapter.recallPassages(run.f.budget("alpha"));
-      // The screen decoded the version it hashed, so the target was scored (its chunk was read). Round 1 decoded the
-      // replaced file at its second read and skipped the target in the screen, before any chunk read.
+      // The screen judges the one version it read and hashed, so the target passed the screen and was scored (its
+      // chunk was read); a replacement made after that read cannot change the screen's decision.
       expect(chunkReadsOf(run)).toBe(1);
       // The verification phase reads the file afresh and refuses the replaced version, so nothing unverified escapes.
       expect(result).toEqual(oracleRecall([...seeds.filter(seed => seed !== target), { ...target, kind: "undecodable-provenance" }],
@@ -73,8 +73,8 @@ describe.each(RECALL_TEST_WINDOWS)("read-ahead window %i", readAhead => {
       run.f.storage.corrupt.add(documentProvenanceKey(run.f.documentIdOf(target.passageId)));
       replaceAtSecondRead(run, "decodable");
       const result = await run.f.adapter.recallPassages(run.f.budget("alpha"));
-      // The screen skipped the target on the version it read; round 1 hashed that version but decoded the
-      // replacement, passed the target and returned it.
+      // The screen skips the target on the one version it read and hashed, so a replacement made after that read
+      // cannot pass the target into the result.
       expect(result.passages.map(passage => passage.passage_id)).toEqual(["other"]);
       expect(chunkReadsOf(run)).toBe(0);
       const asRead = await seeded(seeds);

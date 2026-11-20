@@ -85,7 +85,7 @@ describe("row 1: the commit makes the same budget calls in the same order at eve
 
 describe("row 2: random completion order equals the one-passage-at-a-time result", () => {
   it.each(Array.from({ length: SEEDS }, (_, seed) => seed))("seed %i", async seed => {
-    // Odd seeds put an aborting passage past the candidate cap, where the one-at-a-time loop never reads it.
+    // Odd seeds put an aborting passage past the candidate cap, where a window of 1 never reads it.
     const abortingAt = seed % 2 === 1 ? PASSAGES - 1 : seed % 4 === 2 ? Math.floor(PASSAGES / 2) : undefined;
     const tighten = seed % 2 === 1 ? { candidates: PASSAGES - 2 } : {};
     const seeds = corpus(seed, abortingAt);
