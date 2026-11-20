@@ -9,6 +9,8 @@ import { KeyOrderMemoryStorage } from "../sdw/recall-score-first-fixture.js";
 import { TestSdwMemoryBackendAdapter } from "../sdw/test-memory-backend.js";
 
 export const CREATED = "2026-11-01T00:00:00.000Z";
+export const BRIDGE_MASTER_KEY = new Uint8Array(32).fill(29);
+export const BRIDGE_FORTRESS = "read-ahead-bridge";
 /** How one read behaves: parked until released, rejected, delayed by event-loop turns, or passed through. */
 export type ReadRule = "park" | "reject" | "park-then-reject" | { readonly turns: number } | undefined;
 
@@ -23,6 +25,8 @@ export class ScheduledStorage extends KeyOrderMemoryStorage {
   readonly parked: { readonly key: string; readonly tag: number; readonly release: () => void }[] = [];
   /** Tag stamped on reads parked from now on, so one call's parked reads can be released apart from another's. */
   tag = 0;
+  /** Bytes served for a key in place of the stored ones, as a file replaced on disk reads back; the write gate refuses writing them. */
+  readonly planted = new Map<string, Uint8Array>();
   override async write(...args: Parameters<MemoryStorage["write"]>) { this.writes++; return super.write(...args); }
   override async writeIfAbsent(...args: Parameters<MemoryStorage["writeIfAbsent"]>) { this.writes++; return super.writeIfAbsent(...args); }
   override async replaceIfEquals(...args: Parameters<MemoryStorage["replaceIfEquals"]>) { this.writes++; return super.replaceIfEquals(...args); }
@@ -39,7 +43,7 @@ export class ScheduledStorage extends KeyOrderMemoryStorage {
         for (let turn = rule.turns; turn > 0; turn--) await nextTurn();
       }
       if (rule === "reject" || rule === "park-then-reject") throw new Error("scheduled read failure");
-      return await super.read(namespace, key);
+      return this.planted.get(key)?.slice() ?? await super.read(namespace, key);
     } finally {
       this.inFlight--;
       this.settled++;
@@ -79,7 +83,7 @@ export async function quiesce(turns = 25): Promise<void> {
 
 export async function recallBridge(passages: readonly { readonly id: string; readonly text: string }[]) {
   const storage = new ScheduledStorage();
-  const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey: new Uint8Array(32).fill(29), fortressId: "read-ahead-bridge",
+  const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey: BRIDGE_MASTER_KEY, fortressId: BRIDGE_FORTRESS,
     ownerRef: "agent", now: () => CREATED });
   for (const passage of passages) await adapter.insertPassage({ passage_id: passage.id, text: passage.text }, "user_content");
   storage.resetCounts();

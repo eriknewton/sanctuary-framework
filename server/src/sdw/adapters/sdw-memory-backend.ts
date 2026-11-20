@@ -1217,6 +1217,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         const slot = await ring.take(ordinal);
         // A passage the read-ahead stopped short of is never decided as if it had been read: the scan ends truncated.
         if (slot === undefined) { budget.truncated = true; break; }
+        if (slot.failed !== undefined) throw slot.failed.error;
         // Errors held by the read-ahead are raised here, at this passage's turn, in the order its reads were decided.
         if (!slot.document.ok) throw slot.document.error;
         const document = slot.document.value;
@@ -2402,9 +2403,11 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       // The read-ahead stops where the commit's scanning() would, and past one passage's unit cap, so per slot it
       // reads at most one chunk beyond what the commit accounts for.
       if (!budget.scanOpen()) return;
-      const read = await settleRecallRead(() => this.corpus.getChunk(document.document_id, ordinal, chunkId(ordinal)));
+      // The chunk's text is interpreted inside the settled read, so a malformed record is this slot's held refusal,
+      // raised at the passage's turn like an unreadable chunk, and never a rejection that skips the other slots' drain.
+      const read = await settleRecallRead(async () => recallChunkText(await this.corpus.getChunk(document.document_id, ordinal, chunkId(ordinal))));
       if (!read.ok || read.value === null) { slot.chunks.push(read.ok ? { ok: true, value: null } : read); return; }
-      const length = read.value.text.length;
+      const length = read.value.length;
       units += length;
       if (units > budget.limits.passageUnits) {
         // Retained state (ruling B2): past the per-passage cap the commit needs only the lengths, never the text, so
@@ -2415,7 +2418,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         slot.textReleased = true;
         return;
       }
-      slot.chunks.push({ ok: true, value: { length, text: read.value.text } });
+      slot.chunks.push({ ok: true, value: { length, text: read.value } });
     }
   }
 
@@ -2663,10 +2666,19 @@ export interface RecallReadAheadResult {
   readonly chunks: RecallHeld<{ readonly length: number; text: string | null } | null>[];
   /** Set once the chunks' summed length passed passageUnits and every text was dropped. */
   textReleased: boolean;
+  /** An error the slot raised outside its per-read holds; the commit raises it at this passage's turn. */
+  failed?: { readonly ok: false; readonly error: unknown };
 }
 interface RecallReadAheadSlot extends RecallReadAheadResult {
   /** Resolves when every read the slot issued has settled; never rejects. */
   settled?: Promise<void>;
+}
+
+/** A chunk record's text, or null for a missing chunk; a record whose text is not a string is refused, not read. */
+function recallChunkText(chunk: SdwDocumentChunkRecord | null): string | null {
+  if (chunk === null) return null;
+  if (typeof chunk.text !== "string") throw new SdwValidationError("identity_mismatch", "SDW memory passage chunk is malformed");
+  return chunk.text;
 }
 
 /** Runs one read and settles it: never rejects, so awaiting the result always means the read is finished. */
@@ -2698,7 +2710,9 @@ export class RecallReadAheadRing {
       // The commit takes passages in order, so the slot window passages back has already been taken and released.
       if (this.cells[index] !== undefined) throw new Error("SDW memory recall read-ahead ring slot still held");
       const slot: RecallReadAheadSlot = { document: { ok: true, value: null }, chunks: [], textReleased: false };
-      slot.settled = this.read(this.launched, slot);
+      // The rejection handler attaches as the slot is issued, so settled never rejects: a take() or drain() that
+      // awaits it always waits for the slot's reads, whatever this or any other slot raised.
+      slot.settled = this.read(this.launched, slot).catch((error: unknown) => { slot.failed = { ok: false, error }; });
       this.cells[index] = slot;
       this.launched++;
     }
@@ -2714,7 +2728,8 @@ export class RecallReadAheadRing {
   }
   /** Wait until every read of every slot still held has settled. */
   async drain(): Promise<void> {
-    for (const slot of this.cells) if (slot !== undefined) await slot.settled;
+    // allSettled, not a loop of awaits: no slot's outcome can end the drain before every other held slot settles.
+    await Promise.allSettled(this.cells.map(slot => slot?.settled));
   }
   /** Slots launched and not yet released by the commit. */
   get retainedSlots(): number {
