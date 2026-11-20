@@ -6,7 +6,7 @@ import { basename, isAbsolute, join } from "node:path";
 // Must match the allocations in selector-roots-isolation.ts and private-tmpdir.ts;
 // shared constants keep the run teardown's allowlist identical to the creators'.
 export const SELECTOR_ROOT_PREFIX = "k1-selector-worker-";
-// The socket-path budget reserves 26 bytes for the separator, prefix and mkdtemp suffix.
+// Socket-path reserve: 26 bytes = 1 separator + 19 ASCII bytes in PRIVATE_ROOT_PREFIX + 6 mkdtemp suffix bytes.
 // Must match the 26-byte figure beside SHORT_SOCKET_TMP_PARENT in
 // test/castle-wall/runtime/enforcement-availability.test.ts.
 export const PRIVATE_ROOT_PREFIX = "sanctuary-test-tmp-";
