@@ -1,5 +1,6 @@
 // The bridge process composition reaches score-first recall: a one-match recall over the production adapter
-// verifies one companion, not one per saved passage. Temporary fortress, injected in-memory keychain, no child process.
+// verifies one companion, not one per saved passage, and reads several passages at once at the default read-ahead
+// window. Temporary fortress, injected in-memory keychain, no child process.
 import { Buffer } from "node:buffer";
 import { chmod, mkdtemp, mkdir, rm } from "node:fs/promises";
 import net from "node:net";
@@ -13,6 +14,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { PrivateFrameDecoder, encodePrivateFrame, runHermesBridgeProcess } from "../../src/hermes-memory-bridge/index.js";
+import { RECALL_READ_AHEAD_PASSAGES } from "../../src/hermes-memory-bridge/recall.js";
 import { HermesMemoryClient, type ClientPorts } from "../../src/hermes-memory-client/client.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { memoryProvenancePublicKeyFingerprint } from "../../src/sdw/memory-provenance-bad-signers.js";
@@ -96,8 +98,33 @@ it("reaches score-first recall through the bridge process composition", async ()
     }
     verifications.mockClear();
     recalls.mockClear();
+    // Count, on the real file store, the distinct passages with a read in flight at once; two reads of one passage
+    // (its document and provenance, issued together) count once.
+    const passageOf = (key: string) => /^(?:doc|prov|prov-status|chunk)\.(mem\.[^.]+\.[^.]+)(?:\.|$)/.exec(key)?.[1];
+    const inFlight = new Map<string, number>();
+    let maximumDistinct = 0;
+    const read = FilesystemStorage.prototype.read;
+    vi.spyOn(FilesystemStorage.prototype, "read").mockImplementation(async function (this: FilesystemStorage, namespace, key) {
+      const passage = passageOf(key);
+      if (passage !== undefined) {
+        inFlight.set(passage, (inFlight.get(passage) ?? 0) + 1);
+        maximumDistinct = Math.max(maximumDistinct, inFlight.size);
+      }
+      try {
+        return await read.call(this, namespace, key);
+      } finally {
+        if (passage !== undefined) {
+          const left = inFlight.get(passage)! - 1;
+          if (left === 0) inFlight.delete(passage); else inFlight.set(passage, left);
+        }
+      }
+    });
     const recalled = await call("memory_recall", { query: "when is the handover?" });
     expect(recalled).toMatchObject({ outcome: "recalled", truncated: false, passages: [{ passage_id: target }] });
+    // The read-ahead is live in the shipped graph: more than one passage had a read in flight at the same time.
+    expect(maximumDistinct).toBeGreaterThan(1);
+    expect(maximumDistinct).toBeLessThanOrEqual(RECALL_READ_AHEAD_PASSAGES);
+    expect(inFlight.size).toBe(0);
     expect(recalls).toHaveBeenCalledTimes(1);
     expect(recalls.mock.contexts[0]).toBeInstanceOf(SdwMemoryBackendAdapter);
     expect((recalls.mock.contexts[0] as SdwMemoryBackendAdapter).mode).toBe("hermes-bridge");
