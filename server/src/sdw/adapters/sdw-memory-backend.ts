@@ -2398,7 +2398,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       units += length;
       if (units > budget.limits.passageUnits) {
         // Retained state (ruling B2): past the per-passage cap the commit needs only the lengths, never the text, so
-        // the slot drops every text it holds at once and retains at most passageUnits text units at any time.
+        // the slot drops every text it holds at once and retains at most passageUnits text units at any time. Must
+        // match RECALL_READ_AHEAD_RETAINED_TEXT_UNITS in hermes-memory-bridge/recall.ts, the per-call bound this gives.
         slot.chunks.push({ ok: true, value: { length, text: null } });
         for (const held of slot.chunks) if (held.ok && held.value !== null) held.value.text = null;
         slot.textReleased = true;
