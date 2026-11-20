@@ -394,12 +394,21 @@ export class SdwDocumentCorpusStore {
     const storageKey = documentProvenanceKey(documentId);
     const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
     if (raw === null) return null;
-    const record = decodeSdwRecord<SdwMemoryProvenanceRecord>(raw, {
+    return { raw, record: this.decodeProvenance(documentId, raw) };
+  }
+
+  /**
+   * Decodes provenance bytes the caller already read from this document's provenance key, with exactly the
+   * options {@link getProvenanceRaw} applies (namespace, storage key, fortress id, encryption key, expected kind
+   * and the document identity check), so a caller that hashed those bytes decodes the same version it hashed.
+   */
+  decodeProvenance(documentId: string, raw: Uint8Array): SdwMemoryProvenanceRecord {
+    const storageKey = documentProvenanceKey(documentId);
+    return decodeSdwRecord<SdwMemoryProvenanceRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, fortressId: this.fortressId,
       encryptionKey: this.encryptionKey, expectedKind: "memory_provenance",
       verifyIdentity: (candidate) => candidate.document_id === documentId,
     });
-    return { raw, record };
   }
 
   async getProvenanceStatusRaw(documentId: string, txn?: SdwCorpusTxn): Promise<{ readonly raw: Uint8Array; readonly record: SdwMemoryProvenanceStatusRecord } | null> {

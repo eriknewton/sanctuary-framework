@@ -1,7 +1,7 @@
 // The real encrypted adapter bounds per-call scan work and retained context.
 import { expect, it } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { HermesRecallBudget, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
+import { HermesRecallBudget, RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
 import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 
 class CountingStorage extends MemoryStorage {
@@ -65,8 +65,8 @@ it("returns bounded partial context on abort and skips scanning with no terms", 
   expect(storage.chunkReads).toBe(0);
 });
 
-// Each exhausted budget preserves exactly the verified match retained before exhaustion.
-it.each(["candidates", "units", "wall", "abort"] as const)("retains known context before exhausting %s", async kind => {
+// Each exhausted scan budget preserves exactly the match ranked before exhaustion, verified inside the wall.
+it.each(["candidates", "units", "wall", "abort", "full wall"] as const)("retains known context before exhausting %s", async kind => {
   const storage = new CountingStorage();
   const created = "2026-11-01T00:00:00.000Z";
   const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey: new Uint8Array(32).fill(17),
@@ -77,15 +77,20 @@ it.each(["candidates", "units", "wall", "abort"] as const)("retains known contex
   const abort = new AbortController();
   storage.beforeRead = key => {
     if (key === "doc.mem.agent.b") {
-      if (kind === "wall") storage.now = RECALL_WALL_BUDGET_MS;
+      // The scan stops at the reserve; the reserved slice still verifies what was ranked.
+      if (kind === "wall") storage.now = RECALL_WALL_BUDGET_MS - RECALL_VERIFY_RESERVE_MS;
+      if (kind === "full wall") storage.now = RECALL_WALL_BUDGET_MS;
       if (kind === "abort") abort.abort();
     }
   };
   const budget = new HermesRecallBudget("board meeting", () => storage.now, abort.signal,
     kind === "candidates" ? { candidates: 1 } : kind === "units" ? { scannedUnits: text.length + 1 } : {});
   const result = await adapter.recallPassages(budget);
-  expect(result).toEqual({ outcome: "recalled", truncated: true,
-    passages: [{ passage_id: "a", created_at: created }], context: "- (saved 2026-11-01) board meeting\n" });
+  // Abort and the full wall stop verification too, so nothing ranked but unverified is returned.
+  expect(result).toEqual(kind === "abort" || kind === "full wall"
+    ? { outcome: "recalled", truncated: true, passages: [], context: "" }
+    : { outcome: "recalled", truncated: true,
+      passages: [{ passage_id: "a", created_at: created }], context: "- (saved 2026-11-01) board meeting\n" });
 });
 
 it.each(["abort", "wall"] as const)("checks %s before key listing", async kind => {

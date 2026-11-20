@@ -1,5 +1,5 @@
 import { SdwWorkingStateStore } from "../working-state-store.js";
-import { recallTimestamp, type HermesRecallBudget, type HermesRecallResult } from "../../hermes-memory-bridge/recall.js";
+import { HermesRecallCandidateHeap, recallTimestamp, type HermesRecallBudget, type HermesRecallResult } from "../../hermes-memory-bridge/recall.js";
 import { MAX_PUBLIC_FRAME_BYTES, MEMORY_CORPUS_SCAN_CAP } from "../../hermes-memory-bridge/constants.js";
 /**
  * SDW implementation of the memory-backend adapter contract.
@@ -1188,39 +1188,64 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return results.slice(0, limit);
   }
 
-  /** Recall shares search provenance checks while retaining only bounded, verified excerpts. */
+  /**
+   * Recall scores every screened passage first, then verifies only the best few, each against the same
+   * document record its text was scored from, before any of them can reach the result. It writes nothing.
+   */
   async recallPassages(budget: HermesRecallBudget): Promise<HermesRecallResult> {
     if (budget.terms.length === 0 || !budget.active()) return budget.result();
     const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
+    if (entries.length === 0) return budget.result();
+    // A tamper signal in the integrity state refuses every recall with something to scan, whatever the query
+    // matches; the end read below refuses a state that moved while this call ran.
+    const integrityState = await this.readRecallIntegrityState();
+    const statusHint = await this.recallStatusHint();
+    const heap = new HermesRecallCandidateHeap<SdwDocumentRecord>(budget);
     for (const entry of entries) {
       if (!budget.candidate()) break;
+      // The one decode of this record: its content hash checks the text, and verification binds the same record.
       const document = await this.corpus.getDocument(entry.key.slice("doc.".length));
-      if (!budget.active()) break;
+      if (!budget.scanning()) break;
       if (document === null || recallTimestamp(document.created_at) === null) continue;
       if (document.chunk_count > budget.limits.passageUnits) { budget.truncated = true; continue; }
-      const provenance = await this.verifyOrQuarantineProvenance(document);
-      if (!budget.active()) break;
-      if (provenance === "quarantined") continue;
-      await this.assertUnsignedCompatibilityAllowed(provenance);
-      const parts: string[] = [];
-      let units = 0;
-      let complete = true;
-      for (let ordinal = 0; ordinal < document.chunk_count; ordinal++) {
-        if (!budget.active()) { complete = false; break; }
-        const chunk = await this.corpus.getChunk(document.document_id, ordinal, chunkId(ordinal));
-        if (chunk === null) throw new SdwValidationError("passage_incomplete", "SDW memory passage chunk missing");
-        if (!budget.active() || !budget.scan(chunk.text.length)) { complete = false; break; }
-        units += chunk.text.length;
-        if (units > budget.limits.passageUnits) { budget.truncated = true; complete = false; break; }
-        parts.push(chunk.text);
+      // Pre-screen before any chunk read: a passage recall skipped before this change still reads no chunks and
+      // spends no scanned units. The screen checks no signature, so it may only skip; a passage it passes still
+      // faces full verification before output.
+      const screen = await this.recallProvenance(document, integrityState, "screen", statusHint);
+      if (!budget.scanning()) break;
+      if (screen === "skip") continue;
+      let text: string | null;
+      try {
+        text = await this.readRecallText(document, budget);
+      } catch (error) {
+        // A broken passage aborts recall only when its provenance verifies; one that fails verification is
+        // skipped, as the provenance check that used to run first would have skipped it.
+        if (await this.recallProvenance(document, integrityState, "verify") === "skip") continue;
+        throw error;
       }
       // Skipped text is never scored: a prefix has not established the stored full-content commitment.
-      if (!complete) continue;
-      const text = parts.join("");
-      if (passageContentHash(text) !== document.content_hash) {
-        throw new SdwValidationError("identity_mismatch", "SDW memory passage content hash mismatch");
-      }
-      budget.retain(this.toPassage(document, text, provenance));
+      if (text === null) continue;
+      // Text scored here is corpus-key-authenticated and matches its document's content hash, but carries no provenance and no credibility. The score only chooses which passages to verify. Nothing reaches the result, the audit row, a log or an error until `verifyCompanion` and signer eligibility pass for this same document record.
+      const candidate = budget.score({ passage_id: this.passageIdOf(document.document_id), created_at: document.created_at, text });
+      if (candidate !== null) heap.offer(candidate, document);
+    }
+    // Rank order: the first passages to verify are the ones verifying every passage would have returned.
+    while (budget.retainedCount < budget.limits.retained && budget.verifying()) {
+      const next = heap.take();
+      if (next === undefined) break;
+      const verified = await this.recallProvenance(next.bound, integrityState, "verify");
+      // An abort or the wall during verification returns only passages that had already verified.
+      if (!budget.verifying()) break;
+      if (verified === "pass") budget.admit(next.candidate);
+    }
+    if (heap.overflowed && budget.retainedCount < budget.limits.retained) budget.truncated = true;
+    // The start read already refused state_MARKER_ABSENT_POST_COMPLETE, so any difference covers it here too.
+    const endState = await this.resolveMemoryIntegrityState();
+    if (endState !== integrityState) {
+      throw new SdwValidationError(
+        "auth_failed",
+        "SDW memory integrity state changed during provenance verification",
+      );
     }
     return budget.result();
   }
@@ -1978,6 +2003,11 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return `doc.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
   }
 
+  // Must match documentProvenanceStatusKey in grammar.ts for this owner's document ids.
+  private documentProvenanceStatusKeyPrefix(): string {
+    return `prov-status.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
+  }
+
   private documentChunkKeyPrefix(): string {
     return `chunk.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
   }
@@ -2203,6 +2233,111 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         "SDW memory integrity state changed during provenance verification",
       );
     }
+  }
+
+  private async readRecallIntegrityState(): Promise<SdwMemoryIntegrityState> {
+    const state = await this.resolveMemoryIntegrityState();
+    if (state === "state_MARKER_ABSENT_POST_COMPLETE") {
+      throw new SdwValidationError(
+        "auth_failed",
+        "SDW memory provenance completion marker is absent after completion",
+      );
+    }
+    return state;
+  }
+
+  /**
+   * The status keys under this owner's prefix, listed once per recall, or null when the listing exceeds
+   * MEMORY_CORPUS_SCAN_CAP: the hint held is bounded by the corpus scan cap, and past it the screen reads every
+   * passage's status record as it did before the hint existed, so the cap costs reads and never changes output.
+   */
+  private async recallStatusHint(): Promise<ReadonlySet<string> | null> {
+    const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentProvenanceStatusKeyPrefix());
+    if (entries.length > MEMORY_CORPUS_SCAN_CAP) return null;
+    return new Set(entries.map((entry) => entry.key));
+  }
+
+  /**
+   * Recall's provenance decision for one bound document record. It takes no lock and writes nothing:
+   * quarantine stays with memory_get, memory_search and the owner integrity sweep, so a recall query can
+   * neither steer a write nor wait on a lock. "screen" checks no signature and may only skip; "verify"
+   * checks both signatures, the subject and destination binding, signer eligibility and the unsigned rule.
+   * The caller's start and end integrity reads replace the per-passage state reads getPassageProvenance makes.
+   */
+  private async recallProvenance(
+    document: SdwDocumentRecord,
+    integrityState: SdwMemoryIntegrityState,
+    mode: "screen" | "verify",
+    statusHint: ReadonlySet<string> | null = null,
+  ): Promise<"pass" | "skip"> {
+    const documentId = document.document_id;
+    const rawProvenanceBytes = await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceKey(documentId));
+    const observedProvenanceSha256 = toBase64url(hash(rawProvenanceBytes ?? new Uint8Array()));
+    // The listing is a skip hint for the screen only: a status written after the listing is caught by the
+    // verify phase's own re-read before anything reaches the result, so a missed hint costs scanned units, never output.
+    const existingStatus = mode === "screen" && statusHint !== null && !statusHint.has(documentProvenanceStatusKey(documentId))
+      ? null
+      : await this.corpus.getProvenanceStatusRaw(documentId);
+    if (existingStatus !== null &&
+        existingStatus.record.observed_content_hash === document.content_hash &&
+        existingStatus.record.observed_provenance_sha256 === observedProvenanceSha256) return "skip";
+    let provenance: SdwMemoryProvenanceRecord | null;
+    try {
+      // The observed provenance hash and the decoded record come from one read, so a status match and the
+      // decoded companion can never describe two different versions of the provenance file.
+      provenance = rawProvenanceBytes === null ? null : this.corpus.decodeProvenance(documentId, rawProvenanceBytes);
+    } catch {
+      return "skip";
+    }
+    if (provenance === null) {
+      if (mode === "screen") return "pass";
+      if (integrityState === "state_COMPLETE") {
+        throw new SdwValidationError(
+          "auth_failed",
+          "SDW memory passage is unsigned after provenance migration completion",
+        );
+      }
+      return "pass";
+    }
+    let companion = provenance.companion;
+    if (mode === "verify") {
+      const result = this.verifyCompanion(document, companion);
+      if (!result.ok) return "skip";
+      companion = result.value;
+    }
+    let eligibility;
+    try {
+      eligibility = await evaluateMemoryProvenanceSignerEligibility({
+        companion,
+        resolveSignerPublicKey: (identityId, did) => this.resolveSignerPublicKey(identityId, did),
+        badSignerAuthority: this.badSignerAuthority,
+      });
+    } catch (error) {
+      // Eligibility on an unverified companion must not abort where a verified one would not: resolve it fully.
+      if (mode === "screen") return this.recallProvenance(document, integrityState, "verify");
+      throw error;
+    }
+    return eligibility.eligible ? "pass" : "skip";
+  }
+
+  /** Read and hash-check one passage under the scan budget; null when the budget stopped it before completion. */
+  private async readRecallText(document: SdwDocumentRecord, budget: HermesRecallBudget): Promise<string | null> {
+    const parts: string[] = [];
+    let units = 0;
+    for (let ordinal = 0; ordinal < document.chunk_count; ordinal++) {
+      if (!budget.scanning()) return null;
+      const chunk = await this.corpus.getChunk(document.document_id, ordinal, chunkId(ordinal));
+      if (chunk === null) throw new SdwValidationError("passage_incomplete", "SDW memory passage chunk missing");
+      if (!budget.scanning() || !budget.scan(chunk.text.length)) return null;
+      units += chunk.text.length;
+      if (units > budget.limits.passageUnits) { budget.truncated = true; return null; }
+      parts.push(chunk.text);
+    }
+    const text = parts.join("");
+    if (passageContentHash(text) !== document.content_hash) {
+      throw new SdwValidationError("identity_mismatch", "SDW memory passage content hash mismatch");
+    }
+    return text;
   }
 
   private async quarantine(

@@ -2,7 +2,7 @@
 import { expect, it } from "vitest";
 import { HermesBridgeCore, type HermesBridgeAuditRecord } from "../../src/hermes-memory-bridge/bridge-core.js";
 import { parsePublicFrame, type NodeToRelayInput } from "../../src/hermes-memory-bridge/envelopes.js";
-import { RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
+import { RECALL_VERIFY_RESERVE_MS, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
 import { SdwDocumentCorpusStore, padChunkOrdinal } from "../../src/sdw/document-corpus-store.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import { documentProvenanceKey } from "../../src/sdw/grammar.js";
@@ -42,7 +42,7 @@ async function fixture() {
     return JSON.parse(JSON.parse(Buffer.from(response.publicPayloadBytes).toString()).payload.content[0].text);
   };
   return { storage, adapter, corpus, core, audits, writes, call, frame, body,
-    complete: () => { complete = true; }, advance: () => { now += RECALL_WALL_BUDGET_MS; },
+    complete: () => { complete = true; }, advance: (ms = RECALL_WALL_BUDGET_MS) => { now += ms; },
     rejectAudit: (value: boolean) => { rejectAudit = value; } };
 }
 
@@ -80,7 +80,7 @@ it.each(["provenance", "hash", "unsigned"] as const)("recall observes the %s tru
   } finally { h.core.relayEof(); }
 });
 
-it.each(["cancel", "stop"] as const)("finishes bounded recall work after %s with a retained match", async control => {
+it.each(["cancel", "stop"] as const)("finishes bounded recall work after %s, returning only verified matches", async control => {
   const h = await fixture();
   await h.adapter.insertPassage({ passage_id: "b", text: "board later" }, "user_content");
   const originalRead = h.storage.read.bind(h.storage);
@@ -93,9 +93,12 @@ it.each(["cancel", "stop"] as const)("finishes bounded recall work after %s with
   try {
     h.call("controlled"); await drainUntil(() => parked);
     if (control === "cancel") h.frame({ type: "cancel", mcp_request_id: "controlled" }); else h.core.relayEof();
-    h.advance(); release();
+    // The scan stops at the verification reserve, and the reserved slice verifies the match ranked before it.
+    h.advance(RECALL_WALL_BUDGET_MS - RECALL_VERIFY_RESERVE_MS); release();
     await drainUntil(() => h.audits.some(row => row.kind === "memory_recall"));
-    expect(h.audits.find(row => row.kind === "memory_recall")).toMatchObject({ passage_ids: ["a"], truncated: true });
+    // Stop aborts the call, and an abort returns only passages that had verified; none had during the scan.
+    expect(h.audits.find(row => row.kind === "memory_recall"))
+      .toMatchObject({ passage_ids: control === "cancel" ? ["a"] : [], truncated: true });
     await drainUntil(() => h.core.snapshot().lifecycle.recordCount === 0);
     if (control === "cancel") expect(h.body()).toEqual({ ...MATCH, truncated: true });
     else expect(h.writes).toEqual([]);
