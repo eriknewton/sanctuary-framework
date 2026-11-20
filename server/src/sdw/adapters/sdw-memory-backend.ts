@@ -2665,7 +2665,7 @@ export function chunkText(text: string, maxChunkChars: number): readonly string[
 export { passageContentHash };
 
 /**
- * Recall's scan order (V8): most recently modified files first, from the unchanged list(), in one pass. Rule 7: this
+ * Recall's scan order: most recently modified files first, from the unchanged list(), in one pass. Rule 7: this
  * order is a hint with no credibility. Subject: the document file. Evidence source: the host's file modification
  * time as list() reports it. Verifier: none. It is never a freshness guarantee: anyone with host file access can
  * set the time, and a save of old content is a new file. A wrong order only reorders a complete scan; when the scan

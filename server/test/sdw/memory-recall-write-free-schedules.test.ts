@@ -137,7 +137,7 @@ describe("recall writes nothing to the corpus and quarantines nothing", () => {
     const f = await corpus();
     await adapterSchedules[name]!(f);
     expect(f.storage.writes).toBe(0);
-    // Neither newly invalid passage has a quarantine status record, so a later recall verifies them again (V5's residual).
+    // Neither newly invalid passage has a quarantine status record, so a later recall verifies them again.
     f.storage.beforeRead = undefined;
     for (const seed of [NEWLY_INVALID, NEWLY_INVALID_BROKEN]) expect(await f.corpus.getProvenanceStatusRaw(f.documentIdOf(seed.passageId))).toBeNull();
   });

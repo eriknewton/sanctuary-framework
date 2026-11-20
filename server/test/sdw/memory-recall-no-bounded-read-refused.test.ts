@@ -1,4 +1,4 @@
-// fail-before-exempt: pins the refusal arm for a storage backend without readBounded, which this change's source already refuses, so it passes on the base by construction; the bounded-read fail-before witness is the error round trip in test/storage/capability-error-read-bound.test.ts.
+// fail-before-exempt: coverage pin for the refusal arm on a storage backend without readBounded; the bounded-read fail-before witness is the error round trip in test/storage/capability-error-read-bound.test.ts.
 // Recall refuses, rather than reading a chunk record whole, when the storage backend offers no bounded read: the
 // whole-record read is never substituted for the bounded one. The control recalls the same corpus on a backend that
 // does offer it, so the refusal is the missing method and nothing else.
