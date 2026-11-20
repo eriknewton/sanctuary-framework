@@ -1,3 +1,4 @@
+// fail-before-exempt: the fixture states its own file and directory modes so the result does not depend on the process umask; no server/src change.
 /**
  * Re-gate 1 (fix commit 636f6051) CHOKEPOINT (2026-07-07 fix-round 2), then
  * extended for re-gate 3 (fix-round 3): the `wrap/auto-provision.ts` real-ops

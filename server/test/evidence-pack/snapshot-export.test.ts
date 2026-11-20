@@ -1,3 +1,4 @@
+// fail-before-exempt: the fixture states its own file and directory modes so the result does not depend on the process umask; no server/src change.
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtemp, mkdir, readFile, writeFile, readdir, chmod, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";

@@ -1,3 +1,4 @@
+// fail-before-exempt: the fixture states its own file and directory modes so the result does not depend on the process umask; no server/src change.
 /**
  * Recovery key disclosure — v1.1.1 hotfix Finding U
  *

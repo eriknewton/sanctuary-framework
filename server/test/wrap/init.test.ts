@@ -1,4 +1,4 @@
-// fail-before-exempt: fixture teardown releases the write barrier before scrubbing the key; behaviour under test is unchanged on the base.
+// fail-before-exempt: the fixture states its own file modes independent of the process umask, and teardown releases the write barrier before scrubbing the key; behaviour under test is unchanged on the base.
 /**
  * sanctuary init — fortress isolation tests (v1.1.1 hotfix Findings S + T)
  *

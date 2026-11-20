@@ -1,4 +1,4 @@
-// fail-before-exempt: fixture snapshot mutation witnesses read FIFO metadata outside server/src.
+// fail-before-exempt: fixtures state their own directory modes independent of the process umask, and snapshot mutation witnesses read FIFO metadata outside server/src.
 import {describe, expect, it} from "vitest";
 import * as fs from "node:fs";
 import {join, dirname} from "node:path";

@@ -1,3 +1,4 @@
+// fail-before-exempt: the fixture states its own file and directory modes so the result does not depend on the process umask; no server/src change.
 import {afterEach, describe, expect, it, vi} from "vitest";
 import {mkdtempSync, mkdirSync, readdirSync, writeFileSync, lstatSync, unlinkSync, rmdirSync} from "node:fs";
 import {join} from "node:path";
