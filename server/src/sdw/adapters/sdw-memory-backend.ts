@@ -18,6 +18,7 @@ import { MAX_PUBLIC_FRAME_BYTES, MEMORY_CORPUS_SCAN_CAP } from "../../hermes-mem
  */
 
 import { randomBytes } from "node:crypto";
+import { parseIsoInstantWithOffset } from "../../core/time.js";
 import type {
   FilesystemStorageCapabilities,
   NamespaceLockStorageCapabilities,
@@ -2362,8 +2363,9 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   /**
    * One read-ahead slot. It never touches the budget's state, the heap or the result, writes nothing and takes no
    * lock; it stops only on budget.scanOpen(), a pure question. Every read it issues is awaited on its own (settled,
-   * success or failure) before the next decision, so when this returns no read it issued is still pending. Errors
-   * are held in the slot and raised by the commit at this passage's turn.
+   * success or failure) before the next decision, so when this returns no read it issued is still pending; a stalled
+   * read therefore stalls the slot, and the drain's bound in recallPassages applies. Errors are held in the slot and
+   * raised by the commit at this passage's turn.
    */
   private async readRecallSlot(
     key: string,
@@ -2633,10 +2635,11 @@ export { passageContentHash };
  * time as list() reports it. Verifier: none. It is never a freshness guarantee: anyone with host file access can
  * set the time, and a save of old content is a new file. A wrong order only reorders a complete scan; when the scan
  * stops it decides which passages are left unscanned, and truncated reports that. Equal times keep key order, and an
- * entry with no parseable time sorts after every timed one, so a backend that reports no times keeps key order.
+ * entry with no time that parses as an ISO instant with an offset sorts after every timed one, so a backend that
+ * reports no times keeps key order.
  */
 function recallScanOrder<T extends { readonly key: string; readonly modified_at?: string }>(listed: readonly T[]): T[] {
-  const timed = listed.map(entry => ({ entry, at: entry.modified_at === undefined ? Number.NaN : Date.parse(entry.modified_at) }));
+  const timed = listed.map(entry => ({ entry, at: (entry.modified_at === undefined ? undefined : parseIsoInstantWithOffset(entry.modified_at)) ?? Number.NaN }));
   timed.sort((a, b) => {
     const aTimed = Number.isFinite(a.at), bTimed = Number.isFinite(b.at);
     if (aTimed && bTimed && a.at !== b.at) return b.at - a.at;

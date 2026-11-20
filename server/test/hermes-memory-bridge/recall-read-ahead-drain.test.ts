@@ -1,5 +1,6 @@
 // Every read a recall issues has settled before the bridge sees the call return and releases its admission record,
-// under a parked read beside a failed one, repeated admission waves, abort, the wall and concurrent calls.
+// under a parked read beside a failed one, repeated admission waves, abort, the wall and concurrent calls. The cost
+// is a bound, not a latency guarantee: a parked read past the stop point holds the call until it settles.
 import { describe, expect, it } from "vitest";
 import { HERMES_MAX_CALL_RECORDS, HERMES_MAX_PUBLIC_CONNECTIONS } from "../../src/hermes-memory-bridge/constants.js";
 import { RECALL_READ_AHEAD_PASSAGES, RECALL_READS_PER_SLOT, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
