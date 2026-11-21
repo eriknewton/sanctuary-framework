@@ -1,5 +1,5 @@
 import { SdwWorkingStateStore } from "../working-state-store.js";
-import { recallTimestamp, type HermesRecallBudget, type HermesRecallResult } from "../../hermes-memory-bridge/recall.js";
+import { HermesRecallCandidateHeap, recallTimestamp, type HermesRecallBudget, type HermesRecallResult } from "../../hermes-memory-bridge/recall.js";
 import { MAX_PUBLIC_FRAME_BYTES, MEMORY_CORPUS_SCAN_CAP } from "../../hermes-memory-bridge/constants.js";
 /**
  * SDW implementation of the memory-backend adapter contract.
@@ -18,6 +18,7 @@ import { MAX_PUBLIC_FRAME_BYTES, MEMORY_CORPUS_SCAN_CAP } from "../../hermes-mem
  */
 
 import { randomBytes } from "node:crypto";
+import { parseIsoInstantWithOffset } from "../../core/time.js";
 import type {
   FilesystemStorageCapabilities,
   NamespaceLockStorageCapabilities,
@@ -128,6 +129,28 @@ export const DEFAULT_MAX_CHUNK_CHARS = 8192;
 /** A shipped Hermes save fits one public frame at DEFAULT_MAX_CHUNK_CHARS, so its passage has at most this many chunks. */
 export const HERMES_SAVE_MAX_CHUNKS = Math.ceil(MAX_PUBLIC_FRAME_BYTES / DEFAULT_MAX_CHUNK_CHARS);
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
+// Six: the longest JSON encoding of one UTF-16 code unit is the six-byte escape \uXXXX (a control character or a
+// lone surrogate); any other unit is at most three UTF-8 bytes.
+const CHUNK_RECORD_JSON_BYTES_PER_UNIT = 6;
+// The chunk record's fields other than its text: the shipped writer's measure 475 bytes with two 256-unit
+// identifiers (the SDW identifier maximum) and the largest safe-integer ordinal, rounded up to leave room for the
+// optional offset and count fields.
+const CHUNK_RECORD_FIELD_BYTES = 1024;
+// Sixteen: the AES-256-GCM authentication tag appended to the ciphertext.
+const CHUNK_RECORD_TAG_BYTES = 16;
+// The encrypted envelope's own fields (version, algorithm, IV, timestamp and the JSON around the ciphertext)
+// measure 91 bytes, rounded up.
+const CHUNK_RECORD_ENVELOPE_BYTES = 256;
+
+/**
+ * The longest stored chunk record a writer configured with maxChunkChars can produce: the worst-case JSON of its
+ * text and fields, encrypted and tagged, base64url-encoded (four characters per three bytes) inside the envelope.
+ * 67 179 bytes at DEFAULT_MAX_CHUNK_CHARS. Recall refuses a stored record past it before reading it into memory.
+ */
+export function recallChunkRecordMaxBytes(maxChunkChars: number): number {
+  const plaintext = maxChunkChars * CHUNK_RECORD_JSON_BYTES_PER_UNIT + CHUNK_RECORD_FIELD_BYTES + CHUNK_RECORD_TAG_BYTES;
+  return CHUNK_RECORD_ENVELOPE_BYTES + Math.ceil(plaintext * 4 / 3);
+}
 // Exported: `sdw/memory-tools.ts` applies the same default at the tool
 // boundary so an unattended memory_search never reaches the adapter unbounded.
 export const MEMORY_SEARCH_DEFAULT_LIMIT = 10;
@@ -411,6 +434,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   readonly ownerRef: string;
   private readonly passageIdKey: Uint8Array;
   private readonly maxChunkChars: number;
+  private readonly recallChunkMaxBytes: number;
   private readonly corpusScanCap: number;
   private readonly listMaxLimit: number;
   private readonly provenanceCandidateCap: number;
@@ -493,6 +517,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     this.ownerRef = options.ownerRef;
     this.passageIdKey = derivePurposeKey(options.masterKey, MEMORY_PASSAGE_ID_HKDF_INFO);
     this.maxChunkChars = maxChunkChars;
+    this.recallChunkMaxBytes = recallChunkRecordMaxBytes(maxChunkChars);
     this.corpusScanCap = corpusScanCap;
     this.listMaxLimit = listMaxLimit;
     const provenanceCandidateCap = options.provenanceCandidateCap ?? MEMORY_PROVENANCE_QUARANTINE_CANDIDATE_CAP;
@@ -1188,40 +1213,92 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return results.slice(0, limit);
   }
 
-  /** Recall shares search provenance checks while retaining only bounded, verified excerpts. */
+  /**
+   * Recall scores every screened passage first, then verifies only the best few, each against the same
+   * document record its text was scored from, before any of them can reach the result. It writes nothing.
+   */
   async recallPassages(budget: HermesRecallBudget): Promise<HermesRecallResult> {
+    // Continuing arm: no terms, or a budget already aborted or spent at entry, returns an empty
+    // result (truncated in the second case) having read no listing and no integrity state; it carries no passage.
     if (budget.terms.length === 0 || !budget.active()) return budget.result();
-    const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
-    for (const entry of entries) {
-      if (!budget.candidate()) break;
-      const document = await this.corpus.getDocument(entry.key.slice("doc.".length));
-      if (!budget.active()) break;
-      if (document === null || recallTimestamp(document.created_at) === null) continue;
-      if (document.chunk_count > budget.limits.passageUnits) { budget.truncated = true; continue; }
-      const provenance = await this.verifyOrQuarantineProvenance(document);
-      if (!budget.active()) break;
-      if (provenance === "quarantined") continue;
-      await this.assertUnsignedCompatibilityAllowed(provenance);
-      const parts: string[] = [];
-      let units = 0;
-      let complete = true;
-      for (let ordinal = 0; ordinal < document.chunk_count; ordinal++) {
-        if (!budget.active()) { complete = false; break; }
-        const chunk = await this.corpus.getChunk(document.document_id, ordinal, chunkId(ordinal));
-        if (chunk === null) throw new SdwValidationError("passage_incomplete", "SDW memory passage chunk missing");
-        if (!budget.active() || !budget.scan(chunk.text.length)) { complete = false; break; }
-        units += chunk.text.length;
-        if (units > budget.limits.passageUnits) { budget.truncated = true; complete = false; break; }
-        parts.push(chunk.text);
+    const listed = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
+    // Continuing arm: an empty listing returns an empty result having read no integrity state; it carries no passage.
+    if (listed.length === 0) return budget.result();
+    const entries = recallScanOrder(listed);
+    // A tamper signal in the integrity state refuses every recall with something to scan, whatever the query
+    // matches; the end read below refuses a state that moved while this call ran.
+    const integrityState = await this.readRecallIntegrityState();
+    const statusHint = await this.recallStatusHint();
+    const heap = new HermesRecallCandidateHeap<SdwDocumentRecord>(budget);
+    const ring = new RecallReadAheadRing(budget.limits.readAhead,
+      (ordinal, slot) => this.readRecallSlot(entries[ordinal]!.key, slot, budget, integrityState, statusHint));
+    try {
+      // The commit: every budget call, decision and heap offer happens here, one passage at a time in listing
+      // order, in the same sequence at every read-ahead window. The read-ahead only fetches bytes early.
+      for (let ordinal = 0; ordinal < entries.length; ordinal++) {
+        if (!budget.candidate()) break;
+        ring.fill(ordinal, entries.length, () => budget.scanOpen());
+        const slot = await ring.take(ordinal);
+        // A passage the read-ahead stopped short of is never decided as if it had been read: the scan ends truncated.
+        if (slot === undefined) { budget.truncated = true; break; }
+        if (slot.failed !== undefined) throw slot.failed.error;
+        // Errors held by the read-ahead are raised here, at this passage's turn, in the order its reads were decided.
+        if (!slot.document.ok) throw slot.document.error;
+        const document = slot.document.value;
+        if (!budget.scanning()) break;
+        if (document === null || recallTimestamp(document.created_at) === null) continue;
+        if (document.chunk_count > budget.limits.passageUnits) { budget.truncated = true; continue; }
+        if (slot.screen === undefined) { budget.truncated = true; break; }
+        // Pre-screen before any chunk read: a passage the screen skips reads no chunks and spends no scanned units.
+        // The screen checks no signature, so it may only skip; a passage it passes still faces full verification
+        // before output.
+        if (!slot.screen.ok) throw slot.screen.error;
+        if (!budget.scanning()) break;
+        if (slot.screen.value === "skip") continue;
+        let text: string | null;
+        try {
+          text = this.commitRecallText(document, budget, slot);
+        } catch (error) {
+          // A broken passage aborts recall only when its provenance verifies; one that fails verification is
+          // skipped, exactly as a verification run before the chunk reads would skip it. This full verification
+          // runs in the commit, not the read-ahead, and is bounded by the passages the scan reaches, not by
+          // RECALL_VERIFY_CANDIDATES. Continuing arm: a passage it skips reaches no output and writes nothing.
+          if (await this.recallProvenance(document, integrityState, "verify") === "skip") continue;
+          throw error;
+        }
+        // Skipped text is never scored: a prefix has not established the stored full-content commitment.
+        if (text === null) continue;
+        // Text scored here is corpus-key-authenticated and matches its document's content hash, but carries no provenance and no credibility. The score only chooses which passages to verify. Nothing reaches the result, the audit row, a log or an error until `verifyCompanion` and signer eligibility pass for this same document record.
+        const candidate = budget.score({ passage_id: this.passageIdOf(document.document_id), created_at: document.created_at, text });
+        if (candidate !== null) heap.offer(candidate, document);
       }
-      // Skipped text is never scored: a prefix has not established the stored full-content commitment.
-      if (!complete) continue;
-      const text = parts.join("");
-      if (passageContentHash(text) !== document.content_hash) {
-        throw new SdwValidationError("identity_mismatch", "SDW memory passage content hash mismatch");
-      }
-      budget.retain(this.toPassage(document, text, provenance));
+    } finally {
+      // Drain: every read this call issued has settled before verification, before any throw and before
+      // the return, so no read outlives the call or the bridge admission record that holds it. The cost is a bound,
+      // not a guarantee of latency: a stalled local read launched past the stop point delays the return until it
+      // settles, and the reserved verification time is not claimed to survive a stalled drain.
+      await ring.drain();
     }
+    // Rank order: the first passages to verify are the ones verifying every passage would have returned.
+    while (budget.retainedCount < budget.limits.retained && budget.verifying()) {
+      const next = heap.take();
+      if (next === undefined) break;
+      const verified = await this.recallProvenance(next.bound, integrityState, "verify");
+      // An abort or the wall during verification returns only passages that had already verified.
+      if (!budget.verifying()) break;
+      if (verified === "pass") budget.admit(next.candidate);
+    }
+    if (heap.overflowed && budget.retainedCount < budget.limits.retained) budget.truncated = true;
+    // The start read already refused state_MARKER_ABSENT_POST_COMPLETE, so any difference covers it here too.
+    const endState = await this.resolveMemoryIntegrityState();
+    if (endState !== integrityState) {
+      throw new SdwValidationError(
+        "auth_failed",
+        "SDW memory integrity state changed during provenance verification",
+      );
+    }
+    // Continuing arm (a complete or stopped scan, with or without a match): every passage returned verified against
+    // its bound record, every issued read settled, and the integrity state was read unchanged at the start and here.
     return budget.result();
   }
 
@@ -1978,6 +2055,11 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return `doc.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
   }
 
+  // Must match documentProvenanceStatusKey in grammar.ts for this owner's document ids.
+  private documentProvenanceStatusKeyPrefix(): string {
+    return `prov-status.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
+  }
+
   private documentChunkKeyPrefix(): string {
     return `chunk.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
   }
@@ -2205,6 +2287,199 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     }
   }
 
+  private async readRecallIntegrityState(): Promise<SdwMemoryIntegrityState> {
+    const state = await this.resolveMemoryIntegrityState();
+    if (state === "state_MARKER_ABSENT_POST_COMPLETE") {
+      throw new SdwValidationError(
+        "auth_failed",
+        "SDW memory provenance completion marker is absent after completion",
+      );
+    }
+    return state;
+  }
+
+  /**
+   * The status keys under this owner's prefix, listed once per recall, or null when the listing exceeds
+   * MEMORY_CORPUS_SCAN_CAP: the hint held is bounded by the corpus scan cap, and past it the screen reads every
+   * passage's status record, so the cap costs reads and never changes output.
+   */
+  private async recallStatusHint(): Promise<ReadonlySet<string> | null> {
+    const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentProvenanceStatusKeyPrefix());
+    if (entries.length > MEMORY_CORPUS_SCAN_CAP) return null;
+    return new Set(entries.map((entry) => entry.key));
+  }
+
+  /**
+   * Recall's provenance decision for one bound document record. It takes no lock and writes nothing:
+   * quarantine stays with memory_get, memory_search and the owner integrity sweep, so a recall query can
+   * neither steer a write nor wait on a lock. "screen" checks no signature and may only skip; "verify"
+   * checks both signatures, the subject and destination binding, signer eligibility and the unsigned rule.
+   * The caller's start and end integrity reads replace the per-passage state reads getPassageProvenance makes.
+   */
+  private async recallProvenance(
+    document: SdwDocumentRecord,
+    integrityState: SdwMemoryIntegrityState,
+    mode: "screen" | "verify",
+    statusHint: ReadonlySet<string> | null = null,
+  ): Promise<"pass" | "skip"> {
+    const rawProvenanceBytes = await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceKey(document.document_id));
+    return this.recallProvenanceFrom(document, rawProvenanceBytes, integrityState, mode, statusHint);
+  }
+
+  /** {@link recallProvenance} over provenance bytes the caller already read from this document's provenance key. */
+  private async recallProvenanceFrom(
+    document: SdwDocumentRecord,
+    rawProvenanceBytes: Uint8Array | null,
+    integrityState: SdwMemoryIntegrityState,
+    mode: "screen" | "verify",
+    statusHint: ReadonlySet<string> | null,
+  ): Promise<"pass" | "skip"> {
+    const documentId = document.document_id;
+    const observedProvenanceSha256 = toBase64url(hash(rawProvenanceBytes ?? new Uint8Array()));
+    // The listing is a skip hint for the screen only: a status written after the listing is caught by the
+    // verify phase's own re-read before anything reaches the result, so a missed hint costs scanned units, never output.
+    const existingStatus = mode === "screen" && statusHint !== null && !statusHint.has(documentProvenanceStatusKey(documentId))
+      ? null
+      : await this.corpus.getProvenanceStatusRaw(documentId);
+    if (existingStatus !== null &&
+        existingStatus.record.observed_content_hash === document.content_hash &&
+        existingStatus.record.observed_provenance_sha256 === observedProvenanceSha256) return "skip";
+    let provenance: SdwMemoryProvenanceRecord | null;
+    try {
+      // The observed provenance hash and the decoded record come from one read, so a status match and the
+      // decoded companion can never describe two different versions of the provenance file.
+      provenance = rawProvenanceBytes === null ? null : this.corpus.decodeProvenance(documentId, rawProvenanceBytes);
+    } catch {
+      return "skip";
+    }
+    if (provenance === null) {
+      if (mode === "screen") return "pass";
+      if (integrityState === "state_COMPLETE") {
+        throw new SdwValidationError(
+          "auth_failed",
+          "SDW memory passage is unsigned after provenance migration completion",
+        );
+      }
+      return "pass";
+    }
+    let companion = provenance.companion;
+    if (mode === "verify") {
+      const result = this.verifyCompanion(document, companion);
+      if (!result.ok) return "skip";
+      companion = result.value;
+    }
+    let eligibility;
+    try {
+      eligibility = await evaluateMemoryProvenanceSignerEligibility({
+        companion,
+        resolveSignerPublicKey: (identityId, did) => this.resolveSignerPublicKey(identityId, did),
+        badSignerAuthority: this.badSignerAuthority,
+      });
+    } catch (error) {
+      // Eligibility on an unverified companion must not abort where a verified one would not: resolve it fully.
+      // Continuing arm: this full verification (both signatures, subject, destination, eligibility) runs in the screen,
+      // inside a read-ahead slot, once per such passage the scan reaches; RECALL_VERIFY_CANDIDATES does not cap it.
+      if (mode === "screen") return this.recallProvenance(document, integrityState, "verify");
+      throw error;
+    }
+    return eligibility.eligible ? "pass" : "skip";
+  }
+
+  /**
+   * One read-ahead slot. It never touches the budget's state, the heap or the result, writes nothing and takes no
+   * lock; it stops only on budget.scanOpen(), a pure question. Every read it issues is awaited on its own (settled,
+   * success or failure) before the next decision, so when this returns no read it issued is still pending; a stalled
+   * read therefore stalls the slot, and the drain's bound in recallPassages applies. Errors are held in the slot and
+   * raised by the commit at this passage's turn.
+   */
+  private async readRecallSlot(
+    key: string,
+    slot: RecallReadAheadSlot,
+    budget: HermesRecallBudget,
+    integrityState: SdwMemoryIntegrityState,
+    statusHint: ReadonlySet<string> | null,
+  ): Promise<void> {
+    const documentId = key.slice("doc.".length);
+    // Ownership: the document and provenance reads are issued together and settled one by one, so a
+    // failed document read never leaves its provenance read running unowned. RECALL_READS_PER_SLOT counts these two.
+    const documentRead = settleRecallRead(() => this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, key));
+    const provenanceRead = settleRecallRead(() => this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceKey(documentId)));
+    const rawDocument = await documentRead;
+    const rawProvenance = await provenanceRead;
+    // Interpreted in the commit's decision order: the document first, then the screen's provenance.
+    if (!rawDocument.ok) { slot.document = rawDocument; return; }
+    slot.document = rawDocument.value === null ? { ok: true, value: null }
+      : heldRecallValue(() => this.corpus.decodeDocument(documentId, rawDocument.value!));
+    if (!slot.document.ok || slot.document.value === null) return;
+    const document = slot.document.value;
+    // The same pre-screen gates the commit applies: a passage it skips before the screen gets no screen here.
+    if (recallTimestamp(document.created_at) === null || document.chunk_count > budget.limits.passageUnits) return;
+    if (!budget.scanOpen()) return;
+    // The screen runs in the slot, so its eligibility fallback (a full verification when the eligibility check
+    // throws) can run here too; the read-ahead does verify in that one arm.
+    slot.screen = rawProvenance.ok
+      ? await settleRecallRead(() => this.recallProvenanceFrom(document, rawProvenance.value, integrityState, "screen", statusHint))
+      : rawProvenance;
+    // A passage the screen skips reads no chunks: chunks are read only for a passage the screen passed.
+    if (!slot.screen.ok || slot.screen.value === "skip") return;
+    let units = 0;
+    for (let ordinal = 0; ordinal < document.chunk_count; ordinal++) {
+      // The read-ahead stops where the commit's scanning() would, and past one passage's unit cap, so per slot it
+      // reads at most one chunk beyond what the commit accounts for.
+      if (!budget.scanOpen()) return;
+      // The chunk's text is interpreted inside the settled read, so a malformed record is this slot's held refusal,
+      // raised at the passage's turn like an unreadable chunk, and never a rejection that skips the other slots' drain.
+      // Read-side maximum: a stored record longer than recallChunkMaxBytes is refused before its bytes are read into
+      // memory or decoded, and is an unreadable chunk under the same refusal table. Whole-call bound: each slot
+      // reads one chunk at a time, so at most RECALL_READ_AHEAD_PASSAGES records (4 x 67 179 bytes at
+      // DEFAULT_MAX_CHUNK_CHARS) are read or decoded at once, each decode stage linear in that length, beside the
+      // retained text RECALL_READ_AHEAD_RETAINED_TEXT_UNITS bounds. DEBT(S2-RECALL-DOC-PROV-READ-BOUND): document
+      // and provenance records are read whole; this maximum covers chunk records, the part of a passage that grows
+      // with its text, so the whole-call bound above holds for chunk records only.
+      const read = await settleRecallRead(async () => recallChunkText(
+        await this.corpus.getChunkBounded(document.document_id, ordinal, chunkId(ordinal), this.recallChunkMaxBytes)));
+      if (!read.ok || read.value === null) { slot.chunks.push(read.ok ? { ok: true, value: null } : read); return; }
+      const length = read.value.length;
+      units += length;
+      if (units > budget.limits.passageUnits) {
+        // Retained state: past the per-passage cap the commit needs only the lengths, never the text, so
+        // the slot drops every text it holds at once and retains at most passageUnits text units at any time. Must
+        // match RECALL_READ_AHEAD_RETAINED_TEXT_UNITS in hermes-memory-bridge/recall.ts, the per-call bound this gives.
+        slot.chunks.push({ ok: true, value: { length, text: null } });
+        for (const held of slot.chunks) if (held.ok && held.value !== null) held.value.text = null;
+        slot.textReleased = true;
+        return;
+      }
+      slot.chunks.push({ ok: true, value: { length, text: read.value } });
+    }
+  }
+
+  /** The commit's per-chunk accounting, replayed in order over the chunk reads the read-ahead made. */
+  private commitRecallText(document: SdwDocumentRecord, budget: HermesRecallBudget, slot: RecallReadAheadResult): string | null {
+    const parts: string[] = [];
+    let units = 0;
+    for (let ordinal = 0; ordinal < document.chunk_count; ordinal++) {
+      if (!budget.scanning()) return null;
+      const read = slot.chunks[ordinal];
+      // The read-ahead stopped before this chunk (scanOpen() closed): the passage is not complete, so it is not scored.
+      if (read === undefined) { budget.truncated = true; return null; }
+      if (!read.ok) throw read.error;
+      const chunk = read.value;
+      if (chunk === null) throw new SdwValidationError("passage_incomplete", "SDW memory passage chunk missing");
+      if (!budget.scanning() || !budget.scan(chunk.length)) return null;
+      units += chunk.length;
+      if (units > budget.limits.passageUnits) { budget.truncated = true; return null; }
+      parts.push(chunk.text!);
+    }
+    // Text is dropped only once the summed lengths pass passageUnits, and the loop above returns at that chunk.
+    if (slot.textReleased) throw new Error("SDW memory recall read-ahead released text the commit needs");
+    const text = parts.join("");
+    if (passageContentHash(text) !== document.content_hash) {
+      throw new SdwValidationError("identity_mismatch", "SDW memory passage content hash mismatch");
+    }
+    return text;
+  }
+
   private async quarantine(
     documentId: string,
     reason: string,
@@ -2388,6 +2663,119 @@ export function chunkText(text: string, maxChunkChars: number): readonly string[
 // existing importer of passageContentHash from THIS module keeps working
 // without an import-path change.
 export { passageContentHash };
+
+/**
+ * Recall's scan order: most recently modified files first, from the unchanged list(), in one pass. Rule 7: this
+ * order is a hint with no credibility. Subject: the document file. Evidence source: the host's file modification
+ * time as list() reports it. Verifier: none. It is never a freshness guarantee: anyone with host file access can
+ * set the time, and a save of old content is a new file. A wrong order only reorders a complete scan; when the scan
+ * stops it decides which passages are left unscanned, and truncated reports that. Equal times keep key order, and an
+ * entry with no time that parses as an ISO instant with an offset sorts after every timed one, so a backend that
+ * reports no times keeps key order.
+ */
+function recallScanOrder<T extends { readonly key: string; readonly modified_at?: string }>(listed: readonly T[]): T[] {
+  const timed = listed.map(entry => ({ entry, at: (entry.modified_at === undefined ? undefined : parseIsoInstantWithOffset(entry.modified_at)) ?? Number.NaN }));
+  timed.sort((a, b) => {
+    const aTimed = Number.isFinite(a.at), bTimed = Number.isFinite(b.at);
+    if (aTimed && bTimed && a.at !== b.at) return b.at - a.at;
+    if (aTimed !== bTimed) return aTimed ? -1 : 1;
+    // Ties by key, compared the way the shipped list() implementations sort their keys.
+    return a.entry.key.localeCompare(b.entry.key);
+  });
+  return timed.map(item => item.entry);
+}
+
+/** A read-ahead outcome held to the passage's commit turn: a value, or the error the read or decode raised. */
+type RecallHeld<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
+
+/** What one slot read for its passage; the commit decides on it in listing order. */
+export interface RecallReadAheadResult {
+  /** Absent only while the slot's first two reads are in flight. */
+  document: RecallHeld<SdwDocumentRecord | null>;
+  /** Absent when a pre-screen gate held, or scanOpen() closed before the screen. */
+  screen?: RecallHeld<"pass" | "skip">;
+  /** Chunk reads in ordinal order; a null value is a missing chunk, a null text a chunk past the per-passage cap. */
+  readonly chunks: RecallHeld<{ readonly length: number; text: string | null } | null>[];
+  /** Set once the chunks' summed length passed passageUnits and every text was dropped. */
+  textReleased: boolean;
+  /** An error the slot raised outside its per-read holds; the commit raises it at this passage's turn. */
+  failed?: { readonly ok: false; readonly error: unknown };
+}
+interface RecallReadAheadSlot extends RecallReadAheadResult {
+  /** Resolves when every read the slot issued has settled; never rejects. */
+  settled?: Promise<void>;
+}
+
+/** A chunk record's text, or null for a missing chunk; a record whose text is not a string is refused, not read. */
+function recallChunkText(chunk: SdwDocumentChunkRecord | null): string | null {
+  if (chunk === null) return null;
+  if (typeof chunk.text !== "string") throw new SdwValidationError("identity_mismatch", "SDW memory passage chunk is malformed");
+  return chunk.text;
+}
+
+/** Runs one read and settles it: never rejects, so awaiting the result always means the read is finished. */
+async function settleRecallRead<T>(read: () => Promise<T>): Promise<RecallHeld<T>> {
+  try { return { ok: true, value: await read() }; } catch (error) { return { ok: false, error }; }
+}
+function heldRecallValue<T>(compute: () => T): RecallHeld<T> {
+  try { return { ok: true, value: compute() }; } catch (error) { return { ok: false, error }; }
+}
+
+/**
+ * The read-ahead of one recall call: a ring of at most `window` slots (rule 8). A slot is launched only while the
+ * scan is open and at most `window - 1` passages past the commit point, and the commit's take() releases it, with
+ * every text it holds, the moment its passage is decided. Nothing keeps a list of launched passages for the call.
+ */
+export class RecallReadAheadRing {
+  private readonly cells: (RecallReadAheadSlot | undefined)[];
+  private launched = 0;
+  constructor(
+    private readonly window: number,
+    private readonly read: (ordinal: number, slot: RecallReadAheadSlot) => Promise<void>,
+  ) {
+    this.cells = new Array<RecallReadAheadSlot | undefined>(window).fill(undefined);
+  }
+  /** Launch slots up to `ordinal + window - 1`, each only while `open()` holds. */
+  fill(ordinal: number, count: number, open: () => boolean): void {
+    while (this.launched < count && this.launched < ordinal + this.window && open()) {
+      const index = this.launched % this.window;
+      // The commit takes passages in order, so the slot window passages back has already been taken and released.
+      if (this.cells[index] !== undefined) throw new Error("SDW memory recall read-ahead ring slot still held");
+      const slot: RecallReadAheadSlot = { document: { ok: true, value: null }, chunks: [], textReleased: false };
+      // The rejection handler attaches as the slot is issued, so settled never rejects: a take() or drain() that
+      // awaits it always waits for the slot's reads, whatever this or any other slot raised.
+      slot.settled = this.read(this.launched, slot).catch((error: unknown) => { slot.failed = { ok: false, error }; });
+      this.cells[index] = slot;
+      this.launched++;
+    }
+  }
+  /** Wait until every read of this passage's slot has settled, then release the slot and return what it read. */
+  async take(ordinal: number): Promise<RecallReadAheadResult | undefined> {
+    if (ordinal >= this.launched) return undefined;
+    const index = ordinal % this.window;
+    const slot = this.cells[index]!;
+    await slot.settled;
+    this.cells[index] = undefined;
+    return slot;
+  }
+  /** Wait until every read of every slot still held has settled. */
+  async drain(): Promise<void> {
+    // allSettled, not a loop of awaits: no slot's outcome can end the drain before every other held slot settles.
+    await Promise.allSettled(this.cells.map(slot => slot?.settled));
+  }
+  /** Slots launched and not yet released by the commit. */
+  get retainedSlots(): number {
+    return this.cells.filter(slot => slot !== undefined).length;
+  }
+  /** Passage text units the held slots retain. */
+  get retainedTextUnits(): number {
+    let units = 0;
+    for (const slot of this.cells) {
+      for (const read of slot?.chunks ?? []) if (read.ok && read.value !== null) units += read.value.text?.length ?? 0;
+    }
+    return units;
+  }
+}
 
 function chunkId(ordinal: number): string {
   return `c${padChunkOrdinal(ordinal)}`;

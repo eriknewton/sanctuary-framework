@@ -99,6 +99,7 @@ export const READ_ONLY_STORAGE_DELEGATED_METHODS = [
   "totalSize",
   "listNamespaces",
   "listKeys",
+  "readBounded",
   "namespacePath",
 ] as const;
 
@@ -133,12 +134,20 @@ export class ReadOnlyStorageGuard
   /** Mirror presence so AuditLog's absent-capability fallback remains truthful. */
   listKeys?: (namespace: string, prefix?: string) => Promise<string[]>;
 
+  /** Mirror presence: a consumer that requires a bounded read must see its absence, not a method that throws. */
+  readBounded?: (namespace: string, key: string, maxBytes: number) => Promise<Uint8Array | null>;
+
   constructor(inner: StorageBackend) {
     this.inner = inner;
     // Must match StorageBackend.listKeys in interface.ts and STORAGE_READ_ONLY
     // in test/structure/read-tool-mutation-reachability.ts.
     if (typeof inner.listKeys === "function") {
       this.listKeys = (namespace, prefix) => inner.listKeys!(namespace, prefix);
+    }
+    // Must match StorageBackend.readBounded in interface.ts and STORAGE_READ_ONLY
+    // in test/structure/read-tool-mutation-reachability.ts.
+    if (typeof inner.readBounded === "function") {
+      this.readBounded = (namespace, key, maxBytes) => inner.readBounded!(namespace, key, maxBytes);
     }
     this.innerCapabilities = inner as Partial<FilesystemStorageCapabilities>;
     if (typeof inner.listNamespaces === "function") {
