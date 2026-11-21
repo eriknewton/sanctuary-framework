@@ -318,6 +318,7 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")("L
           return pending;
         };
         let bundle: string | undefined;
+        let approvedImportCount: number | undefined;
         if (trigger === "IMPORT") {
           const exported = await approve(run.rpc(8, "reputation_export", { identity_id: identity }), "approve");
           expect(exported.isError).not.toBe(true);
@@ -327,6 +328,8 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")("L
           expect(healthy.isError).not.toBe(true);
           expect(JSON.parse(healthy.content[0].text).error).toBeUndefined();
           expect(JSON.parse(healthy.content[0].text).completeness_verification).not.toBe("failed");
+          approvedImportCount = JSON.parse(healthy.content[0].text).imported_attestations;
+          expect(approvedImportCount).toEqual(expect.any(Number));
           run.command("COUNTS"); expect(await run.phase("RECOVERY_COUNTS")).toMatchObject({ importCalls: 1, recoveryCalls: 0 });
         }
         run.command("ARM"); await run.phase("ARMED");
@@ -422,8 +425,20 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")("L
         expect(await run.done).toEqual({ code: 0, signal: null });
         expect(run.stderr()).not.toContain("forcing");
         expect(JSON.parse(await readFile(join(root, "lk1-flush.json"), "utf8")).sort()).toEqual(["audit", "baseline", "inbox"]);
-        const { profile } = await persisted(fortress, key);
+        const { profile, audit } = await persisted(fortress, key);
         expect(profile.tool_call_counts.state_read ?? 0, "shutdown persists the final live read").toBeGreaterThan(0);
+        if (trigger === "IMPORT") {
+          // The refused import committed nothing: its own persisted row records zero
+          // imported attestations and a failed completeness check. The stored
+          // reputation holds no more entries than the approved import reported.
+          const imports = audit.entries.filter((entry) => entry.operation === "reputation_import");
+          expect(imports.filter((entry) => entry.result === "success")).toHaveLength(1);
+          const refused = imports.filter((entry) => entry.result === "failure");
+          expect(refused).toHaveLength(1);
+          expect(refused[0]!.details).toMatchObject({ imported: 0, completeness_verification: "failed" });
+          const stored = await new FilesystemStorage(join(fortress, "state")).list("_reputation");
+          expect(stored).toHaveLength(approvedImportCount!);
+        }
         if (trigger === "ALIVE") return;
         const after = await lstat(paused.path!, { bigint: true }).catch(() => null);
         expect(after?.ino, "quota successor survives actual CLI shutdown").toBe(heldIdentity.ino);
