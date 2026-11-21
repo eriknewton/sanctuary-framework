@@ -329,7 +329,10 @@ export function argumentStageCause(error: unknown): Extract<DenialCause, "export
  * The operator-side facts of a refused handler result: the top-level verdict
  * key and value of its body, and the committed and audited flags a handler
  * reports when its effect already happened. Reads only the top level; never
- * parses deeper.
+ * parses deeper. The committed and audited keys must match DENIAL_FACT_KEYS in
+ * agent-native/denial-ledger.ts, and the verdict keys whose value is not free
+ * text must match VERDICT_ERROR_NAMES in
+ * test/principal-policy/router-gate-denial-opacity.test.ts.
  */
 export function refusedResultFacts(result: unknown): {
   error_name: string;

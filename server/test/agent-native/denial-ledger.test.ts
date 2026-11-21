@@ -257,6 +257,33 @@ describe("denial ledger close", () => {
     expect(r.audit.ops("denial_cause_summary")).toHaveLength(1);
     expect(r.warnings.at(-1)).toContain("3 audit appends unsettled");
   });
+
+  it("a refusal recorded after close is counted and opens no window and no append", async () => {
+    const r = rig();
+    r.refuse("before_close");
+    r.refuse("before_close");
+    await r.ledger.close();
+    const appendsAtClose = r.audit.appends.length;
+    // The first row, and the summary written at close for the window that saw two refusals.
+    expect(appendsAtClose).toBe(2);
+
+    r.refuse("after_close_a");
+    r.refuse("after_close_b", "handler_error");
+    r.advance(DENIAL_WINDOW_MS);
+    r.refuse("after_close_a");
+    for (let i = 0; i < MAX_LIVE_WINDOWS; i++) r.refuse(`after_close_${i}`);
+
+    expect(r.audit.appends.length).toBe(appendsAtClose);
+    const snapshot = r.ledger.snapshot();
+    expect(snapshot.windows).toEqual([]);
+    expect(snapshot.open_keyed_windows).toBe(0);
+    expect(snapshot.overflow_open).toBe(false);
+    expect(snapshot.pending_appends).toBe(0);
+    expect(snapshot.recorded_after_close).toBe(3 + MAX_LIVE_WINDOWS);
+    // A second close finds nothing left to close or wait for.
+    await r.ledger.close();
+    expect(r.audit.appends.length).toBe(appendsAtClose);
+  });
 });
 
 // ── Through the router ────────────────────────────────────────────────────

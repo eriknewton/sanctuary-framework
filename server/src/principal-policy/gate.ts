@@ -467,7 +467,10 @@ export class ApprovalGate {
    * preparation refused the call). Must match the pre-gate stage in router.ts's
    * runBoundedCall: it writes the same one critical `gate_deny:<operation>` row
    * an automatic gate denial writes, so every refused call leaves exactly one
-   * gate decision row whichever stage refused it.
+   * gate decision row whichever stage refused it. The refusing row prefixes
+   * (`gate_deny:` here and in evaluate, `gate_injection_block:`) must match
+   * REFUSING_GATE_ROW_PREFIXES in
+   * test/principal-policy/router-gate-denial-opacity.test.ts.
    *
    * @param operation - The name `evaluate` would have received
    *   (`approvalTargetToolName ?? name`).

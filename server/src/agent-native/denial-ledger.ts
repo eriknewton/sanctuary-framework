@@ -174,6 +174,8 @@ export interface DenialLedgerSnapshot {
   readonly pending_appends: number;
   readonly ledger_budget_exhausted: number;
   readonly ledger_append_failures: number;
+  /** Refusals recorded after close; counted only. */
+  readonly recorded_after_close: number;
   readonly windows: ReadonlyArray<{ readonly key: string; readonly attempted: number; readonly generation: Readonly<DenialGeneration> }>;
 }
 
@@ -300,6 +302,7 @@ export class DenialLedger implements DenialRecorder {
   private pendingSlots = 0;
   private budgetExhausted = 0;
   private appendFailures = 0;
+  private recordedAfterClose = 0;
   private closed = false;
   private readonly warn: (line: string) => void;
 
@@ -319,6 +322,12 @@ export class DenialLedger implements DenialRecorder {
    */
   record(cause: DenialCause, input: DenialRecordInput): void {
     try {
+      if (this.closed) {
+        // After close a refusal is only counted: no window opens and no append
+        // starts, so nothing the ledger holds outlives cleanup.
+        this.recordedAfterClose += 1;
+        return;
+      }
       const now = this.clock();
       this.closeExpired(now);
       const closedCause = closedDenialCause(cause);
@@ -381,6 +390,7 @@ export class DenialLedger implements DenialRecorder {
       pending_appends: this.pendingSlots,
       ledger_budget_exhausted: this.budgetExhausted,
       ledger_append_failures: this.appendFailures,
+      recorded_after_close: this.recordedAfterClose,
       windows: live.map((window) => ({ key: window.generation.key, attempted: window.attempted, generation: window.generation })),
     };
   }

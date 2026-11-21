@@ -234,9 +234,15 @@ async function call(booted: Booted, name: string, args: Record<string, unknown> 
 function body(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
   return JSON.parse((result.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>;
 }
-async function gateRowCount(booted: Booted): Promise<number> {
+// Must match the refusing gate row operations in principal-policy/gate.ts (and
+// the pre-gate row recordPreGateRefusal writes, which is a gate_deny row).
+const REFUSING_GATE_ROW_PREFIXES = ["gate_deny:", "gate_injection_block:"];
+async function gateRowCounts(booted: Booted): Promise<{ gate: number; deny: number }> {
   const { entries } = await booted.app.auditLog.query({ limit: 10_000 });
-  return entries.filter((entry) => entry.operation.startsWith("gate_")).length;
+  return {
+    gate: entries.filter((entry) => entry.operation.startsWith("gate_")).length,
+    deny: entries.filter((entry) => REFUSING_GATE_ROW_PREFIXES.some((prefix) => entry.operation.startsWith(prefix))).length,
+  };
 }
 
 interface RefusalCase {
@@ -551,7 +557,7 @@ describe("one refusal through the production composition root", () => {
   const seamRecords = new Map<string, DenialRecord[]>();
 
   it.each(REFUSAL_CASES)("$label reaches the agent as the one refusal", async (refusal) => {
-    const gateRowsBefore = await gateRowCount(booted);
+    const gateRowsBefore = await gateRowCounts(booted);
     const recordsBefore = ledgerSeam.records.length;
     const outcome = await settled(refusal.run(booted));
     seamRecords.set(refusal.label, ledgerSeam.records.slice(recordsBefore) as DenialRecord[]);
@@ -559,9 +565,12 @@ describe("one refusal through the production composition root", () => {
     expect(outcome).toEqual({ resolved: expectedRefusal() });
     if (!("resolved" in outcome)) return;
     expect((outcome.resolved.content as Array<{ text: string }>)[0]!.text).toBe(EXPECTED_REFUSAL_TEXT);
-    if (refusal.gateRow) {
-      expect(await gateRowCount(booted) - gateRowsBefore).toBe(1);
-    }
+    // A pre-gate or gate refusal adds exactly one gate row, a refusing one.
+    // Every other refusal adds no refusing gate row; a call the gate allowed
+    // still has the gate's own allow rows.
+    const gateRowsAfter = await gateRowCounts(booted);
+    if (refusal.gateRow) expect(gateRowsAfter.gate - gateRowsBefore.gate).toBe(1);
+    expect(gateRowsAfter.deny - gateRowsBefore.deny).toBe(refusal.gateRow ? 1 : 0);
   });
 
   it("the cooperative recall of a hidden key and the primitive state_write to a reserved namespace both reach the agent as the one refusal through a real tools/call", () => {

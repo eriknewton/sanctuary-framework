@@ -197,9 +197,15 @@ export function createServer(
 ): Server {
   const gate = options?.gate;
   assertToolClasses(tools);
-  // Every refusal reaches a ledger on every path: production passes the shared
-  // one; a router given only an audit log builds its own over that log; a
-  // router with neither (unit fixtures) counts refusals with no sink and no I/O.
+  // Every refusal reaches a ledger on every path. Production always passes the
+  // composition root's shared ledger (createSanctuaryServer in index.ts builds
+  // it, hands it here and closes it before the final audit flush), as the test
+  // "a gate refusal, a cooperative refusal, a primitive refusal and a proxy
+  // refusal draw on one ledger" in
+  // test/principal-policy/router-gate-denial-opacity.test.ts witnesses. The
+  // fallbacks exist for fixtures only: a router given just an audit log builds
+  // its own ledger over that log, and one with neither counts refusals with no
+  // sink and no I/O. Neither changes what the agent receives.
   const denialLedger: DenialRecorder = options?.denialLedger
     ?? (options?.auditLog ? new DenialLedger(options.auditLog, Date.now) : new CountingDenialRecorder());
 
