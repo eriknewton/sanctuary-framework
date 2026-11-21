@@ -106,6 +106,16 @@ describe("bounded intent screening", () => {
     expect(separated).toHaveLength(2000);
     expect(classifyIntent(separated).probe_key).toBe("oversize");
   });
+  it("keeps only complete contraction suffixes inside negation tokens", () => {
+    for (const apostrophe of ["'", "\u2019"]) {
+      for (const suffix of ["s", "re", "ll", "ve", "d", "m"]) {
+        expect(classifyIntent(`not${apostrophe}${suffix} save the note`).tool).toBe("sanctuary_remember");
+        expect(classifyIntent(`not${apostrophe}${suffix}a save the note`).probe_key).toBe("ambiguous");
+      }
+      expect(classifyIntent(`don${apostrophe}t save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`not${apostrophe}t save the note`).probe_key).toBe("ambiguous");
+    }
+  });
   it("screens whole requests containing temporal words", () => {
     expect(classifyIntent("save the notes before you delete the old ones").probe_key).toBe("delete");
   });
@@ -230,6 +240,11 @@ describe("bounded intent screening", () => {
     ["save http.txt for later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["remember the https setup", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["save the http status", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["not'save the note", "sensitive", null, "ambiguous", null],
+    ["not:'save the note", "sensitive", null, "ambiguous", null],
+    ["not'-save the note", "sensitive", null, "ambiguous", null],
+    ["don't save the note", "sensitive", null, "ambiguous", null],
+    ["the user's note, save it", "sensitive", null, "multi_intent", null],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);

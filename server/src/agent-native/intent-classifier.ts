@@ -74,13 +74,21 @@ function isHelpWordJoiner(point: string): boolean {
   return !/[\p{L}\p{N}\s]/u.test(point);
 }
 
+function isHelpContractionApostrophe(points: string[], index: number): boolean {
+  // Only complete English contraction suffixes keep an apostrophe inside a negation token.
+  if (points[index] !== "'" && points[index] !== "\u2019") return false;
+  // Three following code points cover a two-letter suffix and its boundary.
+  const suffix = points.slice(index + 1, index + 1 + 3).join("");
+  return /^(?:s|re|ll|ve|d|m)(?!\p{L})/u.test(suffix) ||
+    (points[index - 1] === "n" && /^t(?!\p{L})/u.test(suffix));
+}
+
 function separateNegationJoiners(text: string): string {
   const points = Array.from(text);
   for (let start = 0; start < points.length; start += 1) {
-    // Apostrophes are exempt only in negation tokenization, so contractions remain single tokens.
-    if (!isHelpWordJoiner(points[start]) || points[start] === "'") continue;
+    if (!isHelpWordJoiner(points[start]) || isHelpContractionApostrophe(points, start)) continue;
     let end = start + 1;
-    while (end < points.length && isHelpWordJoiner(points[end]) && points[end] !== "'") end += 1;
+    while (end < points.length && isHelpWordJoiner(points[end]) && !isHelpContractionApostrophe(points, end)) end += 1;
     // Runs between letters have the same boundary as whitespace, preserving source offsets for cue matching.
     if (start > 0 && end < points.length && /\p{L}/u.test(points[start - 1]) && /\p{L}/u.test(points[end])) {
       for (let i = start; i < end; i += 1) points[i] = " ".repeat(points[i].length);
