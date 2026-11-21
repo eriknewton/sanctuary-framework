@@ -277,6 +277,11 @@ describe("bounded intent screening", () => {
     ["not's\u200bsave the note", "sensitive", null, "ambiguous", null],
     ["don%E2%80%8B't save the note", "sensitive", null, "ambiguous", null],
     ["\ufeffsave the note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["do%25E2%2580%258Byou remember my timezone", "sensitive", null, "ambiguous", null],
+    ["save the note%25%45%32%25%38%30%25%38%42", "sensitive", null, "ambiguous", null],
+    ["save the note\uff05E2\uff0580\uff058B", "sensitive", null, "ambiguous", null],
+    ["save bm90ZeKAiw==", "sensitive", null, "ambiguous", null],
+    ["save aW1wb3J0wq1hbnQ=", "sensitive", null, "ambiguous", null],
   ] as const;
   it.each(intentCases)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);

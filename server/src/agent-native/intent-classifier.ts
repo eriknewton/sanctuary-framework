@@ -99,13 +99,16 @@ function separateNegationJoiners(text: string): string {
   return points.join("");
 }
 
-function normalizeHelpVariant(text: string): { normalized: string; fold: string; unreadable: boolean } {
-  const normalized = text.replace(/\p{Default_Ignorable_Code_Point}/gu, "")
-    .normalize("NFKC").normalize("NFD").replace(/\p{M}/gu, "").replace(/[\u2018\u2019\u02bc]/g, "'");
+function normalizeHelpVariant(text: string): { normalized: string; fold: string; unreadable: boolean; invisible: boolean } {
+  const compatibility = text.normalize("NFKC");
+  // Record presence before deletion for every variant so no second decoder can disagree with the screener.
+  const invisible = /\p{Default_Ignorable_Code_Point}/u.test(text) || /\p{Default_Ignorable_Code_Point}/u.test(compatibility);
+  const normalized = compatibility.replace(/\p{Default_Ignorable_Code_Point}/gu, "")
+    .normalize("NFD").replace(/\p{M}/gu, "").replace(/[\u2018\u2019\u02bc]/g, "'");
   const fold = normalized.toLowerCase();
   // Letters outside the scanner's ASCII class must not disappear during compaction.
   const unreadable = Array.from(fold).some(point => /\p{L}/u.test(point) && !isHelpWordJoiner(point) && !/[a-z]/.test(point));
-  return { normalized, fold, unreadable };
+  return { normalized, fold, unreadable, invisible };
 }
 
 function decodeHelpPercent(text: string): string {
@@ -117,10 +120,11 @@ function decodeHelpPercent(text: string): string {
 }
 
 /** Return bounded folded decodings and their retained work counts for intent screening. */
-export function buildHelpVariants(normalized: string): { variants: string[]; bytes: number; budgetHit: boolean; unreadable: boolean } {
+export function buildHelpVariants(normalized: string): { variants: string[]; bytes: number; budgetHit: boolean; unreadable: boolean; invisible: boolean } {
   const original = normalizeHelpVariant(normalized);
   const { fold } = original;
   let unreadable = original.unreadable;
+  let invisible = original.invisible;
   const masked = mask(fold);
   const variants = new Set<string>();
   let bytes = 0;
@@ -129,6 +133,7 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
     const variant = normalizeHelpVariant(value);
     const folded = variant.fold;
     unreadable ||= variant.unreadable;
+    invisible ||= variant.invisible;
     if (folded === fold || folded === masked || variants.has(folded)) return true;
     const size = Buffer.byteLength(folded, "utf8");
     // Both budgets apply before retention, keeping every scanned copy within bounded work.
@@ -160,7 +165,7 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
     }
     return true;
   };
-  if (!decodePercent(normalized)) return { variants: [...variants], bytes, budgetHit, unreadable };
+  if (!decodePercent(normalized)) return { variants: [...variants], bytes, budgetHit, unreadable, invisible };
   for (const token of normalized.split(/[^a-z0-9%+/=_-]+/i)) {
     if (token.includes("%")) {
       if (!decodePercent(token)) break;
@@ -174,7 +179,7 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
     }
   }
   if (!budgetHit) add(normalized.replace(/0/g, "o").replace(/1/g, "i").replace(/3/g, "e").replace(/4/g, "a").replace(/@/g, "a"));
-  return { variants: [...variants], bytes, budgetHit, unreadable };
+  return { variants: [...variants], bytes, budgetHit, unreadable, invisible };
 }
 
 function scanCopies(fold: string): string | undefined {
@@ -225,19 +230,23 @@ function scanCopies(fold: string): string | undefined {
   };
   return scan(masked, false, false) ?? scan(masked, true, false) ?? scan(fold, true, true);
 }
-function screen(text: string): { needle?: string; budgetHit: boolean; fold: string; unreadable?: boolean } {
-  const { normalized, fold } = normalizeHelpVariant(text);
-  const { variants, budgetHit, unreadable } = buildHelpVariants(normalized);
+function screen(text: string): { needle?: string; budgetHit: boolean; fold: string; unreadable?: boolean; invisible: boolean } {
+  const original = normalizeHelpVariant(text);
+  const { normalized, fold } = original;
+  const generated = buildHelpVariants(normalized);
+  const { variants, budgetHit } = generated;
+  const unreadable = original.unreadable || generated.unreadable;
+  const invisible = original.invisible || generated.invisible;
   // No scan copy may erase an unreadable letter from the original or any decoded text.
-  if (unreadable) return { budgetHit, fold, unreadable };
+  if (unreadable) return { budgetHit, fold, unreadable, invisible };
   const clauses = splitClauses(fold);
   const texts = [...(clauses.length > 1 ? clauses : []), fold, ...variants];
   // A needle found in any scanned copy wins, so benign words and encodings preserve the same review boundary.
   for (const value of texts) {
     const needle = scanCopies(value);
-    if (needle) return { needle, budgetHit, fold };
+    if (needle) return { needle, budgetHit, fold, invisible };
   }
-  return { budgetHit, fold };
+  return { budgetHit, fold, invisible };
 }
 function sensitive(probe_key: string): IntentClassification {
   return { safety_class: "sensitive", tool: null, example: null,
@@ -388,7 +397,13 @@ function state_MAIN_VERB(fold: string, cues: Cue[]): IntentClassification | unde
 }
 export function classifyIntent(intent: string): IntentClassification {
   const points = Array.from(intent);
-  if (points.length > HELP_INTENT_MAX_CHARS) {
+  const oversize = points.length > HELP_INTENT_MAX_CHARS;
+  // Only one BOM at the received entry is exempt; decoded and internal BOMs remain variant evidence.
+  if (intent.startsWith("\ufeff")) {
+    intent = intent.slice(1);
+    points.shift();
+  }
+  if (oversize) {
     const prefix = screen(points.slice(0, HELP_BAND_SCAN_CHARS).join(""));
     const suffix = screen(points.slice(-HELP_BAND_SCAN_CHARS).join(""));
     if (prefix.unreadable || suffix.unreadable) return sensitive("unreadable");
@@ -399,7 +414,7 @@ export function classifyIntent(intent: string): IntentClassification {
   if (scanned.unreadable) return sensitive("unreadable");
   if (scanned.needle) return state_GATED(scanned.needle);
   if (scanned.budgetHit) return state_VARIANT_BUDGET();
-  const invisible = state_INVISIBLE(intent);
+  const invisible = state_INVISIBLE(scanned.invisible);
   if (invisible) return invisible;
   const fold = scanned.fold;
   const allCues = collectCues(fold);
@@ -421,14 +436,10 @@ export function classifyIntent(intent: string): IntentClassification {
   if (state_STORED_REFERENCE) return memoryAnswer("read", fold);
   return state_AMBIGUOUS();
 }
-function state_INVISIBLE(intent: string): IntentClassification | undefined {
-  // An ordinary intent containing an invisible character loses its tool recommendation: help is advisory,
-  // so a lost recommendation is safe, while write guidance on a disguised intent is not.
-  const raw = intent.startsWith("\ufeff") ? intent.slice(1) : intent;
-  if (/\p{Default_Ignorable_Code_Point}/u.test(raw)) return sensitive("ambiguous");
-  for (const [encoded] of intent.matchAll(/(?:%[0-9a-f]{2})+/gi)) {
-    if (/\p{Default_Ignorable_Code_Point}/u.test(decodeHelpPercent(encoded))) return sensitive("ambiguous");
-  }
+function state_INVISIBLE(invisible: boolean): IntentClassification | undefined {
+  // An ordinary intent containing an invisible character, including one in a decoded token, loses its tool
+  // recommendation: help is advisory, so a lost recommendation is safe, while write guidance on a disguised intent is not.
+  if (invisible) return sensitive("ambiguous");
 }
 function state_OVERSIZE(): IntentClassification { return sensitive("oversize"); }
 function state_VARIANT_BUDGET(): IntentClassification { return sensitive("variant_budget"); }
