@@ -14,7 +14,7 @@ import { handlePostureRoute } from "../../src/principal-policy/posture-routes.js
 import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 import { createPosturePanelStore } from "../../src/principal-policy/panel-producer.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
-import { refusalResult } from "../../src/agent-native/safety-base.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const WRAPPED_AGENT_ID = "hermes:fortress-0123456789abcdef";
 const AGENT = `agent:${WRAPPED_AGENT_ID}`;
@@ -294,7 +294,7 @@ it("a thrown write leaves intent only and returns the caller an error", async ()
   });
   try {
     const result = await call("sanctuary_remember", { key: "throw-write", value: "blue" });
-    expect(result).toEqual(refusalResult());
+    expect(result).toEqual(expectedRefusal());
     const rows = (await booted.auditLog.query({})).entries;
     const intent = rows.find(e => e.operation === "sanctuary_remember_intent")!;
     expect(intent.details!.agent_id).toBe(AGENT);
@@ -336,7 +336,7 @@ it("a last-write anchor failure preserves the value and intent without an outcom
   });
   try {
     const result = await call("sanctuary_remember", { key: "anchor-failure", value: "blue" });
-    expect(result).toEqual(refusalResult());
+    expect(result).toEqual(expectedRefusal());
     expect(persisted).toBeDefined();
     expect(await storage.read(...persisted!)).not.toBeNull();
     spy.mockRestore();
@@ -490,7 +490,7 @@ it("a real insert rollback failure preserves records and intent only with a gene
     expect([...written.keys()].some(key => key.startsWith("doc."))).toBe(true);
     expect([...written.keys()].some(key => key.startsWith("chunk."))).toBe(true);
     for (const [key, bytes] of written) expect(await storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, key)).toEqual(bytes);
-    expect(result).toEqual(refusalResult());
+    expect(result).toEqual(expectedRefusal());
     const rows = (await booted.auditLog.query({})).entries;
     // The handler's error stays operator-side, under its own tool_error row.
     expect(rows.filter(e => e.operation === "tool_error:memory_insert")).toHaveLength(1);
@@ -531,7 +531,7 @@ it("an unclassified validation throw after insert commit leaves intent only", as
   });
   try {
     const result = await call("memory_insert", { passage_id: "late-validation", text: "A blue cup.", taint: "user_content" });
-    expect(result).toEqual(refusalResult());
+    expect(result).toEqual(expectedRefusal());
     expect(JSON.parse((await call("memory_get", { passage_id: "late-validation" })).content[0].text).found).toBe(true);
     const rows = (await booted.auditLog.query({})).entries;
     expect(rows.filter(e => e.operation === "memory_insert_intent")).toHaveLength(1);

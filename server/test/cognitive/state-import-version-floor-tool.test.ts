@@ -39,11 +39,11 @@ import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { createServer, type ToolDefinition } from "../../src/router.js";
-import { boundaryRefusal, refusalResult } from "../../src/agent-native/safety-base.js";
 import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../../src/storage/exit-import-journal.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { expectedRefusal, expectedRefusalBody } from "../helpers/expected-refusal.js";
 
 type ToolPayload = Record<string, unknown>;
 
@@ -714,7 +714,7 @@ describe("state_import version floor tool path", () => {
         name: "state_import",
         arguments: { bundle, conflict_resolution: "overwrite" },
       });
-      expect(result).toEqual(refusalResult());
+      expect(result).toEqual(expectedRefusal());
       expect(await rig.storage.read("notes", "attempt-audit-abort")).toBeNull();
       appendSpy.mockRestore();
     } finally {
@@ -1262,7 +1262,7 @@ describe("state_import version floor tool path", () => {
         bundle,
         conflict_resolution: "overwrite",
       });
-      expect(refused).toEqual(boundaryRefusal());
+      expect(refused).toEqual(expectedRefusalBody());
 
       const first = await readValue(rig.client, "journal-first");
       expect(first.value).toBe("imported");
@@ -1315,7 +1315,7 @@ describe("state_import version floor tool path", () => {
         bundle,
         conflict_resolution: "overwrite",
       });
-      expect(refused).toEqual(boundaryRefusal());
+      expect(refused).toEqual(expectedRefusalBody());
       expect(JSON.stringify(refused)).not.toContain("key-!4E2D");
       expect(await storage.exists("notes", "stored-name-first")).toBe(true);
 

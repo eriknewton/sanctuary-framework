@@ -21,9 +21,10 @@ import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
-import { normalizedArgsHash, OpaqueNamespaceRegistry, fingerprintIdentityId, refusalResult } from "../../src/agent-native/safety-base.js";
+import { normalizedArgsHash, OpaqueNamespaceRegistry, fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import type { DenialCause, DenialRecorder, DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../../src/storage/interface.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -123,7 +124,7 @@ describe("durable namespace export", () => {
     const exportState = vi.spyOn(f.cold, "exportNamespaces");
     const result = await f.client.callTool({ name: "state_export", arguments: {} });
     // The agent receives the one refusal; the capacity guidance is the ledger's.
-    expect(result).toEqual(refusalResult());
+    expect(result).toEqual(expectedRefusal());
     expect(f.denials).toHaveLength(1);
     expect(f.denials[0]![0]).toBe("export_capacity");
     expect(f.denials[0]![1].error_message).toBe(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);

@@ -4,7 +4,7 @@
  * fixed expectation instead of against the implementation under test.
  *
  * Must match REFUSAL_TEXT in server/src/agent-native/safety-base.ts. The
- * parity test in test/agent-native/phase1-safety-base.test.ts asserts that
+ * parity test in test/agent-native/refusal-literal-parity.test.ts asserts that
  * expectedRefusal() deep-equals refusalResult().
  */
 

@@ -11,20 +11,13 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import {
   classifyApprovalRequest,
-  boundaryRefusal,
   COOPERATIVE_DENIAL_DISCOVERY_HINT,
   fixedDenial,
   fingerprintIdentityId,
   OpaqueNamespaceRegistry,
-  REFUSAL_TEXT,
-  refusalResult,
   type SessionBinding,
 } from "../../src/agent-native/safety-base.js";
-import {
-  EXPECTED_REFUSAL_TEXT,
-  expectedRefusal,
-  expectedRefusalBody,
-} from "../helpers/expected-refusal.js";
+import { expectedRefusalBody } from "../helpers/expected-refusal.js";
 import type { ToolDefinition } from "../../src/router.js";
 
 async function callTool(
@@ -669,16 +662,10 @@ describe("agent-native Phase 1 safety base", () => {
   });
 
   it("the fixed-denial builder returns the one boundary refusal whatever its arguments", () => {
-    expect(fixedDenial("audit:ref", "wait", "minutes")).toEqual({
-      denied: true,
-      message: "This action is not available in the current context.",
-      remediation_class: "request_review",
-      retry_after: null,
-      audit_ref: "audit:refusal",
-      discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
-    });
-    expect(fixedDenial("audit:ref")).toBe(boundaryRefusal());
-    expect(fixedDenial("audit:other", "unavailable", "hours")).toBe(boundaryRefusal());
+    expect(fixedDenial("audit:ref", "wait", "minutes")).toEqual(expectedRefusalBody());
+    expect(fixedDenial("audit:ref")).toEqual(expectedRefusalBody());
+    expect(fixedDenial("audit:other", "unavailable", "hours")).toEqual(expectedRefusalBody());
+    expect(fixedDenial("audit:other").discovery_hint).toBe(COOPERATIVE_DENIAL_DISCOVERY_HINT);
   });
 
   it("shares concurrent first-use persisted claims inside one registry", async () => {
@@ -723,16 +710,5 @@ describe("agent-native Phase 1 safety base", () => {
     await expect(registry.issuePersistedMemoryHandle("agent-b")).rejects.toThrow(
       "memory handle ownership conflict"
     );
-  });
-});
-
-// Parity between the witnesses' fixed literal and the implementation; it reads
-// the boundary refusal's own exports, so it is a new-surface check, not a
-// behavioural witness.
-describe("the witnesses' fixed refusal literal", () => {
-  it("deep-equals refusalResult() and serializes to REFUSAL_TEXT", () => {
-    expect(expectedRefusal()).toEqual(refusalResult());
-    expect(EXPECTED_REFUSAL_TEXT).toBe(REFUSAL_TEXT);
-    expect(expectedRefusalBody()).toEqual(boundaryRefusal());
   });
 });

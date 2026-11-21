@@ -41,13 +41,14 @@ import {
 } from "../../src/operational/agent-audit-redaction.js";
 import { SIEM_EXPORT_FORMATS, createSIEMTools } from "../../src/audit/siem-tools.js";
 import { createServer } from "../../src/router.js";
-import { fingerprintIdentityId, refusalResult } from "../../src/agent-native/safety-base.js";
+import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import type { DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
 import type { ToolDefinition } from "../../src/router.js";
 import { Broker } from "../../src/disclosure/broker/broker.js";
 import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
 import type { Backend } from "../../src/disclosure/broker/backend-interface.js";
 import { SecretNotFoundError } from "../../src/disclosure/broker/backend-interface.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const ALLOWED_VIEW_KEYS = [...AGENT_AUDIT_VIEW_FIELDS].sort();
 const ALLOWED_EVENT_KEYS = [
@@ -450,7 +451,7 @@ describe("agent-audit-allowlist: router catch-all (MED-2 fail-closed errors)", (
       {}
     );
     // Agent sees ONLY the one refusal — never the raw message or a ref.
-    expect(res).toEqual(refusalResult());
+    expect(res).toEqual(expectedRefusal());
     expect(JSON.stringify(res)).not.toContain(SECRET);
     expect(JSON.stringify(res)).not.toContain("/etc/sanctuary");
 

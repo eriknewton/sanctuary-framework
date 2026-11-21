@@ -8,7 +8,7 @@ import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
-import { fingerprintIdentityId, refusalResult } from "../../src/agent-native/safety-base.js";
+import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import { DenialLedger } from "../../src/agent-native/denial-ledger.js";
 import type { MultiAgentIsolationGuard } from "../../src/sdw/memory-isolation.js";
 import { KNOWN_SIGNERS_NAMESPACE, KnownSignersStore, knownSignerStorageKey } from "../../src/reputation/known-signers-store.js";
@@ -24,6 +24,7 @@ import { EXIT_IMPORT_NAMESPACE, MAX_EXIT_IMPORT_JOURNAL_LOCATIONS } from "../../
 import type { CrossProcessLockLease, CrossProcessLockOptions } from "../../src/storage/cross-process-lock.js";
 import { SignerPruneError } from "../../src/storage/signer-prune-outcome.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const KEY_BYTES = 32; // Ed25519 seeds and the symmetric master key are 256 bits.
 const MASTER_FIXTURE_BYTE = 1; // Deterministic test material, distinct from the signer seed.
@@ -530,7 +531,7 @@ describe("signer prune outcome ownership", () => {
     if (routed) {
       // Through the router the agent receives the one refusal; the committed and
       // audited facts are the operator's, on the ledger's first row.
-      expect(response).toEqual(refusalResult());
+      expect(response).toEqual(expectedRefusal());
       expect(await ledgerRows(ledgerAudit)).toEqual([expect.objectContaining({ details: expect.objectContaining({
         cause: "post_allow_refusal", tool: OPERATION, error_name: "error",
         error_message: "deletion committed, audit unavailable", committed: true, audited: false,
@@ -554,7 +555,7 @@ describe("signer prune outcome ownership", () => {
     f.audit.rejectOperation = OPERATION;
     const ledgerAudit = new AuditLog(new MemoryStorage(), MASTER);
     const response = await throughRouter(f, ledgerAudit);
-    expect(response).toEqual(refusalResult());
+    expect(response).toEqual(expectedRefusal());
     expect(await ledgerRows(ledgerAudit)).toEqual([expect.objectContaining({ details: expect.objectContaining({
       cause: "post_allow_refusal", tool: OPERATION, error_name: "error", error_message: "audit unavailable",
     }) })]);

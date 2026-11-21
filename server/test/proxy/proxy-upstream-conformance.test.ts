@@ -4,7 +4,6 @@ import { describe, expect, it, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer, type ToolDefinition } from "../../src/router.js";
-import { refusalResult } from "../../src/agent-native/safety-base.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
@@ -19,6 +18,7 @@ import { InjectionDetector } from "../../src/security/injection-detector.js";
 import { ClientManager } from "../../src/proxy/client-manager.js";
 import { ProxyRouter } from "../../src/proxy/proxy-router.js";
 import type { UpstreamServer } from "../../src/sovereignty-profile.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const FIXTURE_PATH = fileURLToPath(
   new URL("./fixtures/upstream-conformance-server.mjs", import.meta.url)
@@ -130,7 +130,7 @@ describe("proxy upstream transport conformance", () => {
       },
     });
 
-    expect(result).toEqual(refusalResult());
+    expect(result).toEqual(expectedRefusal());
     expect(JSON.stringify(result)).not.toContain("must not reach upstream");
     expect(await forwardedCallCount(harness)).toBe(0);
 
@@ -205,13 +205,13 @@ describe("proxy upstream transport conformance", () => {
       arguments: {},
     });
     // Both reach the agent as the one refusal; which failure it was stays in the audit rows below.
-    expect(malformed).toEqual(refusalResult());
+    expect(malformed).toEqual(expectedRefusal());
 
     const exploded = await harness.client.callTool({
       name: "proxy/real_stdio/explode",
       arguments: {},
     });
-    expect(exploded).toEqual(refusalResult());
+    expect(exploded).toEqual(expectedRefusal());
     expect(JSON.stringify(exploded)).not.toContain("/tmp/private-path");
     expect(await forwardedCallCount(harness)).toBe(2);
 

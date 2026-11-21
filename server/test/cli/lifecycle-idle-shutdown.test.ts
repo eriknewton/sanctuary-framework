@@ -12,7 +12,7 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { decrypt } from "../../src/core/encryption.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { refusalResult } from "../../src/agent-native/safety-base.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const fixture = fileURLToPath(new URL("../fixtures/lifecycle-idle-child.ts", import.meta.url));
 const owned: Array<{ child: ChildProcess; root: string; done: Promise<unknown> }> = [];
@@ -374,7 +374,7 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")("L
         run.command("RESUME");
         if (trigger === "IMPORT") {
           // The refused import reaches the agent as the one refusal; why it failed is operator-side.
-          expect(await saving).toEqual(refusalResult());
+          expect(await saving).toEqual(expectedRefusal());
         } else if (trigger === "CLAIM" || trigger === "IDENTITY") {
           expect((await saving).isError).toBe(true);
         } else {

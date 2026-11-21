@@ -10,12 +10,7 @@ import { DEFAULT_POLICY, generateDefaultPolicyYaml } from "../../src/principal-p
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import {
-  boundaryRefusal,
-  fingerprintIdentityId,
-  REFUSAL_TEXT,
-  refusalResult,
-} from "../../src/agent-native/safety-base.js";
+import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
 import type { ToolCallTrapRuntime } from "../../src/honeypot/tool-call-trap-runtime.js";
@@ -29,8 +24,18 @@ import { AGENT_AUDIT_VIEW_FIELDS } from "../../src/operational/agent-audit-redac
 import { INTERNAL_SIGNING_DOMAIN_PREFIXES } from "../../src/core/signing-domains.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+import { EXPECTED_REFUSAL_TEXT, expectedRefusal, expectedRefusalBody } from "../helpers/expected-refusal.js";
 
 type TextPayload = Record<string, unknown>;
+
+/** A call's outcome as data, so a protocol error fails an assertion instead of throwing. */
+async function settled<T>(call: Promise<T>): Promise<{ resolved: T } | { rejected: string }> {
+  try {
+    return { resolved: await call };
+  } catch (error) {
+    return { rejected: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 async function connectTools(tools: ToolDefinition[], gate: ApprovalGate): Promise<Client> {
   const server = createServer(tools, { gate });
@@ -140,7 +145,7 @@ describe("router gate denial opacity", () => {
           arguments: testCase.args,
         });
         // The whole result, not a field subset: every denial is the one refusal.
-        expect(result, testCase.label).toEqual(refusalResult());
+        expect(result, testCase.label).toEqual(expectedRefusal());
         denials.push({
           label: testCase.label,
           payload: parseTextPayload(result),
@@ -148,7 +153,7 @@ describe("router gate denial opacity", () => {
       }
 
       for (const denial of denials) {
-        expect(denial.payload, denial.label).toEqual(boundaryRefusal());
+        expect(denial.payload, denial.label).toEqual(expectedRefusalBody());
         expect(denial.payload, denial.label).not.toHaveProperty("approval_required");
         expect(denial.payload, denial.label).not.toHaveProperty("tier");
         expect(denial.payload, denial.label).not.toHaveProperty("reason");
@@ -510,48 +515,61 @@ describe("one refusal through the production composition root", () => {
     }
   });
 
-  it.each(REFUSAL_CASES)("$label reaches the agent as refusalResult() and the ledger with its cause", async (refusal) => {
+  // What each refusal handed the ledger, kept for the seam checks below.
+  const seamRecords = new Map<string, DenialRecord[]>();
+
+  it.each(REFUSAL_CASES)("$label reaches the agent as the one refusal", async (refusal) => {
     const gateRowsBefore = await gateRowCount(booted);
     const recordsBefore = ledgerSeam.records.length;
-    const result = await refusal.run(booted);
-    results.set(refusal.label, result);
-    expect(result).toEqual(refusalResult());
-    expect((result.content as Array<{ text: string }>)[0]!.text).toBe(REFUSAL_TEXT);
-    const added = ledgerSeam.records.slice(recordsBefore) as DenialRecord[];
-    expect(added.map((record) => record.cause)).toEqual([refusal.cause]);
-    expect(added[0]!.input).toMatchObject({ origin: "agent:opacity-agent" });
+    const outcome = await settled(refusal.run(booted));
+    seamRecords.set(refusal.label, ledgerSeam.records.slice(recordsBefore) as DenialRecord[]);
+    if ("resolved" in outcome) results.set(refusal.label, outcome.resolved);
+    expect(outcome).toEqual({ resolved: expectedRefusal() });
+    if (!("resolved" in outcome)) return;
+    expect((outcome.resolved.content as Array<{ text: string }>)[0]!.text).toBe(EXPECTED_REFUSAL_TEXT);
     if (refusal.gateRow) {
       expect(await gateRowCount(booted) - gateRowsBefore).toBe(1);
     }
   });
 
-  it("the cooperative recall of a hidden key and the primitive state_write to a reserved namespace both reach the agent as refusalResult() through a real tools/call", () => {
-    expect(results.get("recall of a hidden key")).toEqual(refusalResult());
-    expect(results.get("primitive state_write to a reserved namespace after allow")).toEqual(refusalResult());
+  it("the cooperative recall of a hidden key and the primitive state_write to a reserved namespace both reach the agent as the one refusal through a real tools/call", () => {
+    expect(results.get("recall of a hidden key")).toEqual(expectedRefusal());
+    expect(results.get("primitive state_write to a reserved namespace after allow")).toEqual(expectedRefusal());
   });
 
-  it("a gate refusal, a cooperative refusal, a primitive refusal and a proxy refusal draw on one ledger", async () => {
-    const shared = ledgerSeam.targets.at(-1);
-    // The composition root built one ledger for the served process and handed it to the router.
-    expect(shared).toBeInstanceOf(DenialLedger);
-    // Records since the served process booted (the fixture router above has no ledger of its own).
-    const served = ledgerSeam.records.slice(servedRecordsFrom);
-    expect(served.length).toBeGreaterThan(0);
-    expect(served.every((record) => record.target === shared)).toBe(true);
-    const drew = (tool: string, cause: DenialCause) =>
-      served.some((record) => record.cause === cause && (record.input as DenialRecordInput).tool === tool);
-    expect(drew("state_delete", "gate_denied")).toBe(true);
-    expect(drew("sanctuary_recall", "post_allow_refusal")).toBe(true);
-    expect(drew("state_write", "post_allow_refusal")).toBe(true);
-    expect(drew(`proxy/${FIXTURE_UPSTREAM}/read`, "post_allow_refusal")).toBe(true);
-    // The one ledger wrote each tool's window row to the served process's audit log.
-    await vi.waitFor(async () => {
-      const rows = (await booted.app.auditLog.query({ operation_type: "denial_cause", limit: 1_000 })).entries;
-      const tools = new Set(rows.map((row) => row.details?.tool));
-      for (const tool of ["state_delete", "sanctuary_recall", "state_write", `proxy/${FIXTURE_UPSTREAM}/read`]) {
-        expect(tools.has(tool), tool).toBe(true);
-      }
-      expect(rows.every((row) => row.identity_id === "system")).toBe(true);
+  // New-module witnesses: what the router hands the denial ledger, read at the
+  // router-to-ledger seam. They need the ledger module; the agent-facing
+  // witnesses above do not.
+  describe("new-module witnesses: the router-to-ledger seam", () => {
+    it.each(REFUSAL_CASES)("$label reaches the ledger with its cause", (refusal) => {
+      const added = seamRecords.get(refusal.label) ?? [];
+      expect(added.map((record) => record.cause)).toEqual([refusal.cause]);
+      expect(added[0]?.input).toMatchObject({ origin: "agent:opacity-agent" });
+    });
+
+    it("a gate refusal, a cooperative refusal, a primitive refusal and a proxy refusal draw on one ledger", async () => {
+      const shared = ledgerSeam.targets.at(-1);
+      // The composition root built one ledger for the served process and handed it to the router.
+      expect(shared).toBeInstanceOf(DenialLedger);
+      // Records since the served process booted (the fixture router above has no ledger of its own).
+      const served = ledgerSeam.records.slice(servedRecordsFrom);
+      expect(served.length).toBeGreaterThan(0);
+      expect(served.every((record) => record.target === shared)).toBe(true);
+      const drew = (tool: string, cause: DenialCause) =>
+        served.some((record) => record.cause === cause && (record.input as DenialRecordInput).tool === tool);
+      expect(drew("state_delete", "gate_denied")).toBe(true);
+      expect(drew("sanctuary_recall", "post_allow_refusal")).toBe(true);
+      expect(drew("state_write", "post_allow_refusal")).toBe(true);
+      expect(drew(`proxy/${FIXTURE_UPSTREAM}/read`, "post_allow_refusal")).toBe(true);
+      // The one ledger wrote each tool's window row to the served process's audit log.
+      await vi.waitFor(async () => {
+        const rows = (await booted.app.auditLog.query({ operation_type: "denial_cause", limit: 1_000 })).entries;
+        const tools = new Set(rows.map((row) => row.details?.tool));
+        for (const tool of ["state_delete", "sanctuary_recall", "state_write", `proxy/${FIXTURE_UPSTREAM}/read`]) {
+          expect(tools.has(tool), tool).toBe(true);
+        }
+        expect(rows.every((row) => row.identity_id === "system")).toBe(true);
+      });
     });
   });
 
@@ -710,12 +728,23 @@ describe("router stage faults", () => {
     { ...fault, writesFirst: false, variant: "rejects before writing" },
     { ...fault, writesFirst: true, variant: "writes bytes, then throws" },
   ]);
+  // What each fault handed the ledger, kept for the seam checks below.
+  const faultRecords = new Map<string, DenialRecord[]>();
+
   it.each(variants)("a fault in $stage that $variant is the one refusal", async (fault) => {
     const rig = await fault.arrange(fault.writesFirst);
     // A protocol error would reject here; the boundary must resolve to the refusal.
-    const result = await rig.client.callTool({ name: rig.name, arguments: {} });
-    expect(result).toEqual(refusalResult());
-    expect(rig.records.map((record) => record.cause)).toEqual([fault.cause]);
+    const outcome = await settled(rig.client.callTool({ name: rig.name, arguments: {} }));
+    faultRecords.set(`${fault.stage} ${fault.variant}`, rig.records);
+    expect(outcome).toEqual({ resolved: expectedRefusal() });
+  });
+
+  // New-module witness: the cause each fault hands the ledger, read at the seam.
+  describe("new-module witnesses: the router-to-ledger seam", () => {
+    it.each(variants)("a fault in $stage that $variant reaches the ledger with its stage's cause", (fault) => {
+      const records = faultRecords.get(`${fault.stage} ${fault.variant}`) ?? [];
+      expect(records.map((record) => record.cause)).toEqual([fault.cause]);
+    });
   });
 });
 
@@ -798,7 +827,7 @@ describe("continuing paths through the boundary", () => {
   it("a call with no gate configured still runs the outcome check", async () => {
     const tool: ToolDefinition = { ...makeTool("identity_list"), handler: async () => toolResult({ error: "fixture refusal" }) };
     const rig = await faultRig([tool], false, false);
-    expect(await rig.client.callTool({ name: "identity_list", arguments: {} })).toEqual(refusalResult());
+    expect(await rig.client.callTool({ name: "identity_list", arguments: {} })).toEqual(expectedRefusal());
     expect(rig.records.map((record) => record.cause)).toEqual(["post_allow_refusal"]);
   });
 });

@@ -40,7 +40,7 @@ import { createCognitiveTools } from "../../src/cognitive/tools.js";
 import { UNATTRIBUTED_DISCLOSURE_OPERATION } from "../../src/cognitive/unattributed-disclosure.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { boundaryRefusal } from "../../src/agent-native/safety-base.js";
+import { expectedRefusalBody } from "../helpers/expected-refusal.js";
 
 const MASTER_KEY = new Uint8Array([
   0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98,
@@ -259,7 +259,7 @@ describe("the unattributed-disclosure MCP tool", () => {
     // The GENERIC denial, not a specific one: which of "not yours" or "no
     // session" it was is not something the caller is told, so the denial leaks
     // no structure about the fortress.
-    expect(payload).toEqual(boundaryRefusal());
+    expect(payload).toEqual(expectedRefusalBody());
 
     // And the denial is on the record, written by the shared operation rather
     // than by this transport.

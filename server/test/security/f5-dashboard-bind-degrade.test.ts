@@ -46,7 +46,6 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { refusalResult } from "../../src/agent-native/safety-base.js";
 import { createSanctuaryServer } from "../../src/index.js";
 import {
   StderrApprovalChannel,
@@ -58,6 +57,7 @@ import {
 import type { ApprovalRequest } from "../../src/principal-policy/types.js";
 import { createTempFortress, type TempFortress } from "../helpers/temp-fortress.js";
 import { bindWithRetry, randomTestPort } from "../util/port-collision-retry.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 async function callTool(
   server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
@@ -169,9 +169,10 @@ describe("F5: a busy embedded-dashboard port degrades the MCP stdio boot instead
       namespace: "f5-test-ns",
       key: "f5-test-key",
     });
-    // Must match refusalResult() in agent-native/safety-base.ts, the one
-    // result router.ts returns for every refusal whichever rule or tier fired.
-    expect(denied).toEqual(refusalResult());
+    // Must match REFUSAL_TEXT in server/src/agent-native/safety-base.ts (the
+    // fixed literal in test/helpers/expected-refusal.ts), the one result
+    // router.ts returns for every refusal whichever rule or tier fired.
+    expect(denied).toEqual(expectedRefusal());
     const deniedPayload = parseToolResult(denied);
     const deniedText = JSON.stringify(deniedPayload).toLowerCase();
     expect(deniedText).not.toContain("port");

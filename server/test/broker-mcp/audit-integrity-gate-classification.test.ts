@@ -5,9 +5,9 @@ import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/operational/audit-log.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
-import { refusalResult } from "../../src/agent-native/safety-base.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { extraAllowedFieldsForTool } from "../../src/tool-args.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 async function connectTools(tools: ToolDefinition[], auditLog: AuditLog): Promise<Client> {
   const server = createServer(tools, { auditLog });
@@ -102,7 +102,7 @@ describe("MCP audit-integrity gate classification", () => {
     const blockedWrite = await client.callTool({ name: "test_write", arguments: {} });
     // The write stop is the one boundary refusal: no finding, count or
     // remediation reaches the agent; the stop's cause stays operator-side.
-    expect(blockedWrite).toEqual(refusalResult());
+    expect(blockedWrite).toEqual(expectedRefusal());
     expect(writeCount).toBe(0);
 
     // An agent-supplied accept_broken_chain no longer exists as an accepted

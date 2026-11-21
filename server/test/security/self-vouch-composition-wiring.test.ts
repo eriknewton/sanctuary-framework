@@ -27,7 +27,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
 import type { ApprovalResponse } from "../../src/principal-policy/types.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
-import { refusalResult } from "../../src/agent-native/safety-base.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 async function callServerTool(
   server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
@@ -93,7 +93,7 @@ describe("self-vouch guard: real composition root (createSanctuaryServer)", () =
       identity_id: b.identity_id,
     });
     // The agent receives the one refusal; the self-vouch reason is the operator's.
-    expect(responded).toEqual(refusalResult());
+    expect(responded).toEqual(expectedRefusal());
     await vi.waitFor(async () => {
       const failed = (await booted.auditLog.query({ operation_type: "handshake_failed", limit: 10 })).entries;
       expect(failed).toContainEqual(expect.objectContaining({
@@ -109,7 +109,7 @@ describe("self-vouch guard: real composition root (createSanctuaryServer)", () =
       action: "register",
       peer_id: b.identity_id,
     });
-    expect(registered).toEqual(refusalResult());
+    expect(registered).toEqual(expectedRefusal());
     // Refused before the registration-boundary self-vouch check: no handshake
     // entry existed, so neither a registration nor that check's row was written.
     const rows = (await booted.auditLog.query({ limit: 200 })).entries;
@@ -271,7 +271,7 @@ async function runPoisonedFederationRegistration(
 
   // The agent receives the one refusal; the registration-boundary self-vouch
   // check's own row is the operator's evidence that it fired.
-  expect(registered).toEqual(refusalResult());
+  expect(registered).toEqual(expectedRefusal());
   await vi.waitFor(async () => {
     const blocked = (await fedFortress.auditLog.query({
       operation_type: "federation_peer_register_self_vouch_blocked",
