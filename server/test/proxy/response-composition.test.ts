@@ -11,6 +11,7 @@ import { ClientManager } from "../../src/proxy/client-manager.js";
 import { CallGovernor } from "../../src/operational/call-governor.js";
 import { ResponseScreen } from "../../src/proxy/response-screen.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 let home: Awaited<ReturnType<typeof createTempHome>>;
 let app: SanctuaryServer;
@@ -73,11 +74,21 @@ describe("shipping response composition", () => {
     const content = [{ type: "resource", resource: { uri: "file:///fixture", text: "\n\\\"😀" } }];
     expect(await call("json")).toEqual({ content: [{ type: "text", text: JSON.stringify({ upstream_response: content }, null, 2) }] });
   });
-  it("screens sanitized upstream exceptions", async () => {
+  it("screens sanitized upstream exceptions and refuses them to the agent", async () => {
     const result = await call("error");
-    expect(JSON.stringify(result)).toContain("ignore previous instructions");
+    // The sanitized exception is still screened and audited; the agent receives the one refusal.
+    expect(result).toEqual(expectedRefusal());
     expect(JSON.stringify(result)).not.toContain("/tmp/fixture");
     expect(await labels()).toContain("label_suspected");
+  });
+  it("an upstream isError result reaches the agent as the envelope", async () => {
+    // The upstream's own error flag rides beside content, as the MCP result schema allows.
+    const upstreamFailure = { content: [{ type: "text", text: "upstream reports a failure" }], isError: true };
+    const upstream = vi.spyOn(ClientManager.prototype, "callTool").mockResolvedValueOnce(upstreamFailure);
+    try {
+      expect(await call("upstream-is-error")).toEqual(expectedRefusal());
+      expect(upstream).toHaveBeenCalledOnce();
+    } finally { upstream.mockRestore(); }
   });
   it("does not activate outbound privacy for a policy-bound server", async () => {
     const prepare = vi.spyOn(LocalPrivacyEngine.prototype, "filterOutbound");
@@ -90,14 +101,13 @@ describe("shipping response composition", () => {
     expect(await client.callTool({ name: "proxy/unbound/read", arguments: { kind: "extra" } })).toEqual({ content: [{ type: "text", text: "hello" }] });
   });
   it.each(["oversize", "candidates"])("withholds %s and retains sticky exposure", async kind => {
-    const result = await call(kind);
-    expect(JSON.stringify(result)).toContain("Operation not permitted");
+    expect(await call(kind)).toEqual(expectedRefusal());
     expect(await labels()).toContain("withhold_scan_failure");
     expect(app.responseExposure).toEqual({ state: "state_TAINTED", tainted: true, observed: true });
   });
   it("withholds detector failure on cache hits without upstream fallback", async () => {
     const scan = vi.spyOn(ResponseScreen.prototype, "screen").mockRejectedValueOnce(new Error("injected scanner fault"));
-    expect(JSON.stringify(await call("extra"))).toContain("Operation not permitted"); scan.mockRestore();
+    expect(await call("extra")).toEqual(expectedRefusal()); scan.mockRestore();
   });
   it("schema-validation errors never copy upstream bytes into logs or audit", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -105,7 +115,7 @@ describe("shipping response composition", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       const result = await call("schema-error");
-      expect(JSON.stringify(result)).toContain("Operation not permitted");
+      expect(result).toEqual(expectedRefusal());
       const entries = (await app.auditLog.query({ limit: 1000 })).entries;
       const retained = JSON.stringify([result, entries, error.mock.calls, warn.mock.calls, log.mock.calls]);
       expect(retained).not.toContain("untrusted-schema-marker");
@@ -136,7 +146,7 @@ describe("shipping response composition", () => {
       if (entry.operation === operation) throw new Error("injected audit fault");
       return original(entry);
     });
-    expect(JSON.stringify(await call("audit-fault"))).toContain("Operation not permitted");
+    expect(await call("audit-fault")).toEqual(expectedRefusal());
     expect(audit).toHaveBeenCalledWith(expect.objectContaining({ details: expect.objectContaining({ reason: "withhold_audit_failure" }) }));
     audit.mockRestore();
     expect(cache).not.toHaveBeenCalled();
@@ -150,7 +160,7 @@ describe("shipping response composition", () => {
       lease.fence(); throw new Error("fixture uncertain worker termination");
     });
     try {
-      expect(JSON.stringify(await call("fenced-cleanup"))).toContain("Operation not permitted");
+      expect(await call("fenced-cleanup")).toEqual(expectedRefusal());
       let closed = false;
       const cleanup = app.cleanup().then(() => { closed = true; });
       await vi.waitFor(() => expect(closed).toBe(true)); await cleanup;

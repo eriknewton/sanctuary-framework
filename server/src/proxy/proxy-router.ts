@@ -21,6 +21,7 @@ import type { ResponseReservation } from "./response-runtime.js";
 import { validateResponse, normalizeScreenedResponse, rehydrationBudget, RequestResponseBindings, type CanonicalResponse } from "./response-bounds.js";
 import type { ToolDefinition, ToolHandler } from "../router.js";
 import { toolResult } from "../router.js";
+import { markProxiedTool, recordProxiedOutcome } from "../tool-outcome.js";
 import type { ClientManager } from "./client-manager.js";
 import { UpstreamUnavailableError } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
@@ -32,6 +33,12 @@ import {
 import type { CallGovernor } from "../operational/call-governor.js";
 import type { LocalPrivacyEngine, PrivacyPolicy } from "../operational/privacy-core.js";
 import type { PrivacyDestinationCategory } from "../contracts/v1.1/index.js";
+
+// Must match the proxied-origin rule in classifyToolOutcome (tool-outcome.ts):
+// every refusal this handler builds is marked as a proxy refusal on the returned object.
+function proxyRefusal(body: object): ReturnType<typeof toolResult> {
+  return recordProxiedOutcome(toolResult(body), { upstream_failed: false, proxy_refusal: true });
+}
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -122,13 +129,15 @@ export class ProxyRouter {
       for (const upstreamTool of serverTools) {
         const proxyName = `proxy/${serverName}/${upstreamTool.name}`;
 
-        tools.push({
+        // Must match the proxied-origin rule in classifyToolOutcome (tool-outcome.ts):
+        // the router recognizes a proxied tool only by this marked object.
+        tools.push(markProxiedTool({
           name: proxyName,
           description: `[via ${serverName}] ${upstreamTool.description}`,
           tool_class: "write",
           inputSchema: upstreamTool.inputSchema,
           handler: this.createHandler(serverName, upstreamTool.name),
-        });
+        }));
       }
     }
 
@@ -209,7 +218,7 @@ export class ProxyRouter {
           });
 
           this.notifyProxyCall(proxyName, serverName, "blocked", "injection_detected", tier);
-          return toolResult({
+          return proxyRefusal({
             error: "Operation not permitted",
             proxy: true,
           });
@@ -287,7 +296,7 @@ export class ProxyRouter {
             });
 
             this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
-            return toolResult({
+            return proxyRefusal({
               error: "Operation not permitted",
               proxy: true,
             });
@@ -356,7 +365,7 @@ export class ProxyRouter {
               "privacy_denied",
               tier
             );
-            return toolResult({
+            return proxyRefusal({
               error: "Operation not permitted",
               proxy: true,
               privacy_denied: true,
@@ -395,7 +404,7 @@ export class ProxyRouter {
               "privacy_denied",
               tier
             );
-            return toolResult({
+            return proxyRefusal({
               error: "Operation not permitted",
               proxy: true,
               privacy_denied: true,
@@ -414,6 +423,9 @@ export class ProxyRouter {
           reservation.observe();
           reservation.assertLive();
           validateResponse(value);
+          // Read before normalization drops `isError`: the upstream's own failure
+          // flag, or the failure this handler caught, decides the origin fact.
+          const upstreamFailed = error !== undefined || (value as { isError?: unknown }).isError === true;
           const canonical = value;
           let prepared: CanonicalResponse = canonical;
           if (outboundFiltered && privacyEngine && privacyPolicy) {
@@ -449,6 +461,9 @@ export class ProxyRouter {
           // Must precede CallGovernor.recordResult in operational/call-governor.ts: cache has no scan tokens.
           if (!cached && !error) this.options.governor?.recordResult(serverName, toolName, filteredArgs, canonical);
           this.notifyProxyCall(proxyName, serverName, error ? "error" : "allowed", error?.error ?? completion.label, tier);
+          // Must match the proxied-origin rule in classifyToolOutcome (tool-outcome.ts):
+          // the fact rides beside the delivered object, so the screened bytes are unchanged.
+          recordProxiedOutcome(delivered, { upstream_failed: upstreamFailed, proxy_refusal: false });
           return delivered; // These exact bytes were screened; no raw envelope or later rewriting is allowed.
         };
 
@@ -472,7 +487,7 @@ export class ProxyRouter {
             });
 
             this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
-            return toolResult({
+            return proxyRefusal({
               error: "Operation not permitted",
               proxy: true,
               governor_reason: govResult.reason,
@@ -534,7 +549,7 @@ export class ProxyRouter {
           else await audit; // Admission refusals still leave the existing operator audit row.
         } catch { /* Audit failure cannot release upstream content. */ }
         this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
-        return toolResult({ error: "Operation not permitted", proxy: true });
+        return proxyRefusal({ error: "Operation not permitted", proxy: true });
       } finally {
         context?.signal?.removeEventListener("abort", cancel);
         lease?.finish();

@@ -311,14 +311,28 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       }
     }
 
+    // Rows the router boundary writes around a refused call, outside the tool's own evidence.
+    const ROUTER_BOUNDARY_OPERATIONS = new Set(["gate_deny:sdw_import", "denial_cause"]);
+
     async function refusalEvidence(fixture: Awaited<ReturnType<typeof createImportFixture>>) {
       const denials = await auditOps(fixture.auditLog, "sdw_import_denied");
       const { entries } = await fixture.auditLog.query({});
       const serializedRows = JSON.stringify(denials);
+      const denialIndex = entries.findIndex((entry) => entry.operation === "sdw_import_denied");
       return {
         denials,
-        // Negative one selects the newest row in the oldest-first query.
-        lastEntry: entries.at(-1),
+        // Negative one selects the newest row the tool wrote in the oldest-first query; the
+        // router boundary's own rows follow it and are checked separately below.
+        lastEntry: entries.filter((entry) => !ROUTER_BOUNDARY_OPERATIONS.has(entry.operation)).at(-1),
+        // The flush in auditOps settles the ledger's detached row, so this order is fixed.
+        boundaryRows: entries.slice(denialIndex + 1).map((entry) => ({
+          operation: entry.operation,
+          identity_id: entry.identity_id,
+          result: entry.result,
+          decided_by: entry.details?.decided_by,
+          cause: entry.details?.cause,
+          tool: entry.details?.tool,
+        })),
         containsBundleBytes: serializedRows.includes(fixture.encodedBundle),
         containsBundleMarker: serializedRows.includes(bundleMarker),
         containsSourceRefMarker: serializedRows.includes(sourceRefMarker),
@@ -330,7 +344,7 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       };
     }
 
-    function expectedRefusalEvidence() {
+    function expectedRefusalEvidence(through: "router" | "direct hook") {
       // Subject: this refused call, attributed to the local system, never the caller's credibility.
       // Evidence: the tool's reference check supplies operation/result/details; layer names its subsystem.
       // The audit writer supplies timestamp; query verifies the persisted chain before returning the row.
@@ -346,6 +360,12 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       return {
         denials: [row],
         lastEntry: row,
+        // Through the router, a refusal decided while preparing arguments writes one pre-gate
+        // gate row, then one ledger row; a direct hook call has no router boundary.
+        boundaryRows: through === "router" ? [
+          { operation: "gate_deny:sdw_import", identity_id: "system", result: "failure", decided_by: "pre_gate" },
+          { operation: "denial_cause", identity_id: "system", result: "failure", cause: "pre_gate_argument_refused", tool: "sdw_import" },
+        ] : [],
         containsBundleBytes: false,
         containsBundleMarker: false,
         containsSourceRefMarker: false,
@@ -368,7 +388,7 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
         // while the bundle plants both nonempty markers for meaningful whole-row leak checks.
         expect({ result, ...await refusalEvidence(fixture) }).toEqual({
           result: fixedDenial("audit:gate:sdw_import", "unavailable", null),
-          ...expectedRefusalEvidence(),
+          ...expectedRefusalEvidence("router"),
         });
       });
     });
@@ -425,7 +445,7 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
         })).catch((caught: unknown) => caught);
         expect({ error, ...await refusalEvidence(fixture) }).toEqual({
           error: expect.objectContaining({ category: "invalid_identifier" }),
-          ...expectedRefusalEvidence(),
+          ...expectedRefusalEvidence("direct hook"),
         });
       });
     });

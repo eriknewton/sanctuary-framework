@@ -17,6 +17,7 @@ import {
   OpaqueNamespaceRegistry,
   type SessionBinding,
 } from "../../src/agent-native/safety-base.js";
+import { expectedRefusalBody } from "../helpers/expected-refusal.js";
 import type { ToolDefinition } from "../../src/router.js";
 
 async function callTool(
@@ -660,16 +661,11 @@ describe("agent-native Phase 1 safety base", () => {
     );
   });
 
-  it("uses only coarse retry_after values in fixed denials", () => {
-    expect(fixedDenial("audit:ref", "wait", "minutes")).toEqual({
-      denied: true,
-      message: "This action is not available in the current context.",
-      remediation_class: "wait",
-      retry_after: "minutes",
-      audit_ref: "audit:ref",
-      discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
-    });
-    expect(fixedDenial("audit:ref").retry_after).toBeNull();
+  it("the fixed-denial builder returns the one boundary refusal whatever its arguments", () => {
+    expect(fixedDenial("audit:ref", "wait", "minutes")).toEqual(expectedRefusalBody());
+    expect(fixedDenial("audit:ref")).toEqual(expectedRefusalBody());
+    expect(fixedDenial("audit:other", "unavailable", "hours")).toEqual(expectedRefusalBody());
+    expect(fixedDenial("audit:other").discovery_hint).toBe(COOPERATIVE_DENIAL_DISCOVERY_HINT);
   });
 
   it("shares concurrent first-use persisted claims inside one registry", async () => {

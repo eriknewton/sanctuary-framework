@@ -9,6 +9,7 @@ import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
+import { DenialLedger } from "../../src/agent-native/denial-ledger.js";
 import type { MultiAgentIsolationGuard } from "../../src/sdw/memory-isolation.js";
 import { KNOWN_SIGNERS_NAMESPACE, KnownSignersStore, knownSignerStorageKey } from "../../src/reputation/known-signers-store.js";
 import { createServer } from "../../src/router.js";
@@ -23,6 +24,7 @@ import { EXIT_IMPORT_NAMESPACE, MAX_EXIT_IMPORT_JOURNAL_LOCATIONS } from "../../
 import type { CrossProcessLockLease, CrossProcessLockOptions } from "../../src/storage/cross-process-lock.js";
 import { SignerPruneError } from "../../src/storage/signer-prune-outcome.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const KEY_BYTES = 32; // Ed25519 seeds and the symmetric master key are 256 bits.
 const MASTER_FIXTURE_BYTE = 1; // Deterministic test material, distinct from the signer seed.
@@ -189,13 +191,19 @@ function expectFailure(response: Response, expected: Record<string, unknown>) {
   expect(payload(response)).toEqual(expected);
   expect(JSON.stringify(response)).not.toContain(SECRET);
 }
+async function ledgerRows(ledgerAudit: AuditLog) {
+  await ledgerAudit.flush();
+  return (await ledgerAudit.query({ operation_type: "denial_cause" })).entries;
+}
 async function expectUnchanged(f: Awaited<ReturnType<typeof fixture>>) {
   expect(await f.storage.read(KNOWN_SIGNERS_NAMESPACE, f.key)).toEqual(f.before);
   expect(f.storage.deleted).toBe(0);
   expect(f.forget).not.toHaveBeenCalled();
 }
 
-async function throughRouter(f: Awaited<ReturnType<typeof fixture>>) {
+// The router's refusal causes go to a ledger over their own audit log, so the
+// fixture's audit log records only what the tool itself appended.
+async function throughRouter(f: Awaited<ReturnType<typeof fixture>>, ledgerAudit = new AuditLog(new MemoryStorage(), MASTER)) {
   const gateStorage = new MemoryStorage();
   const gate = new ApprovalGate(
     DEFAULT_POLICY,
@@ -210,7 +218,7 @@ async function throughRouter(f: Awaited<ReturnType<typeof fixture>>) {
       requester_identity_fingerprint: fingerprintIdentityId("prune-fixture"),
     }) },
   );
-  const server = createServer([f.tool], { gate, auditLog: f.audit });
+  const server = createServer([f.tool], { gate, auditLog: f.audit, denialLedger: new DenialLedger(ledgerAudit, Date.now) });
   const client = new Client({ name: "signer-prune-witness", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -518,11 +526,22 @@ describe("signer prune outcome ownership", () => {
   it.each([false, true])("preserves committed deletion on completion-audit failure through router=%s", async routed => {
     const f = await fixture();
     f.audit.rejectOperation = COMPLETE;
-    const response = routed ? await throughRouter(f) : await f.tool.handler({}, undefined, APPROVAL);
-    expect(response).toHaveProperty("isError", true);
-    expect(response.content).toEqual([{ type: "text", text: JSON.stringify({
-      error: "deletion committed, audit unavailable", committed: true, audited: false,
-    }, null, 2) }]);
+    const ledgerAudit = new AuditLog(new MemoryStorage(), MASTER);
+    const response = routed ? await throughRouter(f, ledgerAudit) : await f.tool.handler({}, undefined, APPROVAL);
+    if (routed) {
+      // Through the router the agent receives the one refusal; the committed and
+      // audited facts are the operator's, on the ledger's first row.
+      expect(response).toEqual(expectedRefusal());
+      expect(await ledgerRows(ledgerAudit)).toEqual([expect.objectContaining({ details: expect.objectContaining({
+        cause: "post_allow_refusal", tool: OPERATION, error_name: "error",
+        error_message: "deletion committed, audit unavailable", committed: true, audited: false,
+      }) })]);
+    } else {
+      expect(response).toHaveProperty("isError", true);
+      expect(response.content).toEqual([{ type: "text", text: JSON.stringify({
+        error: "deletion committed, audit unavailable", committed: true, audited: false,
+      }, null, 2) }]);
+    }
     expect(JSON.stringify(response)).not.toContain(SECRET);
     expect(JSON.stringify(response)).not.toContain(f.did);
     expect(await f.known.lookup(f.did)).toBeNull();
@@ -534,9 +553,12 @@ describe("signer prune outcome ownership", () => {
     const f = await fixture();
     f.guard.mockResolvedValue({ allowed: false, reason: "owner_scope_conflict" });
     f.audit.rejectOperation = OPERATION;
-    const response = await throughRouter(f);
-    expect(response).toHaveProperty("isError", true);
-    expect(response.content).toEqual([{ type: "text", text: JSON.stringify({ error: "audit unavailable" }, null, 2) }]);
+    const ledgerAudit = new AuditLog(new MemoryStorage(), MASTER);
+    const response = await throughRouter(f, ledgerAudit);
+    expect(response).toEqual(expectedRefusal());
+    expect(await ledgerRows(ledgerAudit)).toEqual([expect.objectContaining({ details: expect.objectContaining({
+      cause: "post_allow_refusal", tool: OPERATION, error_name: "error", error_message: "audit unavailable",
+    }) })]);
     await expectUnchanged(f);
   });
 

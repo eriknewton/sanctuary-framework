@@ -17,7 +17,7 @@
  * because it never re-runs index.ts's own wiring in the first place.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -27,6 +27,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
 import type { ApprovalResponse } from "../../src/principal-policy/types.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 async function callServerTool(
   server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
@@ -62,10 +63,11 @@ afterEach(async () => {
 
 describe("self-vouch guard: real composition root (createSanctuaryServer)", () => {
   it("handshake_respond refuses a self-vouch attempt end-to-end through the real boot path", async () => {
-    const { server } = await createSanctuaryServer({
+    const booted = await createSanctuaryServer({
       storage: new MemoryStorage(),
       passphrase: TEST_PASSPHRASE,
     });
+    const { server } = booted;
 
     const a = parse(
       await callServerTool(server, "identity_create", { label: "identity-a" })
@@ -86,26 +88,33 @@ describe("self-vouch guard: real composition root (createSanctuaryServer)", () =
     // B (also locally held, on the SAME fortress) responds to A's challenge.
     // If index.ts's composition ever stopped wiring identityManager into the
     // handshake producer, this would silently succeed instead of refusing.
-    const responded = parse(
-      await callServerTool(server, "handshake_respond", {
-        challenge: initiated.challenge,
-        identity_id: b.identity_id,
-      })
-    );
-    expect(responded.error).toContain("same fortress");
+    const responded = await callServerTool(server, "handshake_respond", {
+      challenge: initiated.challenge,
+      identity_id: b.identity_id,
+    });
+    // The agent receives the one refusal; the self-vouch reason is the operator's.
+    expect(responded).toEqual(expectedRefusal());
+    await vi.waitFor(async () => {
+      const failed = (await booted.auditLog.query({ operation_type: "handshake_failed", limit: 10 })).entries;
+      expect(failed).toContainEqual(expect.objectContaining({
+        details: expect.objectContaining({ reason: "self_vouch_local_did" }),
+      }));
+    });
 
     // federation_peers register() then finds no completed handshake — the
     // producer chokepoint kept the shared map clean — proving the SAME
     // composition root's federation wiring never even needed its own
     // defense-in-depth check to fire for this attempt.
-    const registered = parse(
-      await callServerTool(server, "federation_peers", {
-        action: "register",
-        peer_id: b.identity_id,
-      })
-    );
-    expect(registered.registered).toBeUndefined();
-    expect(registered.error).toContain("No completed handshake");
+    const registered = await callServerTool(server, "federation_peers", {
+      action: "register",
+      peer_id: b.identity_id,
+    });
+    expect(registered).toEqual(expectedRefusal());
+    // Refused before the registration-boundary self-vouch check: no handshake
+    // entry existed, so neither a registration nor that check's row was written.
+    const rows = (await booted.auditLog.query({ limit: 200 })).entries;
+    expect(rows.filter((e) => e.operation === "federation_peer_register")).toEqual([]);
+    expect(rows.filter((e) => e.operation === "federation_peer_register_self_vouch_blocked")).toEqual([]);
   });
 
   it("federation_peers register() refuses a self-vouch even if a poisoned entry reached the map by some other path, using the REAL composition root's identityManager wiring (MUST-FIX 2, register §Z RECHECK fix-round-2)", async () => {
@@ -255,15 +264,23 @@ async function runPoisonedFederationRegistration(
   expect(poisonedImport.error).toBeUndefined();
   expect(poisonedImport.identity_id).toBe(c.identity_id);
 
-  const registered = parse(
-    await callServerTool(fedFortress.server, "federation_peers", {
-      action: "register",
-      peer_id: c.identity_id,
-    })
-  );
+  const registered = await callServerTool(fedFortress.server, "federation_peers", {
+    action: "register",
+    peer_id: c.identity_id,
+  });
 
-  expect(registered.registered).toBeUndefined();
-  expect(registered.error).toContain("holds keys for");
+  // The agent receives the one refusal; the registration-boundary self-vouch
+  // check's own row is the operator's evidence that it fired.
+  expect(registered).toEqual(expectedRefusal());
+  await vi.waitFor(async () => {
+    const blocked = (await fedFortress.auditLog.query({
+      operation_type: "federation_peer_register_self_vouch_blocked",
+      limit: 10,
+    })).entries;
+    expect(blocked).toContainEqual(expect.objectContaining({
+      details: expect.objectContaining({ peer_id: c.identity_id }),
+    }));
+  });
 }
 
 describe("structural backstop: index.ts wires identityManager into federation and handshake tool construction", () => {

@@ -332,11 +332,20 @@ export const EVALUATE_ROUTES: readonly EvaluateRoute[] = [
 ] as const;
 
 /**
+ * What an agent should do when a call is refused. Every refusal is the same
+ * fixed result, so the line names no cause; it says only what to do instead.
+ * Must match the exact string asserted in
+ * test/agent-native/first-class-surfacing.test.ts.
+ */
+export const REFUSAL_INSTRUCTION_LINE =
+  "A refusal does not say why. If a call is refused, do not repeat it as it is: change the request, or tell your operator what you were trying to do." as const;
+
+/**
  * Build the agent-facing MCP `instructions` string from the catalog.
  *
  * This is what a harness reads at connect time. It is a concise "start here"
  * for an AI agent: what this server offers cooperatively and why to route
- * through it, followed by the per-tool catalog, then the bounds paragraph
+ * through it, followed by the per-tool catalog, the refusal line, then the bounds paragraph
  * (platforms, tiers, what is never claimed, where evidence lives). It makes
  * no enforcement claim the cooperative layer cannot back on its own; the
  * bounds paragraph is copied from the README bound, never strengthened.
@@ -355,6 +364,7 @@ export function buildServerInstructions(): string {
   for (const entry of COOPERATIVE_CAPABILITIES) {
     lines.push(`- ${entry.tool}: ${entry.does} Use when: ${entry.when}`);
   }
+  lines.push("", REFUSAL_INSTRUCTION_LINE);
   // Bounds come last and are never omitted: an agent that reads only the
   // catalog above would believe the cooperative layer is the whole product.
   lines.push("", "Bounds, tiers and evidence:", buildBoundsParagraph());
