@@ -72,14 +72,23 @@ interface EventCursor {
   reads: number;
 }
 
+// Thirty-two needles plus six named keys fit within sixty-four, the next power of two.
+export const HELP_PROBE_MAX_KEYS = 64;
+// One minute, matching the window of other rate-bounded audit summaries.
+export const HELP_PROBE_ROW_INTERVAL_MS = 60_000;
+// Three samples of one hundred twenty characters keep each key's retained examples bounded.
+const HELP_PROBE_MAX_SAMPLES = 3;
+const HELP_PROBE_SAMPLE_CHARS = 120;
 interface HelpProbeSummary {
   count: number;
   examples: string[];
-  first_seen: string;
-  last_seen: string;
+  first_seen_ms: number;
+  last_seen_ms: number;
+  last_row_ms?: number;
 }
 
 export interface CooperativeSurfaceOptions {
+  now?: () => number;
   identityManager: IdentityManager;
   namespaceRegistry: OpaqueNamespaceRegistry;
   auditLog: AuditLog;
@@ -101,6 +110,8 @@ export function createAgentNativeCooperativeTools(
   const hidden = new Map<string, HiddenMarker>();
   const cursors = new Map<string, EventCursor>();
   const helpProbeSummaries = new Map<string, HelpProbeSummary>();
+  // The real clock keeps the row bound live when the caller supplies no clock.
+  const helpProbeNow = options.now ?? Date.now;
   const approvalProofStore = options.approvalProofStore ?? new ApprovalProofStore();
 
   const callPrimitive: PrimitiveCaller = async (name, args) => {
@@ -457,27 +468,43 @@ export function createAgentNativeCooperativeTools(
 
   async function recordHelpProbe(intent: string, probeKey: string | undefined, safetyClass: string) {
     if (safetyClass === "ordinary") return;
-    const activeIdentity = active();
-    const summaryKey = `${activeIdentity.requester_identity_fingerprint}:${probeKey ?? "sensitive"}`;
-    const now = new Date().toISOString();
-    const current = helpProbeSummaries.get(summaryKey) ?? {
-      count: 0,
-      examples: [],
-      first_seen: now,
-      last_seen: now,
-    };
-    current.count += 1;
-    current.last_seen = now;
-    if (current.examples.length < 3 && !current.examples.includes(intent.slice(0, 120))) {
-      current.examples.push(intent.slice(0, 120));
+    let origin = "unbound";
+    try {
+      origin = active().requester_identity_fingerprint;
+    } catch (error) {
+      if (!(error instanceof SessionIdentityError)) throw error;
     }
-    helpProbeSummaries.set(summaryKey, current);
-    if (current.count === 1 || current.count % 5 === 0) {
+    const summaryKey = `${origin}:${probeKey ?? "sensitive"}`;
+    const now = helpProbeNow();
+    let current = helpProbeSummaries.get(summaryKey);
+    if (!current) {
+      // Evict the least recently seen key before insertion so retained summaries stay bounded across origins.
+      if (helpProbeSummaries.size >= HELP_PROBE_MAX_KEYS) {
+        let oldestKey: string | undefined;
+        let oldestSeen = Infinity;
+        for (const [key, summary] of helpProbeSummaries) {
+          if (summary.last_seen_ms < oldestSeen) {
+            oldestKey = key;
+            oldestSeen = summary.last_seen_ms;
+          }
+        }
+        if (oldestKey !== undefined) helpProbeSummaries.delete(oldestKey);
+      }
+      current = { count: 0, examples: [], first_seen_ms: now, last_seen_ms: now };
+      helpProbeSummaries.set(summaryKey, current);
+    }
+    current.count += 1;
+    current.last_seen_ms = now;
+    const sample = intent.slice(0, HELP_PROBE_SAMPLE_CHARS);
+    if (current.examples.length < HELP_PROBE_MAX_SAMPLES && !current.examples.includes(sample)) current.examples.push(sample);
+    if (current.last_row_ms === undefined || now - current.last_row_ms >= HELP_PROBE_ROW_INTERVAL_MS) {
+      // Reserving before the await keeps the interval bound under concurrency and append rejection.
+      current.last_row_ms = now;
       await audit("sanctuary_help_probe_summary", {
         safety_class: safetyClass,
         probe_key: probeKey ?? "sensitive",
         count: current.count,
-        samples: current.examples,
+        samples: [...current.examples],
       });
     }
   }
