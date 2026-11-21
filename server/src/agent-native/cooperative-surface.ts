@@ -524,12 +524,13 @@ export function createAgentNativeCooperativeTools(
       // Each queued append owns one non-evictable table entry, so the queue shares the table cap.
       helpProbeAppendTail = new Promise<void>(resolve => { releaseAppend = resolve; });
       let reservedOverflow = 0;
+      let reservedUnconfirmed = 0;
       try {
         // Serial append admission carries overflow into the next row after a pending reservation settles.
         await previousAppend;
         reservedOverflow = helpProbeOverflow;
-        const reservedUnconfirmed = helpProbeOverflowUnconfirmed;
-        // Each count is carried once; unconfirmed counts remain distinct from newly observed overflow.
+        reservedUnconfirmed = helpProbeOverflowUnconfirmed;
+        // A successful append carries each reservation; unconfirmed amounts stay distinct from confirmed overflow.
         helpProbeOverflow = 0;
         helpProbeOverflowUnconfirmed = 0;
         await audit("sanctuary_help_probe_summary", {
@@ -541,8 +542,8 @@ export function createAgentNativeCooperativeTools(
           overflow_unconfirmed_count: reservedUnconfirmed,
         }, "success", identityId);
       } catch (error) {
-        // A throw from the audit append does not establish that the row was not stored.
-        helpProbeOverflowUnconfirmed = Math.min(Number.MAX_SAFE_INTEGER, helpProbeOverflowUnconfirmed + reservedOverflow);
+        // Unconfirmed is an upper bound on overflow that may be on no stored row; re-reporting is honest, losing it is not.
+        helpProbeOverflowUnconfirmed = Math.min(Number.MAX_SAFE_INTEGER, helpProbeOverflowUnconfirmed + reservedOverflow + reservedUnconfirmed);
         throw error;
       } finally {
         // The interval starts again at settlement so late completion cannot place two rows together.

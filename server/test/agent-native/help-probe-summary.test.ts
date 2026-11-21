@@ -6,7 +6,7 @@ import { classifyIntent, HELP_NEEDLES, HELP_INTENT_MAX_CHARS, HELP_MAX_VARIANTS 
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { AuditLog, AUDIT_CHECKPOINT_NAMESPACE } from "../../src/operational/audit-log.js";
+import { AuditLog, AUDIT_NAMESPACE, AUDIT_CHECKPOINT_NAMESPACE } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { fingerprintIdentityId, type SessionBinding } from "../../src/agent-native/safety-base.js";
 
@@ -207,6 +207,50 @@ describe("help probe summaries", () => {
     expect(carried[0]?.details?.overflow_unconfirmed_count).toBe(0);
     expect(carried[1]?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 1 });
     await probe(2);
+    expect((await env.rows()).at(-1)?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 0 });
+  });
+  it.each(["entry", "checkpoint"] as const)("carries unconfirmed overflow through a %s throw and an entry throw", async firstFailure => {
+    class ScheduledStorage extends MemoryStorage {
+      failures: Array<"entry" | "checkpoint"> = [];
+      throws = 0;
+      override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        const next = this.failures[0];
+        if ((next === "entry" && namespace === AUDIT_NAMESPACE) ||
+            (next === "checkpoint" && namespace === AUDIT_CHECKPOINT_NAMESPACE && key.startsWith("audit-checkpoint-"))) {
+          this.failures.shift();
+          this.throws += 1;
+          throw new Error("scheduled storage unavailable");
+        }
+        return super.write(namespace, key, data);
+      }
+    }
+    const storage = new ScheduledStorage();
+    // Each real critical append writes its entry before checkpointing.
+    const env = setup(storage, 1);
+    const entries = uniqueIntents.flatMap(intent => ["origin-one", "origin-two", "origin-three"].map(origin => ({ origin, intent }))).slice(0, cap + 1);
+    const probe = async (index: number) => {
+      env.setOrigin(entries[index]!.origin);
+      return env.call(entries[index]!.intent);
+    };
+    for (let i = 0; i <= cap; i += 1) await probe(i);
+    expect(await env.rows()).toHaveLength(cap);
+    const storedBefore = (await storage.list(AUDIT_NAMESPACE)).length;
+    env.advance(interval);
+    storage.failures = [firstFailure, "entry"];
+    expect(await probe(cap)).toHaveProperty("denied", true);
+    const persisted = firstFailure === "checkpoint" ? 1 : 0;
+    expect(await storage.list(AUDIT_NAMESPACE)).toHaveLength(storedBefore + persisted);
+    expect(await probe(1)).toHaveProperty("denied", true);
+    expect(storage.throws).toBe(2);
+    expect(storage.failures).toEqual([]);
+    expect(await storage.list(AUDIT_NAMESPACE)).toHaveLength(storedBefore + persisted);
+    expect(await env.rows()).toHaveLength(cap + persisted);
+    await probe(2);
+    const carried = (await env.rows()).slice(cap);
+    expect(carried).toHaveLength(persisted + 1);
+    expect(carried.reduce((sum, row) => sum + Number(row.details?.overflow_count), 0)).toBe(persisted);
+    expect(carried.at(-1)?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 1 });
+    await probe(3);
     expect((await env.rows()).at(-1)?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 0 });
   });
   it("reserves one row for fifty concurrent probes of a key", async () => {
