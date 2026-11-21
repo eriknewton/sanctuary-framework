@@ -116,9 +116,12 @@ describe("bounded intent screening", () => {
       expect(classifyIntent(`not${apostrophe}t save the note`).probe_key).toBe("ambiguous");
     }
   });
-  it("preserves default-ignorable boundaries across Unicode categories", () => {
-    expect(buildHelpVariants("%EF%BB%BFsave").variants).toContain("\ufeffsave");
-    expect(buildHelpVariants(Buffer.from("\ufeffsave").toString("base64")).variants).toContain("\ufeffsave");
+  it("screens default-ignorables across Unicode categories", () => {
+    expect(buildHelpVariants("%EF%BB%BFsave").variants).toContain("save");
+    expect(buildHelpVariants(Buffer.from("\ufeffsave").toString("base64")).variants).toContain("save");
+    for (const intent of ["%EF%BB%BFsave the note", "\ufeff\ufeffsave the note", "save\ufeff the note"]) {
+      expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", probe_key: "ambiguous", tool: null, example: null });
+    }
     // Soft hyphen, grapheme joiner, Hangul filler, zero-width space, variation selector, BOM and tag cover distinct categories.
     for (const point of ["\u00ad", "\u034f", "\u115f", "\u200b", "\ufe0f", "\ufeff", "\u{e0020}"]) {
       expect(/\p{Default_Ignorable_Code_Point}/u.test(point)).toBe(true);
@@ -261,6 +264,19 @@ describe("bounded intent screening", () => {
     ["please\u00adnever save the note", "sensitive", null, "ambiguous", null],
     ["do\u200bnot save the note", "sensitive", null, "ambiguous", null],
     ["please%C2%ADnever save the note", "sensitive", null, "ambiguous", null],
+    ["do\u200byou remember my timezone", "sensitive", null, "ambiguous", null],
+    ["\u200bwhat did I save about the deploy", "sensitive", null, "ambiguous", null],
+    ["\u00addo you remember my timezone", "sensitive", null, "ambiguous", null],
+    ["do%E2%80%8Byou remember my timezone", "sensitive", null, "ambiguous", null],
+    ["sa\ufe0fve the note", "sensitive", null, "ambiguous", null],
+    ["please%C2%AD%20never save the note", "sensitive", null, "ambiguous", null],
+    ["save the import\u00adant notes", "sensitive", null, "ambiguous", null],
+    ["save the drop\u00addown menu", "sensitive", null, "ambiguous", null],
+    ["remember the sig\u00adnal", "sensitive", null, "ambiguous", null],
+    ["don\u200b't save the note", "sensitive", null, "ambiguous", null],
+    ["not's\u200bsave the note", "sensitive", null, "ambiguous", null],
+    ["don%E2%80%8B't save the note", "sensitive", null, "ambiguous", null],
+    ["\ufeffsave the note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);
