@@ -1,4 +1,5 @@
-import { classifyIntent } from "./intent-classifier.js";
+import { enforceDeclaredStringLengths } from "../tool-args.js";
+import { classifyIntent, HELP_INTENT_SCHEMA_MAX_CHARS } from "./intent-classifier.js";
 import { randomBytes } from "node:crypto";
 import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import {
@@ -675,11 +676,14 @@ export function createAgentNativeCooperativeTools(
       name: COOPERATIVE_TOOL_NAMES.help,
       description: "Given a free-text intent (for example \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, with a runnable example for ordinary requests. Evaluation questions (what this protects, the bounds, which platforms, how to verify, how to uninstall) return intent_class \"evaluate\" with a guidance string and the related read-only tools. Guidance for sensitive or gated requests is deliberately coarse and never reveals policy internals. Returns the guidance plus an audit_ref. For the start-here catalog of cooperative tools call sanctuary_capabilities; the complete advertised tool list is MCP tools/list.",
       tool_class: "read",
-      inputSchema: {
+      // The cap must match HELP_INTENT_SCHEMA_MAX_CHARS in intent-classifier.ts.
+      // It must match sanctuary_help in test/fixtures/tools-list-wire-golden.json and test/structure/__fixtures__/public-surface/mcp-tool-surface.json.
+      // Registration must match enforceDeclaredStringLengths in tool-args.ts, preserving the schema object's identity.
+      inputSchema: enforceDeclaredStringLengths({
         type: "object",
-        properties: { intent: { type: "string" } },
+        properties: { intent: { type: "string", maxLength: HELP_INTENT_SCHEMA_MAX_CHARS } },
         required: ["intent"],
-      },
+      }),
       handler: async (args) => {
         try {
           const classified = classifyIntent(args.intent as string);

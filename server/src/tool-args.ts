@@ -29,11 +29,20 @@ const MAX_NESTED_VALUE_BYTES = MAX_STRING_BYTES;
 
 export interface SchemaProperty {
   type?: string;
+  maxLength?: number;
   properties?: Record<string, SchemaProperty>;
   required?: string[];
   items?: SchemaProperty;
   enum?: unknown[];
   default?: unknown;
+}
+
+// Registration must match help inputSchema in agent-native/cooperative-surface.ts.
+const declaredStringLengthSchemas = new WeakSet<Record<string, unknown>>();
+/** Register a schema whose declared top-level string lengths the shared validator must enforce. */
+export function enforceDeclaredStringLengths<T extends Record<string, unknown>>(schema: T): T {
+  declaredStringLengthSchemas.add(schema);
+  return schema;
 }
 
 export interface ValidationError {
@@ -92,6 +101,14 @@ export function validateArgs(
     }
 
     if (typeof value === "string") {
+      // Declared lengths are enforced only for opted-in schemas, preserving each schema's validation contract.
+      if (declaredStringLengthSchemas.has(schema) && propSchema.maxLength !== undefined) {
+        const length = Array.from(value).length;
+        if (length > propSchema.maxLength) errors.push({
+          field,
+          message: `Field "${field}" exceeds maximum length (${length} code points > ${propSchema.maxLength} code points)`,
+        });
+      }
       const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
       const byteLength = new TextEncoder().encode(value).length;
       if (byteLength > maxBytes) {
