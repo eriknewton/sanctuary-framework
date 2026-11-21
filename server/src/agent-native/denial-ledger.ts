@@ -65,14 +65,38 @@ export const DENIAL_LEDGER_MAX_KEYS = 256;
 export const DENIAL_LEDGER_MAX_PENDING_APPENDS = 2 * (DENIAL_LEDGER_MAX_KEYS + 1);
 /** Well above one local append, short enough not to stall a stop. */
 export const LEDGER_CLOSE_DEADLINE_MS = 5_000;
-/** Enough for a one-line error; 257 first rows stay under 64 KiB of message text. */
-export const DENIAL_FIRST_ROW_MESSAGE_MAX_CHARS = 200;
+/**
+ * Enough for a one-line error; 257 first rows stay under 64 KiB of message
+ * text (257 * 200 = 51,400 bytes). Counted in stored bytes (see
+ * storedStringBytes), never in characters.
+ */
+export const DENIAL_FIRST_ROW_MESSAGE_MAX_BYTES = 200;
 /** Linked refs kept per window, so a window's record stays fixed-size. */
 export const DENIAL_WINDOW_MAX_LINKED_REFS = 8;
+/**
+ * Stored-byte width of every identifier-like row field (tool, error name,
+ * linked ref, the agent id inside origin): the MCP tool-name length limit of
+ * 128, which every tool name, error class name, verdict key and audit ref in
+ * this tree is well inside. A longer value is truncated.
+ */
+export const DENIAL_ROW_IDENTIFIER_MAX_BYTES = 128;
+// The router's caller principal is `agent:<id>` (router.ts); the id gets the identifier width.
+const ORIGIN_PREFIX = "agent:";
+/** Stored-byte width of origin: the `agent:` prefix plus one identifier. */
+export const DENIAL_ROW_ORIGIN_MAX_BYTES = ORIGIN_PREFIX.length + DENIAL_ROW_IDENTIFIER_MAX_BYTES;
+// Window counters are clamped here, so a summary's counters have a fixed widest form.
+const DENIAL_COUNTER_MAX = Number.MAX_SAFE_INTEGER;
+/**
+ * The handler-reported facts a first row carries. Must match the keys
+ * refusedResultFacts reads in tool-outcome.ts; any other key is dropped so the
+ * row's key set stays fixed.
+ */
+const DENIAL_FACT_KEYS = ["committed", "audited"] as const;
 // 8 random bytes = 16 hex characters, the width of the router's tool_error refs.
 const DENIAL_REF_BYTES = 8;
 // The overflow window's key; registered tool names never contain a space.
 const OVERFLOW_KEY = "overflow window";
+const OVERFLOW_TOOL = "overflow";
 
 /** What the router knows about one refusal; operator-side only. */
 export interface DenialRecordInput {
@@ -113,7 +137,8 @@ export class CountingDenialRecorder implements DenialRecorder {
 }
 
 /** How a window's first row ended; `pending` until its append settles. */
-export type FirstRowState = "pending" | "written" | "failed" | "unconfirmed" | "skipped_budget";
+export const FIRST_ROW_STATES = ["pending", "written", "failed", "unconfirmed", "skipped_budget"] as const;
+export type FirstRowState = (typeof FIRST_ROW_STATES)[number];
 /** How a window's summary ended; `none` when the window closed with one refusal. */
 export type SummaryState = "none" | "pending" | "written" | "failed" | "skipped_budget";
 
@@ -152,6 +177,99 @@ export interface DenialLedgerSnapshot {
 export interface DenialLedgerOptions {
   /** Operator stderr line sink; defaults to process.stderr. */
   readonly warn?: (line: string) => void;
+}
+
+/**
+ * Bytes a string field occupies in the row the audit log stores before
+ * encryption: its JSON form (escapes included, quotes excluded) in UTF-8. Must
+ * match the JSON.stringify of the normalized entry in
+ * operational/audit-log.ts's persistChainedEntry.
+ */
+function storedStringBytes(value: string): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8") - 2;
+}
+
+/** Bytes a whole details object occupies in the stored row. */
+function storedObjectBytes(value: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+/**
+ * The longest prefix of `value` whose stored form fits `maxBytes`, cut only
+ * between whole code points, so a multi-byte character is never split.
+ */
+export function truncateStoredString(value: string, maxBytes: number): string {
+  if (storedStringBytes(value) <= maxBytes) return value;
+  let kept = "";
+  let used = 0;
+  for (const codePoint of value) {
+    const cost = storedStringBytes(codePoint);
+    if (used + cost > maxBytes) break;
+    kept += codePoint;
+    used += cost;
+  }
+  return kept;
+}
+
+function longest(values: readonly string[]): string {
+  return values.reduce((widest, value) => (storedStringBytes(value) > storedStringBytes(widest) ? value : widest), "");
+}
+
+// Every ISO timestamp from year 0 to 9999 has this one width.
+const WIDEST_TIMESTAMP = new Date(0).toISOString();
+const WIDEST_DENIAL_REF = `denial:${"f".repeat(DENIAL_REF_BYTES * 2)}`;
+
+/**
+ * Stored size of every `denial_cause` row's details: the row with every field
+ * at its widest (each identifier at DENIAL_ROW_IDENTIFIER_MAX_BYTES, origin at
+ * DENIAL_ROW_ORIGIN_MAX_BYTES, the message at
+ * DENIAL_FIRST_ROW_MESSAGE_MAX_BYTES, the longest closed cause, every optional
+ * field present and both facts at their wider value) and an empty pad. Each
+ * real row is padded up to it, so a row's size says nothing about its cause.
+ */
+export const DENIAL_CAUSE_ROW_DETAILS_BYTES = storedObjectBytes({
+  denial_ref: WIDEST_DENIAL_REF,
+  tool: "x".repeat(DENIAL_ROW_IDENTIFIER_MAX_BYTES),
+  cause: longest(DENIAL_CAUSES),
+  origin: "x".repeat(DENIAL_ROW_ORIGIN_MAX_BYTES),
+  window_started_at: WIDEST_TIMESTAMP,
+  linked_ref: "x".repeat(DENIAL_ROW_IDENTIFIER_MAX_BYTES),
+  error_name: "x".repeat(DENIAL_ROW_IDENTIFIER_MAX_BYTES),
+  error_message: "x".repeat(DENIAL_FIRST_ROW_MESSAGE_MAX_BYTES),
+  ...Object.fromEntries(DENIAL_FACT_KEYS.map((key) => [key, false])),
+  pad: "",
+});
+
+/**
+ * Stored size of every `denial_cause_summary` row's details: the widest tool,
+ * both timestamps, every counter at DENIAL_COUNTER_MAX (one per closed cause),
+ * DENIAL_WINDOW_MAX_LINKED_REFS refs at the identifier width, the longest
+ * first-row state and an empty pad.
+ */
+export const DENIAL_SUMMARY_ROW_DETAILS_BYTES = storedObjectBytes({
+  denial_ref: WIDEST_DENIAL_REF,
+  tool: "x".repeat(DENIAL_ROW_IDENTIFIER_MAX_BYTES),
+  window_started_at: WIDEST_TIMESTAMP,
+  window_closed_at: WIDEST_TIMESTAMP,
+  attempted: DENIAL_COUNTER_MAX,
+  causes: Object.fromEntries(DENIAL_CAUSES.map((cause) => [cause, DENIAL_COUNTER_MAX])),
+  linked_refs: Array.from({ length: DENIAL_WINDOW_MAX_LINKED_REFS }, () => "x".repeat(DENIAL_ROW_IDENTIFIER_MAX_BYTES)),
+  first_row: longest(FIRST_ROW_STATES),
+  pad: "",
+});
+
+/**
+ * Append a pad that brings the details to exactly `rowBytes`. Every field was
+ * already bounded to its width, so the shortfall is never negative for
+ * timestamps in years 0 to 9999; it is clamped at zero regardless.
+ */
+function padTo(details: Record<string, unknown>, rowBytes: number): Record<string, unknown> {
+  const shortfall = rowBytes - storedObjectBytes({ ...details, pad: "" });
+  return { ...details, pad: " ".repeat(Math.max(0, shortfall)) };
+}
+
+function clampCounter(value: number): number {
+  return Math.min(value, DENIAL_COUNTER_MAX);
 }
 
 /**
@@ -216,7 +334,7 @@ export class DenialLedger implements DenialRecorder {
       window.attempted += 1;
       window.causes.set(closedCause, (window.causes.get(closedCause) ?? 0) + 1);
       if (input.linked_ref !== undefined && window.linked_refs.length < DENIAL_WINDOW_MAX_LINKED_REFS) {
-        window.linked_refs.push(input.linked_ref);
+        window.linked_refs.push(truncateStoredString(input.linked_ref, DENIAL_ROW_IDENTIFIER_MAX_BYTES));
       }
     } catch {
       // Ledger bookkeeping is operator evidence; it never reaches the refusal.
@@ -306,21 +424,24 @@ export class DenialLedger implements DenialRecorder {
     }
     generation.summary = "pending";
     const closedAt = Number.isFinite(now) ? now : this.clock();
+    // Every summary row is padded to DENIAL_SUMMARY_ROW_DETAILS_BYTES, so its
+    // stored size is the same whatever the window saw.
+    const details = padTo({
+      denial_ref: generation.denial_ref,
+      tool: truncateStoredString(window.generation.key === OVERFLOW_KEY ? OVERFLOW_TOOL : window.tool, DENIAL_ROW_IDENTIFIER_MAX_BYTES),
+      window_started_at: new Date(window.window_started_at).toISOString(),
+      window_closed_at: new Date(closedAt).toISOString(),
+      attempted: clampCounter(window.attempted),
+      causes: Object.fromEntries([...window.causes].map(([cause, count]) => [cause, clampCounter(count)])),
+      linked_refs: [...window.linked_refs],
+      first_row: generation.first_row,
+    }, DENIAL_SUMMARY_ROW_DETAILS_BYTES);
     this.detach(generation, () => this.auditLog.appendCritical({
       layer: "l2",
       operation: "denial_cause_summary",
       identity_id: "system",
       result: "failure",
-      details: {
-        denial_ref: generation.denial_ref,
-        tool: window.generation.key === OVERFLOW_KEY ? "overflow" : window.tool,
-        window_started_at: new Date(window.window_started_at).toISOString(),
-        window_closed_at: new Date(closedAt).toISOString(),
-        attempted: window.attempted,
-        causes: Object.fromEntries(window.causes),
-        linked_refs: [...window.linked_refs],
-        first_row: generation.first_row,
-      },
+      details,
     }), (outcome) => {
       generation.summary = outcome === "written" ? "written" : "failed";
       if (outcome !== "written") {
@@ -336,25 +457,33 @@ export class DenialLedger implements DenialRecorder {
       generation.first_row = "skipped_budget";
       return;
     }
-    const message = input.error_message === undefined
-      ? undefined
-      : input.error_message.slice(0, DENIAL_FIRST_ROW_MESSAGE_MAX_CHARS);
+    const bounded = (value: string | undefined, maxBytes: number) =>
+      value === undefined ? undefined : truncateStoredString(value, maxBytes);
+    const linkedRef = bounded(input.linked_ref, DENIAL_ROW_IDENTIFIER_MAX_BYTES);
+    const errorName = bounded(input.error_name, DENIAL_ROW_IDENTIFIER_MAX_BYTES);
+    const message = bounded(input.error_message, DENIAL_FIRST_ROW_MESSAGE_MAX_BYTES);
+    const facts = Object.fromEntries(DENIAL_FACT_KEYS
+      .filter((key) => typeof input.facts?.[key] === "boolean")
+      .map((key) => [key, input.facts![key]]));
+    // Every first row is padded to DENIAL_CAUSE_ROW_DETAILS_BYTES, so its stored
+    // size is the same whatever the cause, tool or message.
+    const details = padTo({
+      denial_ref: generation.denial_ref,
+      tool: truncateStoredString(input.tool, DENIAL_ROW_IDENTIFIER_MAX_BYTES),
+      cause,
+      origin: truncateStoredString(input.origin, DENIAL_ROW_ORIGIN_MAX_BYTES),
+      window_started_at: new Date(window.window_started_at).toISOString(),
+      ...(linkedRef !== undefined ? { linked_ref: linkedRef } : {}),
+      ...(errorName !== undefined ? { error_name: errorName } : {}),
+      ...(message !== undefined ? { error_message: message } : {}),
+      ...facts,
+    }, DENIAL_CAUSE_ROW_DETAILS_BYTES);
     this.detach(generation, () => this.auditLog.appendCritical({
       layer: "l2",
       operation: "denial_cause",
       identity_id: "system",
       result: "failure",
-      details: {
-        denial_ref: generation.denial_ref,
-        tool: input.tool,
-        cause,
-        origin: input.origin,
-        window_started_at: new Date(window.window_started_at).toISOString(),
-        ...(input.linked_ref !== undefined ? { linked_ref: input.linked_ref } : {}),
-        ...(input.error_name !== undefined ? { error_name: input.error_name } : {}),
-        ...(message !== undefined ? { error_message: message } : {}),
-        ...(input.facts ?? {}),
-      },
+      details,
     }), (outcome) => {
       generation.first_row = outcome;
       if (outcome !== "written") {
