@@ -116,6 +116,19 @@ describe("bounded intent screening", () => {
       expect(classifyIntent(`not${apostrophe}t save the note`).probe_key).toBe("ambiguous");
     }
   });
+  it("preserves default-ignorable boundaries across Unicode categories", () => {
+    expect(buildHelpVariants("%EF%BB%BFsave").variants).toContain("\ufeffsave");
+    expect(buildHelpVariants(Buffer.from("\ufeffsave").toString("base64")).variants).toContain("\ufeffsave");
+    // Soft hyphen, grapheme joiner, Hangul filler, zero-width space, variation selector, BOM and tag cover distinct categories.
+    for (const point of ["\u00ad", "\u034f", "\u115f", "\u200b", "\ufe0f", "\ufeff", "\u{e0020}"]) {
+      expect(/\p{Default_Ignorable_Code_Point}/u.test(point)).toBe(true);
+      expect(classifyIntent(`please${point}never save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`not${point} save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`not${point}save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`please${encodeURIComponent(point)}never save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`save the notes before you del${point}ete the old ones`).probe_key).toBe("delete");
+    }
+  });
   it("screens whole requests containing temporal words", () => {
     expect(classifyIntent("save the notes before you delete the old ones").probe_key).toBe("delete");
   });
@@ -245,6 +258,9 @@ describe("bounded intent screening", () => {
     ["not'-save the note", "sensitive", null, "ambiguous", null],
     ["don't save the note", "sensitive", null, "ambiguous", null],
     ["the user's note, save it", "sensitive", null, "multi_intent", null],
+    ["please\u00adnever save the note", "sensitive", null, "ambiguous", null],
+    ["do\u200bnot save the note", "sensitive", null, "ambiguous", null],
+    ["please%C2%ADnever save the note", "sensitive", null, "ambiguous", null],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);

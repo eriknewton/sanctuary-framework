@@ -71,7 +71,8 @@ function mask(text: string): string {
 }
 
 function isHelpWordJoiner(point: string): boolean {
-  return !/[\p{L}\p{N}\s]/u.test(point);
+  // Negation separates joiners; copies B and C delete them, including every default-ignorable code point.
+  return /\p{Default_Ignorable_Code_Point}/u.test(point) || !/[\p{L}\p{N}\s]/u.test(point);
 }
 
 function isHelpContractionApostrophe(points: string[], index: number): boolean {
@@ -84,13 +85,17 @@ function isHelpContractionApostrophe(points: string[], index: number): boolean {
 }
 
 function separateNegationJoiners(text: string): string {
-  const points = Array.from(text);
+  // An encoded run of default-ignorables has the same token boundary, with original cue offsets retained.
+  const boundaries = text.replace(/(?:%[0-9a-f]{2})+/gi, encoded =>
+    /^\p{Default_Ignorable_Code_Point}+$/u.test(decodeHelpPercent(encoded)) ? " ".repeat(encoded.length) : encoded);
+  const points = Array.from(boundaries);
   for (let start = 0; start < points.length; start += 1) {
     if (!isHelpWordJoiner(points[start]) || isHelpContractionApostrophe(points, start)) continue;
     let end = start + 1;
     while (end < points.length && isHelpWordJoiner(points[end]) && !isHelpContractionApostrophe(points, end)) end += 1;
-    // Runs between letters have the same boundary as whitespace, preserving source offsets for cue matching.
-    if (start > 0 && end < points.length && /\p{L}/u.test(points[start - 1]) && /\p{L}/u.test(points[end])) {
+    // Default-ignorables always separate tokens; other joiner runs separate letters, preserving cue offsets.
+    const hasDefaultIgnorable = points.slice(start, end).some(point => /\p{Default_Ignorable_Code_Point}/u.test(point));
+    if (hasDefaultIgnorable || (start > 0 && end < points.length && /\p{L}/u.test(points[start - 1]) && /\p{L}/u.test(points[end]))) {
       for (let i = start; i < end; i += 1) points[i] = " ".repeat(points[i].length);
     }
     start = end - 1;
@@ -99,11 +104,13 @@ function separateNegationJoiners(text: string): string {
 }
 
 function normalizeHelpVariant(text: string): { normalized: string; fold: string; unreadable: boolean } {
-  // Removing default-ignorable code points before normalization gives every copy the same scan alphabet.
-  const normalized = text.replace(/\p{Default_Ignorable_Code_Point}/gu, "").normalize("NFKC").normalize("NFD").replace(/\p{M}/gu, "").replace(/[\u2018\u2019\u02bc]/g, "'");
+  // Preserve default-ignorables through normalization so negation can retain their token boundaries.
+  const normalized = text.split(/(\p{Default_Ignorable_Code_Point}+)/u).map((part, index) =>
+    index % 2 ? part : part.normalize("NFKC").normalize("NFD").replace(/\p{M}/gu, "")
+  ).join("").replace(/[\u2018\u2019\u02bc]/g, "'");
   const fold = normalized.toLowerCase();
   // Letters outside the scanner's ASCII class must not disappear during compaction.
-  const unreadable = /[^a-z]/u.test(fold.replace(/[^\p{L}]/gu, ""));
+  const unreadable = Array.from(fold).some(point => /\p{L}/u.test(point) && !isHelpWordJoiner(point) && !/[a-z]/.test(point));
   return { normalized, fold, unreadable };
 }
 
@@ -111,7 +118,8 @@ function decodeHelpPercent(text: string): string {
   // Decode every valid byte while keeping malformed percent text literal; invalid UTF-8 cannot stop later passes.
   const chunks = text.split(/(%[0-9a-f]{2})/gi).map(chunk =>
     /^%[0-9a-f]{2}$/i.test(chunk) ? Buffer.from(chunk.slice(1), "hex") : Buffer.from(chunk, "utf8"));
-  return new TextDecoder("utf-8", { fatal: false }).decode(Buffer.concat(chunks));
+  // A BOM remains a default-ignorable joiner rather than being consumed by the decoder.
+  return new TextDecoder("utf-8", { fatal: false, ignoreBOM: true }).decode(Buffer.concat(chunks));
 }
 
 /** Return bounded folded decodings and their retained work counts for intent screening. */
@@ -165,8 +173,8 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
     }
     if (token.length >= BASE64_MIN_CHARS && /^[a-z0-9+/=_-]+$/i.test(token)) {
       try {
-        // Only valid UTF-8 bytes represent a text variant; the original token is always screened.
-        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(token, "base64"));
+        // Only valid UTF-8 bytes represent a text variant; preserve its joiners and always screen the original token.
+        const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Buffer.from(token, "base64"));
         if (!add(decoded)) break;
       } catch { /* Non-text bytes leave only the original token to screen. */ }
     }
