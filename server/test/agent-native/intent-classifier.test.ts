@@ -30,8 +30,9 @@ describe("bounded intent screening", () => {
     expect(classifyIntent("importantish").probe_key).toBe("import");
     expect(classifyIntent("designated").probe_key).toBe("sign");
   });
-  it("screens every needle with word joiners at each inner position", () => {
+  it("screens non-URL needles with word joiners at each inner position", () => {
     for (const needle of HELP_NEEDLES) {
+      if (needle === "http://" || needle === "https://") continue;
       // Pin: dash joiners retain the round-one screening answer.
       // U+10EAD is the supplementary-plane Yezidi hyphen; its source offsets span two UTF-16 units.
       for (const joiner of ["-", "_", ".", "—", "\u{10ead}", "/", ":", "+", "😀", "\u200b"]) {
@@ -39,8 +40,9 @@ describe("bounded intent screening", () => {
       }
     }
   });
-  it("screens every needle with each benign word between its halves", () => {
+  it("screens non-URL needles with each benign word between its halves", () => {
     for (const needle of HELP_NEEDLES) {
+      if (needle === "http://" || needle === "https://") continue;
       const middle = Math.floor(needle.length / 2);
       for (const word of HELP_BENIGN_WORDS) gated(`${needle.slice(0, middle)} ${word} ${needle.slice(middle)}`);
     }
@@ -221,9 +223,13 @@ describe("bounded intent screening", () => {
     ["save the notes before you del:ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
     ["save the notes before you del\u200bete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
     ["remember the 3:30 standup", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    // These two percent rows distinguish round one only.
     ["remember my %EF%BD%85xport notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["remember my %C3%A9xport notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["not!save the note", "sensitive", null, "ambiguous", null],
+    ["save http.txt for later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["remember the https setup", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["save the http status", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);

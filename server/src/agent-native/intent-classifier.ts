@@ -196,7 +196,9 @@ function scanCopies(fold: string): string | undefined {
     }
     const copies = [{ text: direct.join(""), offsets: directOffsets }, { text: compact.join(""), offsets: compactOffsets }];
     for (const needle of HELP_NEEDLES) {
-      // Joiner-removing copies and their needles share one alphabet; copy A retains literal URL punctuation.
+      // URL needles require their literal punctuation in copy A; joined copies carry no URL needles.
+      if (removeJoiners && (needle === "http://" || needle === "https://")) continue;
+      // Other needles share the alphabet of their scan copy.
       const matchNeedle = removeJoiners ? Array.from(needle).filter(point => !isHelpWordJoiner(point)).join("") : needle;
       for (const { text, offsets } of copies) {
         let index = text.indexOf(matchNeedle);
