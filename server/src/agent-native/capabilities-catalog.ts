@@ -231,7 +231,7 @@ export interface EvaluateRoute {
  * `classifyIntent` consults EVALUATE_ROUTES before the ordinary memory
  * routes, but only over a bare read/get verb: any other memory verb
  * (remember, store, save, recall, lookup; the sets in
- * MEMORY_VERBS, `cooperative-surface.ts`) outranks the noun, so "remember
+ * MEMORY_VERBS, `intent-classifier.ts`) outranks the noun, so "remember
  * platform=linux" and "recall my bounds note" stay memory intents while
  * "read the bounds" is a bounds question. "protected" is deliberately absent:
  * it is an adjective about the agent's own data ("read my protected key"), not
@@ -268,7 +268,7 @@ export const EVALUATE_NOUNS = new RegExp(`\\b(${EVALUATE_NOUN_WORDS.join("|")})\
 
 /**
  * Evaluate-intent routing table, consumed by `classifyIntent` in
- * `cooperative-surface.ts`. Ordered from the most specific question to the
+ * `intent-classifier.ts`. Ordered from the most specific question to the
  * broadest so "how do I verify the install" lands on `verify`, not on
  * `install_decision`. Every route is read-only or CLI guidance: nothing here
  * can mutate state. A runnable example is offered only where the tool runs
