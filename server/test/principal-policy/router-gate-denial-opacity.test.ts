@@ -19,7 +19,7 @@ import {
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
 import type { ToolCallTrapRuntime } from "../../src/honeypot/tool-call-trap-runtime.js";
-import type { DenialCause, DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
+import { DenialLedger, type DenialCause, type DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
 import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import { ClientManager, type UpstreamTool } from "../../src/proxy/client-manager.js";
 import { ResponseScreen } from "../../src/proxy/response-screen.js";
@@ -171,7 +171,10 @@ describe("router gate denial opacity", () => {
 // ── One boundary through the production composition root ──────────────────
 
 type DenialRecord = { cause: DenialCause; input: DenialRecordInput };
-const ledgerSeam = vi.hoisted(() => ({ records: [] as Array<{ cause: string; input: unknown }> }));
+const ledgerSeam = vi.hoisted(() => ({
+  records: [] as Array<{ cause: string; input: unknown; target: unknown }>,
+  targets: [] as unknown[],
+}));
 
 // Observe what the router hands the ledger without replacing the ledger the
 // composition root wires: every record is copied here, then forwarded.
@@ -181,11 +184,12 @@ vi.mock("../../src/router.js", async (importOriginal) => {
     ...actual,
     createServer: (tools: Parameters<typeof actual.createServer>[0], options: Parameters<typeof actual.createServer>[1]) => {
       const forward = options?.denialLedger;
+      ledgerSeam.targets.push(forward);
       return actual.createServer(tools, {
         ...options,
         denialLedger: {
           record: (cause, input) => {
-            ledgerSeam.records.push({ cause, input });
+            ledgerSeam.records.push({ cause, input, target: forward });
             forward?.record(cause, input);
           },
         },
@@ -433,6 +437,7 @@ describe("one refusal through the production composition root", () => {
   let previousSessionId: string | undefined;
   let previousAgentId: string | undefined;
   const results = new Map<string, Awaited<ReturnType<Client["callTool"]>>>();
+  let servedRecordsFrom = 0;
   const mocks: Array<{ mockRestore: () => void }> = [];
 
   beforeAll(async () => {
@@ -489,6 +494,7 @@ describe("one refusal through the production composition root", () => {
     const created = JSON.parse(((await client.callTool({ name: "identity_create", arguments: { label: "opacity" } })).content as Array<{ text: string }>)[0]!.text);
     process.env.SANCTUARY_SESSION_IDENTITY_ID = created.identity_id;
     booted = { app, client, storage, identityId: created.identity_id };
+    servedRecordsFrom = ledgerSeam.records.length;
   }, 60_000);
 
   afterAll(async () => {
@@ -522,6 +528,31 @@ describe("one refusal through the production composition root", () => {
   it("the cooperative recall of a hidden key and the primitive state_write to a reserved namespace both reach the agent as refusalResult() through a real tools/call", () => {
     expect(results.get("recall of a hidden key")).toEqual(refusalResult());
     expect(results.get("primitive state_write to a reserved namespace after allow")).toEqual(refusalResult());
+  });
+
+  it("a gate refusal, a cooperative refusal, a primitive refusal and a proxy refusal draw on one ledger", async () => {
+    const shared = ledgerSeam.targets.at(-1);
+    // The composition root built one ledger for the served process and handed it to the router.
+    expect(shared).toBeInstanceOf(DenialLedger);
+    // Records since the served process booted (the fixture router above has no ledger of its own).
+    const served = ledgerSeam.records.slice(servedRecordsFrom);
+    expect(served.length).toBeGreaterThan(0);
+    expect(served.every((record) => record.target === shared)).toBe(true);
+    const drew = (tool: string, cause: DenialCause) =>
+      served.some((record) => record.cause === cause && (record.input as DenialRecordInput).tool === tool);
+    expect(drew("state_delete", "gate_denied")).toBe(true);
+    expect(drew("sanctuary_recall", "post_allow_refusal")).toBe(true);
+    expect(drew("state_write", "post_allow_refusal")).toBe(true);
+    expect(drew(`proxy/${FIXTURE_UPSTREAM}/read`, "post_allow_refusal")).toBe(true);
+    // The one ledger wrote each tool's window row to the served process's audit log.
+    await vi.waitFor(async () => {
+      const rows = (await booted.app.auditLog.query({ operation_type: "denial_cause", limit: 1_000 })).entries;
+      const tools = new Set(rows.map((row) => row.details?.tool));
+      for (const tool of ["state_delete", "sanctuary_recall", "state_write", `proxy/${FIXTURE_UPSTREAM}/read`]) {
+        expect(tools.has(tool), tool).toBe(true);
+      }
+      expect(rows.every((row) => row.identity_id === "system")).toBe(true);
+    });
   });
 
   it("every refusal above serialized to one result", () => {

@@ -79,6 +79,7 @@ import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { assertToolOutcomesRegistered } from "./tool-outcome.js";
+import { DenialLedger } from "./agent-native/denial-ledger.js";
 import { toolResult } from "./router.js";
 import {
   ApprovalProofStore,
@@ -2442,10 +2443,16 @@ export async function createSanctuaryServer(options?: {
   // Must match TOOL_OUTCOME_SHAPES in tool-outcome.ts.
   assertToolOutcomesRegistered(allTools);
 
+  // 18b. One denial ledger for the whole process: every refusal the router
+  // returns, from any tool or stage, records its cause here and nowhere else,
+  // so the per-window and pending-append caps hold process-wide.
+  const denialLedger = new DenialLedger(auditLog, Date.now);
+
   // 19. Create MCP server with approval gate (proxy tools are included in allTools)
   const server = createServer(allTools, {
     gate,
     auditLog,
+    denialLedger,
     toolCallTrapRuntime,
     currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
     currentSessionBinding,
@@ -2506,6 +2513,8 @@ export async function createSanctuaryServer(options?: {
         // Flush persistence last; audit flush must follow inbox and baseline.
         try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
         try { await baseline.save(); } catch (e) { errors.push(e); }
+        // The ledger closes its windows (summaries within budget) and waits a bounded time before the final audit flush.
+        try { await denialLedger.close(); } catch (e) { errors.push(e); }
         try { await auditLog.flush(); } catch (e) { errors.push(e); }
       } finally {
         // The server retains its session through serving and final persistence, then awaits release on every cleanup or failed-start exit.
