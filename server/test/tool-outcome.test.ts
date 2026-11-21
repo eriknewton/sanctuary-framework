@@ -96,6 +96,8 @@ describe("tool outcome registry", () => {
   it("lists the custom shapes this tree declares", () => {
     expect(Object.fromEntries(customEntries)).toEqual({
       audit_export_siem: "siem_export",
+      handshake_exchange: "handshake_preview",
+      sanctuary_distress: "distress_signal",
       sovereignty_audit: "sovereignty_report",
     });
   });
@@ -118,6 +120,19 @@ describe("tool outcome registry", () => {
     expect(classifyToolOutcome("sovereignty_audit", {
       content: [{ type: "text", text: "Sovereignty report" }, { type: "text", text: JSON.stringify({ overall_score: 1 }) }],
     })).toBe("success");
+    expect(classifyToolOutcome("handshake_exchange", json({
+      attestation: {}, verification: { counterparty_valid: false, recorded: false, errors: ["bad signature"] },
+    }))).toBe("success");
+    expect(classifyToolOutcome("sanctuary_distress", json({ ok: true, event_id: "distress:1" }))).toBe("success");
+  });
+
+  it("refuses each verdict a custom shape names, and only that verdict", () => {
+    expect(classifyToolOutcome("handshake_exchange", json({
+      attestation: {}, verification: { recorded: false, record_error: "refused" },
+    }))).toBe("refusal");
+    expect(classifyToolOutcome("sanctuary_distress", json({ ok: false, rate_limited: true }))).toBe("refusal");
+    // The same fields on a strict-rule tool are not verdicts it reports.
+    expect(classifyToolOutcome("state_read", json({ verification: { record_error: "x" }, ok: false }))).toBe("success");
   });
 });
 

@@ -68,25 +68,36 @@ function textItems(result: unknown): string[] | undefined {
   return texts;
 }
 
-/** A JSON object body that carries no error, denial or partial-failure verdict. */
-function isSuccessBody(text: string): boolean {
+/** The parsed JSON object body when it carries no error, denial or partial-failure verdict. */
+function successBody(text: string): Record<string, unknown> | undefined {
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    return false;
+    return undefined;
   }
-  if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined;
   const record = body as Record<string, unknown>;
   return !Object.hasOwn(record, "error")
     && record.denied !== true
-    && record.status !== "partial_failed";
+    && record.status !== "partial_failed"
+    ? record
+    : undefined;
+}
+
+function isSuccessBody(text: string): boolean {
+  return successBody(text) !== undefined;
+}
+
+/** The one verdict-free JSON object body the strict rule accepts, if the result is that shape. */
+function standardBody(result: unknown): Record<string, unknown> | undefined {
+  const texts = textItems(result);
+  return texts !== undefined && texts.length === 1 ? successBody(texts[0]!) : undefined;
 }
 
 /** The strict rule: one text item whose text is a JSON object with no verdict. */
 function standardOutcome(result: unknown): boolean {
-  const texts = textItems(result);
-  return texts !== undefined && texts.length === 1 && isSuccessBody(texts[0]!);
+  return standardBody(result) !== undefined;
 }
 
 /**
@@ -105,6 +116,25 @@ const OUTCOME_PREDICATES = {
   sovereignty_report: (result: unknown): boolean => {
     const texts = textItems(result);
     return texts !== undefined && texts.length === 2 && isSuccessBody(texts[1]!);
+  },
+  // One JSON object. A preview whose trust-record write was refused for
+  // ownership or admission carries verification.record_error; whether this
+  // call was permitted to record is a verdict, so that body is a refusal even
+  // though its attestation was signed. Must match the record_error field
+  // handshake_exchange builds in handshake/tools.ts.
+  handshake_preview: (result: unknown): boolean => {
+    const body = standardBody(result);
+    if (body === undefined) return false;
+    const verification = body.verification;
+    return !(typeof verification === "object" && verification !== null
+      && Object.hasOwn(verification, "record_error"));
+  },
+  // One JSON object. A signal the hourly admission limit refused says
+  // ok: false, and an admission verdict is a refusal. Must match the
+  // rate-limited body sanctuary_distress builds in distress/tools.ts.
+  distress_signal: (result: unknown): boolean => {
+    const body = standardBody(result);
+    return body !== undefined && body.ok !== false;
   },
 } as const;
 
@@ -145,7 +175,7 @@ export const TOOL_OUTCOME_SHAPES: Readonly<Record<string, ToolOutcomeShape>> = O
   "governor_status": "standard",
   "handshake_abort": "standard",
   "handshake_complete": "standard",
-  "handshake_exchange": "standard",
+  "handshake_exchange": "handshake_preview",
   "handshake_initiate": "standard",
   "handshake_respond": "standard",
   "handshake_status": "standard",
@@ -193,7 +223,7 @@ export const TOOL_OUTCOME_SHAPES: Readonly<Record<string, ToolOutcomeShape>> = O
   "sanctuary_bootstrap": "standard",
   "sanctuary_capabilities": "standard",
   "sanctuary_compound_execute": "standard",
-  "sanctuary_distress": "standard",
+  "sanctuary_distress": "distress_signal",
   "sanctuary_events_close": "standard",
   "sanctuary_events_open_cursor": "standard",
   "sanctuary_events_read": "standard",

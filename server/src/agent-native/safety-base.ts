@@ -60,7 +60,11 @@ export const BOUNDARY_REFUSAL = Object.freeze({
   discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
 } as const);
 
-/** Compact serialization of BOUNDARY_REFUSAL; must match the text router.ts returns for every refusal. */
+/**
+ * Compact serialization of BOUNDARY_REFUSAL; must match the text router.ts
+ * returns for every refusal, and EXPECTED_REFUSAL_TEXT in
+ * server/test/helpers/expected-refusal.ts, the fixed literal the witnesses compare against.
+ */
 export const REFUSAL_TEXT: string = JSON.stringify(BOUNDARY_REFUSAL);
 
 // Readonly properties keep the type assignable to the SDK's result type; the object itself is frozen.

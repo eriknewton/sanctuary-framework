@@ -1319,8 +1319,9 @@ export function createHandshakeTools(
           // protocol.ts already passed — the two distinct-local-keys case),
           // or when the shared results map is at capacity and every slot
           // already holds a verified peer (register LD2-03). Either way,
-          // downgrade the returned result to unverified exactly as an
-          // invalid nonce signature would, rather than silently reporting
+          // downgrade the session's stored result to unverified exactly as an
+          // invalid nonce signature would, and return the record error
+          // instead of a result, rather than silently reporting
           // verified:true for an entry that was never written.
           if (result.verified) {
             const recorded = await recordHandshakeResult(
@@ -1371,6 +1372,12 @@ export function createHandshakeTools(
             });
           }
 
+          // A refused record is an ownership or admission verdict on this
+          // call, not a computed answer about the completion, so it leaves as
+          // an error body; the router returns its one refusal for it.
+          if (recordFailure !== undefined) {
+            return toolResult({ error: recordFailure.error });
+          }
           return toolResult({ result });
         }
 
@@ -1489,11 +1496,11 @@ export function createHandshakeTools(
             // call's return value, so a self-vouch or bounded-collection
             // refusal here was invisible to the caller — the tool still
             // reported an apparently-successful preview even though nothing
-            // was recorded. Capture it and surface it on the response below;
-            // the attestation itself is still valid and still returned
-            // (recording is a caching side effect for future tier
-            // resolution, not the attestation's own correctness), so this is
-            // additive honesty, not a new failure mode for the tool call.
+            // was recorded. Capture it and surface it on the response below
+            // as `record_error`. Whether this call was permitted to record is
+            // an ownership or admission verdict, so the MCP router's
+            // `handshake_preview` outcome shape (tool-outcome.ts) reads that
+            // field as a refusal and the agent receives the one refusal.
             recordResult = await recordHandshakeResult(
               {
                 counterparty_id: verificationResult.counterparty_id,
@@ -1543,6 +1550,8 @@ export function createHandshakeTools(
             // `false` whenever verification failed, self-vouch fired, or
             // the bounded-collection quota refused the write.
             recorded: recordResult?.ok ?? alreadyLivePeer,
+            // Must match handshake_preview in tool-outcome.ts: a body carrying
+            // record_error is a refusal at the router boundary.
             ...(recordResult && !recordResult.ok
               ? { record_error: recordResult.error }
               : {}),

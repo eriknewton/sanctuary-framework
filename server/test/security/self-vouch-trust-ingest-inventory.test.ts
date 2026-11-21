@@ -318,9 +318,14 @@ describe("(a) handshake producer chokepoint: recordHandshakeResult", () => {
       })
     );
 
-    expect(verified.result.verified).toBe(false);
-    expect(verified.result.errors.join(" ")).toContain("same fortress");
+    // The refused record leaves as an error body, never as a result; the
+    // session itself keeps the downgraded, unverified result.
+    expect(verified.result).toBeUndefined();
+    expect(verified.error).toContain("same fortress");
     expect(responderResults.size).toBe(0);
+    const statusAfter = parse(await status.handler({ session_id: responded.session_id }));
+    expect(statusAfter.state).toBe("failed");
+    expect(statusAfter.result.verified).toBe(false);
   });
 
   it("handshake_exchange never records a self-vouched preview entry", async () => {

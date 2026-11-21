@@ -16,8 +16,15 @@ import {
   fixedDenial,
   fingerprintIdentityId,
   OpaqueNamespaceRegistry,
+  REFUSAL_TEXT,
+  refusalResult,
   type SessionBinding,
 } from "../../src/agent-native/safety-base.js";
+import {
+  EXPECTED_REFUSAL_TEXT,
+  expectedRefusal,
+  expectedRefusalBody,
+} from "../helpers/expected-refusal.js";
 import type { ToolDefinition } from "../../src/router.js";
 
 async function callTool(
@@ -716,5 +723,16 @@ describe("agent-native Phase 1 safety base", () => {
     await expect(registry.issuePersistedMemoryHandle("agent-b")).rejects.toThrow(
       "memory handle ownership conflict"
     );
+  });
+});
+
+// Parity between the witnesses' fixed literal and the implementation; it reads
+// the boundary refusal's own exports, so it is a new-surface check, not a
+// behavioural witness.
+describe("the witnesses' fixed refusal literal", () => {
+  it("deep-equals refusalResult() and serializes to REFUSAL_TEXT", () => {
+    expect(expectedRefusal()).toEqual(refusalResult());
+    expect(EXPECTED_REFUSAL_TEXT).toBe(REFUSAL_TEXT);
+    expect(expectedRefusalBody()).toEqual(boundaryRefusal());
   });
 });
