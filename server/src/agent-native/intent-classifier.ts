@@ -258,19 +258,32 @@ function state_MULTI_CLAUSE_AMBIGUOUS(fold: string, cues: Cue[]): boolean {
   return clauses.filter(clause => clause.trim()).length > 1 && clauses.some((clause, index) =>
     clause.trim() && !cues.some(cue => cue.clause === index));
 }
-function state_QUESTION_GUARD(fold: string, writes: Cue[], allCues: Cue[]): IntentClassification | undefined {
-  if (!writes.length || !/^(?:what|which|where|did|does|do\s+(?:you|we)|have\s+(?:you|we|i))\b/.test(fold.trim())) return;
-  if (writes.every(cue => /\bto\s+$/.test(fold.slice(0, cue.start)))) return;
-  const storedQuestion = writes.every(cue => {
-    const before = fold.slice(0, cue.start);
-    const after = fold.slice(cue.end);
-    return /\b(?:did|have|has|had)\s+(?:i|you|we|they|it)\s+$/.test(before) ||
-      (fold.slice(cue.start, cue.end) === "remember" && /^\s*do\s+(?:you|we)\s+$/.test(before) && /^\s+(?:my|our|what|which|where|when|whether|if|how)\b/.test(after));
-  });
-  if (!storedQuestion) return sensitive("conflict");
-  // Stored-data questions honor the read-class negation in the clause supplying their write cue.
-  const readNegated = allCues.some(cue => cue.negated && cue.kind !== "write" && writes.some(write => write.clause === cue.clause));
-  return readNegated ? sensitive("ambiguous") : memoryAnswer("read", fold);
+function state_QUESTION_GUARD(fold: string, cues: Cue[], allCues: Cue[]): IntentClassification | undefined {
+  const storedClauses = new Set<number>();
+  let otherQuestion = false;
+  let clauseStart = 0;
+  for (const [index, clause] of fold.split(CLAUSE_SPLITTER).entries()) {
+    const start = fold.indexOf(clause, clauseStart);
+    clauseStart = start + clause.length;
+    const writes = cues.filter(cue => cue.clause === index && cue.kind === "write");
+    if (!writes.length || !/^(?:what|which|where|did|does|do\s+(?:you|we)|have\s+(?:you|we|i))\b/.test(clause.trim())) continue;
+    if (writes.every(cue => /\bto\s+$/.test(fold.slice(start, cue.start)))) continue;
+    const storedQuestion = writes.every(cue => {
+      const before = fold.slice(start, cue.start);
+      const after = fold.slice(cue.end, clauseStart);
+      return /\b(?:did|have|has|had)\s+(?:i|you|we|they|it)\s+$/.test(before) ||
+        (fold.slice(cue.start, cue.end) === "remember" && /^\s*do\s+(?:you|we)\s+$/.test(before) && /^\s+(?:my|our|what|which|where|when|whether|if|how)\b/.test(after));
+    });
+    if (storedQuestion) storedClauses.add(index);
+    else otherQuestion = true;
+  }
+  // A stored-data question in any clause excludes write guidance; only its own live cues permit recall.
+  if (storedClauses.size) {
+    if (cues.some(cue => !storedClauses.has(cue.clause))) return sensitive("conflict");
+    const readNegated = allCues.some(cue => cue.negated && cue.kind !== "write" && storedClauses.has(cue.clause));
+    return readNegated ? sensitive("ambiguous") : memoryAnswer("read", fold);
+  }
+  if (otherQuestion) return sensitive("conflict");
 }
 function state_MAIN_VERB(fold: string, cues: Cue[]): IntentClassification | undefined {
   const writes = cues.filter(cue => cue.kind === "write");
@@ -304,16 +317,16 @@ export function classifyIntent(intent: string): IntentClassification {
   if (scanned.budgetHit) return state_VARIANT_BUDGET();
   const fold = scanned.fold;
   const allCues = collectCues(fold);
-  if (state_MULTI_CLAUSE_AMBIGUOUS(fold, allCues)) return sensitive("multi_intent");
   // A negated cue class remains unavailable throughout routing and both fallbacks in its clause.
   const cues = allCues.filter(cue => !cue.negated && !allCues.some(other =>
     other.negated && other.clause === cue.clause && (other.kind === "write") === (cue.kind === "write")));
+  const question = state_QUESTION_GUARD(fold, cues, allCues);
+  if (question) return question;
+  if (state_MULTI_CLAUSE_AMBIGUOUS(fold, allCues)) return sensitive("multi_intent");
   const writes = cues.filter(cue => cue.kind === "write");
   const route = EVALUATE_ROUTES.find(candidate => candidate.matches.test(fold));
   const state_EVALUATE_NOUN = route && EVALUATE_NOUNS.test(fold) && !writes.length && !cues.some(cue => cue.kind === "strong");
   if (state_EVALUATE_NOUN) return evaluateAnswer(route);
-  const question = state_QUESTION_GUARD(fold, writes, allCues);
-  if (question) return question;
   const main = state_MAIN_VERB(fold, cues);
   if (main) return main;
   const state_EVALUATE_FALLBACK = route && !writes.length;

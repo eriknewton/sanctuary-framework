@@ -168,6 +168,11 @@ describe("bounded intent screening", () => {
     ["did you save my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
     ["where should I store the deploy notes", "sensitive", null, "conflict", null],
     ["what should I save before the session ends", "sensitive", null, "conflict", null],
+    ["do not save the note, what did I save about the deploy", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["save the note, what did I save about the deploy", "sensitive", null, "conflict", null],
+    ["what did I save about the deploy, save the note", "sensitive", null, "conflict", null],
+    ["what did I save about the deploy, do not save the note", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["do not save the note, what did I save but never recall it", "sensitive", null, "ambiguous", null],
     ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
