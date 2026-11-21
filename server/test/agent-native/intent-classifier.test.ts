@@ -137,7 +137,7 @@ describe("bounded intent screening", () => {
   });
 
   // The over-schema-cap intent is exercised through validation in tool-args.test.ts.
-  it.each([
+  const intentCases = [
     ["leave a short note for the next coordinator session to read when it starts", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["remember my timezone", "ordinary", "sanctuary_remember", undefined, {"key": "user_tz", "value": "America/Los_Angeles"}],
     ["recall my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
@@ -277,7 +277,8 @@ describe("bounded intent screening", () => {
     ["not's\u200bsave the note", "sensitive", null, "ambiguous", null],
     ["don%E2%80%8B't save the note", "sensitive", null, "ambiguous", null],
     ["\ufeffsave the note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
-  ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
+  ] as const;
+  it.each(intentCases)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);
     expect(answer.tool).toBe(tool);
@@ -287,6 +288,26 @@ describe("bounded intent screening", () => {
       expect(answer.intent_class).toBe("evaluate");
       expect(answer.evaluate_question).toBe("bounds");
     } else expect(answer.intent_class).toBeUndefined();
+  });
+  it("closes guidance for invisible insertions throughout ordinary tool intents", () => {
+    const insertions = ["\u200b", "\u00ad", "\ufe0f", "\u2060", "%E2%80%8B"];
+    const continuingCases = intentCases.filter(([, safetyClass, tool]) => tool !== null && safetyClass !== "gated");
+    // 45 of 134 rows carry an ungated tool: 1,384 code-point boundaries times 5 forms = 6,920 calls.
+    // Derive the count from the table so every continuing row and both end boundaries stay covered.
+    const callCount = continuingCases.reduce((total, [intent]) => total + (Array.from(intent).length + 1) * insertions.length, 0);
+    let calls = 0;
+    for (const [intent] of continuingCases) {
+      const points = Array.from(intent);
+      for (let boundary = 0; boundary <= points.length; boundary += 1) {
+        for (const insertion of insertions) {
+          const text = points.slice(0, boundary).join("") + insertion + points.slice(boundary).join("");
+          const answer = classifyIntent(text);
+          calls += 1;
+          expect(answer.safety_class === "gated" || (answer.tool === null && answer.example === null), text).toBe(true);
+        }
+      }
+    }
+    expect(calls).toBe(callCount);
   });
   it("counts received code points before normalization and scans each band edge", () => {
     expect("lorem ".repeat(170) + "ipsum").toHaveLength(1025);
