@@ -23,6 +23,7 @@ import {
 } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
+import { FIXED_DENIAL_MESSAGE } from "../agent-native/safety-base.js";
 import {
   initiateHandshake,
   respondToHandshake,
@@ -1331,12 +1332,18 @@ export function createHandshakeTools(
             );
             if (!recorded.ok) {
               recordFailure = { error: recorded.error, reason: recorded.reason };
+              // INVARIANT (must-never 7): the stored session result is read
+              // back by a later bare handshake_status, which is a success, so
+              // it carries only the fixed refusal message, never the record
+              // error or anything else that tells one cause from another. The
+              // cause leaves only in the error body below, which the router
+              // turns into its one refusal and records on the denial ledger.
               result = {
                 ...result,
                 verified: false,
                 trust_tier: "unverified",
                 liveness_proven: false,
-                errors: [...result.errors, recorded.error],
+                errors: [...result.errors, FIXED_DENIAL_MESSAGE],
               };
             }
           }

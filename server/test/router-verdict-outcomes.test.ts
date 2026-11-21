@@ -26,7 +26,7 @@ import { createDistressTools, DISTRESS_REASONS, DISTRESS_SEVERITIES } from "../s
 import { defaultDistressConfig } from "../src/distress/config.js";
 import { createErc8004Tools, resolvePendingRequest } from "../src/key-17/erc8004-tools.js";
 import { DefaultPolicyGate, type PolicyGateConfig } from "../src/key-17/policy-gate.js";
-import { expectedRefusal } from "./helpers/expected-refusal.js";
+import { expectedRefusal, expectedRefusalBody } from "./helpers/expected-refusal.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -50,6 +50,16 @@ async function callThroughRouter(
   args: Record<string, unknown>,
   routerAudit: AuditLog,
 ): Promise<WireResult> {
+  const [result] = await callsThroughRouter(tools, [{ name, args }], routerAudit);
+  return result!;
+}
+
+/** Calls in order through one real router and one client session. */
+async function callsThroughRouter(
+  tools: ToolDefinition[],
+  calls: ReadonlyArray<{ name: string; args: Record<string, unknown> }>,
+  routerAudit: AuditLog,
+): Promise<WireResult[]> {
   const classified = tools.map((definition): ToolDefinition => ({
     ...definition,
     tool_class: READ_TOOLS_HERE.has(definition.name) ? "read" : "write",
@@ -60,7 +70,11 @@ async function callThroughRouter(
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   try {
-    return await client.callTool({ name, arguments: args });
+    const results: WireResult[] = [];
+    for (const call of calls) {
+      results.push(await client.callTool({ name: call.name, arguments: call.args }));
+    }
+    return results;
   } finally {
     await client.close();
     await server.close();
@@ -158,6 +172,22 @@ describe("handshake_exchange", () => {
   });
 });
 
+// Wording from the handshake record refusals (ownership, per-origin quota,
+// capacity, admission and audit availability) in src/handshake/tools.ts; none
+// may appear in a later status read.
+const RECORD_CAUSE_WORDING: readonly string[] = [
+  "same fortress",
+  "self-handshake",
+  "too many",
+  "limit",
+  "quota",
+  "capacity",
+  "saturated",
+  "admission",
+  "audit",
+  "retry",
+];
+
 describe("handshake_status", () => {
   async function respondedPair() {
     const initiator = makeFortress();
@@ -197,6 +227,36 @@ describe("handshake_status", () => {
         tool: "handshake_status",
         cause: "post_allow_refusal",
         error_name: "error",
+        error_message: expect.stringContaining("same fortress"),
+      }),
+    })]);
+  });
+
+  it("a later status read of a session whose record was refused carries the fixed message and no cause", async () => {
+    const { a, responder, sessionId, completion } = await respondedPair();
+    await responder.identityManager.save(a);
+    const routerAudit = new AuditLog(new MemoryStorage(), generateRandomKey());
+
+    const [refused, status] = await callsThroughRouter(responder.handshake.tools, [
+      { name: "handshake_status", args: { session_id: sessionId, completion } },
+      { name: "handshake_status", args: { session_id: sessionId } },
+    ], routerAudit);
+
+    expect(refused).toEqual(expectedRefusal());
+    expect(status!.isError).toBeUndefined();
+    const body = parse(status);
+    expect(body.state).toBe("failed");
+    expect(body.result.verified).toBe(false);
+    expect(body.result.errors).toEqual([expectedRefusalBody().message]);
+    const text = (status as { content: Array<{ text: string }> }).content[0]!.text.toLowerCase();
+    for (const causeWording of RECORD_CAUSE_WORDING) {
+      expect(text).not.toContain(causeWording);
+    }
+    // Only the refused completion reaches the ledger, and its row keeps the cause.
+    expect(await denialRows(routerAudit)).toEqual([expect.objectContaining({
+      details: expect.objectContaining({
+        tool: "handshake_status",
+        cause: "post_allow_refusal",
         error_message: expect.stringContaining("same fortress"),
       }),
     })]);
