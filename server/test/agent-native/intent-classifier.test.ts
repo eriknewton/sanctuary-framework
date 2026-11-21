@@ -8,6 +8,9 @@ const {
   HELP_MAX_VARIANTS, HELP_MAX_VARIANT_BYTES, HELP_INTENT_MAX_CHARS,
 } = classifier;
 
+// A decode chain gets one quarter of the variant slots; the fallback also runs the prior-source witness.
+const decodePasses = classifier.HELP_MAX_DECODE_PASSES ?? HELP_MAX_VARIANTS / 4;
+
 const gated = (intent: string) => expect(classifyIntent(intent).safety_class, intent).toBe("gated");
 
 describe("bounded intent screening", () => {
@@ -180,6 +183,12 @@ describe("bounded intent screening", () => {
     ["save my café notes", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["remember my timezone", "ordinary", "sanctuary_remember", undefined, {"key": "user_tz", "value": "America/Los_Angeles"}],
     [`save ${Buffer.from("東京").toString("base64")}`, "sensitive", null, "unreadable", null],
+    ["save %2565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["remember %EF%BC%8565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save %252565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    [`save %${"25".repeat(decodePasses)}65xport the notes`, "sensitive", null, "variant_budget", null],
+    [`save %${"25".repeat(decodePasses - 1)}65xport the notes`, "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save %zz %2565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);

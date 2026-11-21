@@ -30,6 +30,8 @@ export const HELP_INTENT_SCHEMA_MAX_CHARS = 4 * HELP_INTENT_MAX_CHARS;
 export const HELP_BAND_SCAN_CHARS = HELP_INTENT_MAX_CHARS / 2;
 // Well above an ordinary intent's leetspeak copy plus one copy per encoded token.
 export const HELP_MAX_VARIANTS = 32;
+// One decode chain may use a quarter of the variant slots, leaving room for other tokens and generators.
+export const HELP_MAX_DECODE_PASSES = HELP_MAX_VARIANTS / 4;
 // Thirty-two variants of one scan unit bound retained decoded UTF-8 text.
 export const HELP_MAX_VARIANT_BYTES = HELP_MAX_VARIANTS * HELP_BAND_SCAN_CHARS;
 // Four bytes, the shortest needle, require eight base64 characters.
@@ -105,14 +107,30 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
     }
     return true;
   };
-  try {
-    if (!add(decodeURIComponent(normalized))) return { variants: [...variants], bytes, budgetHit, unreadable };
-  } catch { /* Plain text remains available to the screen. */ }
+  const decodePercent = (text: string): boolean => {
+    let current = text;
+    for (let pass = 0; pass < HELP_MAX_DECODE_PASSES; pass += 1) {
+      let decoded: string;
+      try { decoded = decodeURIComponent(current); }
+      catch { return true; /* Previously retained text remains available to the screen. */ }
+      if (decoded === current) return true;
+      if (!add(decoded)) return false;
+      // Normalize each retained output before another pass so compatibility percent signs share the same fixed point.
+      current = normalizeHelpVariant(decoded).normalized;
+    }
+    try {
+      // A chain still changing at the pass bound cannot authorize runnable guidance.
+      if (decodeURIComponent(current) !== current) {
+        budgetHit = true;
+        return false;
+      }
+    } catch { /* The last retained text has no further valid percent decoding. */ }
+    return true;
+  };
+  if (!decodePercent(normalized)) return { variants: [...variants], bytes, budgetHit, unreadable };
   for (const token of normalized.split(/[^a-z0-9%+/=_-]+/i)) {
     if (token.includes("%")) {
-      try {
-        if (!add(decodeURIComponent(token))) break;
-      } catch { /* Plain text remains available to the screen. */ }
+      if (!decodePercent(token)) break;
     }
     if (token.length >= BASE64_MIN_CHARS && /^[a-z0-9+/=_-]+$/i.test(token)) {
       try {
