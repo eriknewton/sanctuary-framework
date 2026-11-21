@@ -14,7 +14,7 @@ import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
 import type { ToolCallTrapRuntime } from "../../src/honeypot/tool-call-trap-runtime.js";
-import { DenialLedger, type DenialCause, type DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
+import { DENIAL_CAUSES, DenialLedger, type DenialCause, type DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
 import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import { ClientManager, type UpstreamTool } from "../../src/proxy/client-manager.js";
 import { ResponseScreen } from "../../src/proxy/response-screen.js";
@@ -247,6 +247,37 @@ interface RefusalCase {
   run: (booted: Booted) => Promise<Awaited<ReturnType<Client["callTool"]>>>;
 }
 
+// One refusal in each boundary stage: pre-gate, gate deny, post-allow, handler error, proxied upstream error.
+const STAGE_REFUSALS = [
+  "argument builder throw",
+  "Tier 1 denied",
+  "recall of an absent key",
+  "handler throw",
+  "proxied upstream error",
+] as const;
+// Every tool the refusal cases below are refused on.
+const REFUSED_TOOLS = [
+  "state_delete", "state_list", "state_read", "sanctuary_remember", "principal_policy_view",
+  "sanctuary_recall", "state_export", "sanctuary_compound_execute", "sanctuary_events_read",
+  "state_write", "identity_sign", "proxy/fx/read",
+];
+// The events tool's own caps: at most 10 reads per cursor, at most 25 events per read.
+const EVENT_PAGES_READ = 10;
+const EVENTS_PER_PAGE = 25;
+const BOUNDARY_ROW_OPERATIONS = new Set(["denial_cause", "denial_cause_summary"]);
+// Must match the verdict keys refusedResultFacts reads in tool-outcome.ts whose value is not free text.
+const VERDICT_ERROR_NAMES = new Set(["denied", "status"]);
+// Operator-side markers of the boundary's rows: their operations, the pre-gate
+// decision field and value, and every closed cause literal except `other`,
+// which is also an ordinary word in unrelated rows.
+const BOUNDARY_ROW_MARKERS = [
+  "denial_cause",
+  "gate_deny:",
+  "decided_by",
+  "pre_gate",
+  ...DENIAL_CAUSES.filter((cause) => cause !== "other"),
+];
+
 const REFUSAL_CASES: RefusalCase[] = [
   {
     label: "Tier 1 denied",
@@ -433,7 +464,8 @@ const REFUSAL_CASES: RefusalCase[] = [
 
 // Operations the approval callback approves so their handlers run; every other
 // approval request is denied, and one operation's request throws.
-const APPROVED_OPERATIONS = new Set(["sanctuary_compound_execute", "identity_sign"]);
+// audit_export_siem is Tier 1 under the default policy; the readback pin exports through it.
+const APPROVED_OPERATIONS = new Set(["sanctuary_compound_execute", "identity_sign", "audit_export_siem"]);
 const THROWING_OPERATION = "principal_policy_view";
 
 describe("one refusal through the production composition root", () => {
@@ -579,27 +611,68 @@ describe("one refusal through the production composition root", () => {
   });
 
   it("the readback tools expose only their fixed redacted row shapes", async () => {
+    // A pin for rows that did not exist at base (the ledger's denial_cause and
+    // denial_cause_summary rows and the pre-gate gate_deny row): after a fresh
+    // refusal in every boundary stage in this one server, no agent-callable
+    // audit surface returns one of them or any of their operator-side fields.
     // Dropped from this run: a check that the readback tools show no new row
-    // after each refused call, and a full cursor table. The SIEM export's rows
-    // are format projections of the same redacted view; their allowlist is
-    // pinned in test/security/agent-audit-allowlist.test.ts.
+    // after each refused call, and a full cursor table.
+    for (const label of STAGE_REFUSALS) {
+      const refusal = REFUSAL_CASES.find((candidate) => candidate.label === label)!;
+      expect(await refusal.run(booted), label).toEqual(expectedRefusal());
+    }
+    const ledgerRows = (await booted.app.auditLog.query({ operation_type: "denial_cause", limit: 1_000 })).entries;
+    // A first row's message is free text, except where its error name is a
+    // body's verdict key: that value (`true`, a status word) is not a message.
+    // The fixed refusal message is public, since every refusal carries it.
+    const ledgerMessages = ledgerRows
+      .filter((row) => !VERDICT_ERROR_NAMES.has(String(row.details?.error_name)))
+      .map((row) => row.details?.error_message)
+      .filter((message): message is string => typeof message === "string" && message.length > 0)
+      .filter((message) => message !== expectedRefusalBody().message);
+    expect(ledgerMessages.length).toBeGreaterThan(0);
+
     const view = [...AGENT_AUDIT_VIEW_FIELDS];
+    // sanctuary_audit_search rows carry `summary: { result }` at base as well; it is kept.
+    const searchFields = ["audit_ref", "timestamp", "operation", "verification", "summary"];
+    const rowSets: Array<[string, unknown, string[]]> = [];
+    for (const query of ["denial_cause", "gate_deny", "pre_gate", ...REFUSED_TOOLS]) {
+      const searched = body(await call(booted, "sanctuary_audit_search", { query, limit: 25 }));
+      rowSets.push([`sanctuary_audit_search ${query}`, searched.results, searchFields]);
+    }
     const opened = body(await call(booted, "sanctuary_events_open_cursor", {}));
-    const read = body(await call(booted, "sanctuary_events_read", { cursor: opened.cursor }));
-    const searched = body(await call(booted, "sanctuary_audit_search", { query: "sanctuary_remember" }));
-    const monitored = body(await call(booted, "monitor_audit_log", {}));
-    const rowSets: Array<[string, unknown, string[]]> = [
-      ["sanctuary_events_read", read.events, ["cursor_event_id", ...view]],
-      ["sanctuary_audit_search", searched.results, ["audit_ref", "timestamp", "operation", "verification", "summary"]],
-      ["monitor_audit_log", monitored.entries, view],
-    ];
-    for (const [tool, rows, fields] of rowSets) {
-      expect(Array.isArray(rows), tool).toBe(true);
-      expect((rows as unknown[]).length, tool).toBeGreaterThan(0);
+    const events: unknown[] = [];
+    let cursor = opened.cursor as string | undefined;
+    for (let page = 0; cursor !== undefined && page < EVENT_PAGES_READ; page += 1) {
+      const read = body(await call(booted, "sanctuary_events_read", { cursor, opts: { limit: EVENTS_PER_PAGE } }));
+      events.push(...(read.events as unknown[]));
+      cursor = typeof read.next_cursor === "string" && read.next_cursor.length > 0 ? read.next_cursor : undefined;
+    }
+    rowSets.push(["sanctuary_events_read", events, ["cursor_event_id", ...view]]);
+    const monitored = body(await call(booted, "monitor_audit_log", { limit: 1_000 }));
+    rowSets.push(["monitor_audit_log", monitored.entries, view]);
+
+    const allRowsText: string[] = [];
+    for (const [surface, rows, fields] of rowSets) {
+      expect(Array.isArray(rows), surface).toBe(true);
       for (const row of rows as Array<Record<string, unknown>>) {
-        expect(Object.keys(row).sort(), tool).toEqual([...fields].sort());
-        expect(JSON.stringify(row), tool).not.toContain("denial_cause");
+        expect(Object.keys(row).sort(), surface).toEqual([...fields].sort());
+        const operation = String(row.operation ?? "");
+        expect(BOUNDARY_ROW_OPERATIONS.has(operation), `${surface} ${operation}`).toBe(false);
+        expect(operation.startsWith("gate_deny:"), `${surface} ${operation}`).toBe(false);
+        allRowsText.push(JSON.stringify(row));
       }
+    }
+    expect(rowSets.some(([surface, rows]) => surface === "monitor_audit_log" && (rows as unknown[]).length > 0)).toBe(true);
+    // Every SIEM format renders the same redacted view; each export body is checked whole.
+    for (const format of ["cef", "ocsf"]) {
+      const exported = await call(booted, "audit_export_siem", { format, limit: 1_000 });
+      expect(exported.isError, format).toBeUndefined();
+      allRowsText.push(...(exported.content as Array<{ text: string }>).map((item) => item.text));
+    }
+    for (const text of allRowsText) {
+      for (const marker of BOUNDARY_ROW_MARKERS) expect(text, marker).not.toContain(marker);
+      for (const message of ledgerMessages) expect(text).not.toContain(message);
     }
   });
 });
