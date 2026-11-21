@@ -19,8 +19,10 @@ import {
   type DenialRecorder,
 } from "../../src/agent-native/denial-ledger.js";
 import { refusalResult } from "../../src/agent-native/safety-base.js";
-import { AuditPersistenceError, type AuditEntryInput, type AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, AuditPersistenceError, type AuditEntryInput } from "../../src/operational/audit-log.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 const SRC_DIR = fileURLToPath(new URL("../../src/", import.meta.url));
 // Live windows: every keyed window plus the one overflow window.
@@ -315,6 +317,43 @@ describe("denial ledger behind the router", () => {
     expect(r.audit.appends.length).toBe(appendsBefore);
     expect(r.ledger.snapshot().pending_appends).toBe(DENIAL_LEDGER_MAX_PENDING_APPENDS);
     expect(r.ledger.snapshot().ledger_budget_exhausted).toBeGreaterThan(0);
+  });
+
+  it("a refusing call returns the one refusal while its ledger append to the real audit log is still pending", async () => {
+    // Writes are held from the moment `holding` is set until the test releases them.
+    class HeldWriteStorage extends MemoryStorage {
+      holding = false;
+      readonly held: Array<() => void> = [];
+      override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        if (this.holding) await new Promise<void>((release) => { this.held.push(release); });
+        return super.write(namespace, key, data);
+      }
+    }
+    const storage = new HeldWriteStorage();
+    const auditLog = new AuditLog(storage, generateRandomKey());
+    // Load the chain first, so the refusing call's own stages need no write.
+    await auditLog.appendCritical({ layer: "l2", operation: "fixture_warmup", identity_id: "system", result: "success" });
+    const ledger = new DenialLedger(auditLog, () => 1_000_000, { warn: () => undefined });
+    const server = createServer([fixtureTool("refused_tool", { error: "fixture refusal" })], { auditLog, denialLedger: ledger });
+    const client = new Client({ name: "denial-ledger-held-write", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      storage.holding = true;
+      expect(await client.callTool({ name: "refused_tool", arguments: {} })).toEqual(refusalResult());
+      // The ledger's row reaches the held write and stays pending after the response returned.
+      await vi.waitFor(() => expect(storage.held.length).toBeGreaterThan(0));
+      expect(ledger.snapshot().pending_appends).toBe(1);
+      expect(ledger.snapshot().windows[0]!.generation.first_row).toBe("pending");
+    } finally {
+      storage.holding = false;
+      for (const release of storage.held.splice(0)) release();
+      await auditLog.flush().catch(() => undefined);
+      await client.close();
+      await server.close();
+    }
+    expect(ledger.snapshot().windows[0]!.generation.first_row).toBe("written");
   });
 
   it("a ledger that throws still leaves the same refusal", async () => {

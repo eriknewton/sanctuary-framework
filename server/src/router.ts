@@ -487,8 +487,10 @@ export function createServer(
   }
 
   /**
-   * Hand a cause to the ledger without ever affecting the response: a ledger
-   * that throws still leaves the same refusal, and no append is awaited here.
+   * Hand a cause to the ledger without affecting this call's response: a
+   * ledger that throws still leaves the same refusal, and no append is awaited
+   * here, so the append never delays the refusing call's own response. Later
+   * calls share the audit log's append queue with it, as with every append.
    * Must match DENIAL_CAUSES in agent-native/denial-ledger.ts: every call site
    * passes a literal from that list (or argumentStageCause), checked
    * structurally by test/agent-native/denial-ledger.test.ts.

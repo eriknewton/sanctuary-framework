@@ -10,7 +10,10 @@
  * The ledger's own state and I/O are bounded whatever the caller does and
  * whatever the audit log does: a fixed number of open windows, fixed-size
  * counters per window, and a global cap on appends that have not settled.
- * Nothing here is awaited by the router, and nothing here throws into it.
+ * Nothing here is awaited by the router, and nothing here throws into it, so a
+ * ledger append never delays the refusing call's own response. Its appends go
+ * through the audit log's one append queue, which later calls share with it
+ * exactly as they share it with every gate and tool append.
  */
 import { randomBytes } from "node:crypto";
 import {
@@ -310,7 +313,9 @@ export class DenialLedger implements DenialRecorder {
 
   /**
    * Count one refusal. Never throws and never awaits: a ledger fault must not
-   * change what the router returns, and no append delays the response.
+   * change what the router returns, and a ledger append never delays the
+   * refusing call's own response (later calls share the audit log's append
+   * queue with it, as they do with every other append).
    */
   record(cause: DenialCause, input: DenialRecordInput): void {
     try {
