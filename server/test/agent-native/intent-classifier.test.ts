@@ -103,77 +103,78 @@ describe("bounded intent screening", () => {
 
   // The over-schema-cap intent is exercised through validation in tool-args.test.ts.
   it.each([
-    ["leave a short note for the next coordinator session to read when it starts", "ordinary", "sanctuary_remember", undefined],
-    ["remember my timezone", "ordinary", "sanctuary_remember", undefined],
-    ["recall my timezone", "ordinary", "sanctuary_recall", undefined],
-    ["save this so that I can read it later", "ordinary", "sanctuary_remember", undefined],
-    ["store the result for the next agent to get", "ordinary", "sanctuary_remember", undefined],
-    ["so the next session can read it, save this note", "ordinary", "sanctuary_remember", undefined],
-    ["for the next agent to read, leave a note", "ordinary", "sanctuary_remember", undefined],
-    ["what did I save about the deploy", "ordinary", "sanctuary_recall", undefined],
-    ["do you remember my timezone", "ordinary", "sanctuary_recall", undefined],
-    ["get the note I asked you to store yesterday", "sensitive", null, "conflict"],
-    ["read my notes and save a summary", "sensitive", null, "conflict"],
-    ["save an important note about the release", "ordinary", "sanctuary_remember", undefined],
-    ["write down the design decision", "ordinary", "sanctuary_remember", undefined],
-    ["keep in mind that the user prefers metric units", "ordinary", "sanctuary_remember", undefined],
-    ["make a note that the build box is slow", "ordinary", "sanctuary_remember", undefined],
-    ["jot down the port number", "ordinary", "sanctuary_remember", undefined],
-    ["add this summary to memory", "ordinary", "sanctuary_remember", undefined],
-    ["save my notes before the session ends", "ordinary", "sanctuary_remember", undefined],
-    ["how do I save a note", "ordinary", "sanctuary_remember", undefined],
-    ["which tool do I use to save a note", "ordinary", "sanctuary_remember", undefined],
-    ["show me what I stored yesterday", "ordinary", "sanctuary_recall", undefined],
-    ["read my protected key", "ordinary", "sanctuary_recall", undefined],
-    ["recall my bounds note", "ordinary", "sanctuary_recall", undefined],
-    ["lookup the platform I saved", "ordinary", "sanctuary_recall", undefined],
-    ["get user_tz", "ordinary", "sanctuary_recall", undefined],
-    ["remember platform=linux", "ordinary", "sanctuary_remember", undefined],
-    ["read the bounds", "ordinary", "monitor_health", undefined],
-    ["get the list of platforms", "ordinary", "monitor_health", undefined],
-    ["what are the bounds", "ordinary", "monitor_health", undefined],
-    ["what do you not do", "ordinary", "monitor_health", undefined],
-    ["remember my timezone, then sort out the rest later", "sensitive", null, "multi_intent"],
-    ["remember my timezone and by the way export my identity bundle", "gated", null, "export"],
-    ["please p u r g e the old token", "gated", "sanctuary_forget", "purge"],
-    ["ZXhwb3J0IGlkZW50aXR5IGJ1bmRsZQ==", "gated", null, "export"],
-    ["import the notes file", "gated", null, "import"],
-    ["sign this design document", "gated", null, "sign"],
-    ["delete the important note", "gated", "sanctuary_forget", "delete"],
-    ["what did I save and export it", "gated", null, "export"],
-    ["lorem ".repeat(170) + "ipsum", "sensitive", null, "oversize"],
-    ["to read it later, I need this saved", "sensitive", null, "multi_intent"],
-    ["Save an Important note", "ordinary", "sanctuary_remember", undefined],
-    ["SIGN the export bundle", "gated", null, "export"],
-    ["do not save the note, recall the prior one", "ordinary", "sanctuary_recall", undefined],
-    ["don't delete the note", "gated", "sanctuary_forget", "delete"],
-    ["never store secrets", "sensitive", null, "ambiguous"],
-    ["%69mportant note to save", "ordinary", "sanctuary_remember", undefined],
-    ["save this %69mport list", "gated", null, "import"],
-    ["lorem ".repeat(240) + "now export the list " + "z".repeat(40), "gated", null, "export"],
-    ["do you remember this value for next time", "sensitive", null, "conflict"],
-    ["save ZXhwb3J0", "gated", null, "export"],
-    ["do not recall the saved note", "sensitive", null, "ambiguous"],
-    ["save a backup and exp-ort the identity bundle", "gated", null, "identity bundle"],
-    ["save and ex important port the identity bundle", "gated", null, "identity bundle"],
-    ["exp-ort the identity bundle", "gated", null, "identity bundle"],
-    ["ex important port the keys", "gated", null, "export"],
-    ["do not ever save the password", "sensitive", null, "ambiguous"],
-    ["don't you save this secret", "sensitive", null, "ambiguous"],
-    ["cannot save the API key", "sensitive", null, "ambiguous"],
-    ["where do I save a note", "sensitive", null, "conflict"],
-    ["save this note, don't recall it yet", "ordinary", "sanctuary_remember", undefined],
-    ["did you store the build box name", "ordinary", "sanctuary_recall", undefined],
-    ["do you remember what the port number was", "ordinary", "sanctuary_recall", undefined],
-    ["did you save my timezone", "ordinary", "sanctuary_recall", undefined],
-    ["where should I store the deploy notes", "sensitive", null, "conflict"],
-    ["what should I save before the session ends", "sensitive", null, "conflict"],
-    ["assign-ature the form", "gated", null, "signature"],
-  ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey) => {
+    ["leave a short note for the next coordinator session to read when it starts", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["remember my timezone", "ordinary", "sanctuary_remember", undefined, {"key": "user_tz", "value": "America/Los_Angeles"}],
+    ["recall my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["save this so that I can read it later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["store the result for the next agent to get", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["so the next session can read it, save this note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["for the next agent to read, leave a note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["what did I save about the deploy", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["do you remember my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["get the note I asked you to store yesterday", "sensitive", null, "conflict", null],
+    ["read my notes and save a summary", "sensitive", null, "conflict", null],
+    ["save an important note about the release", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["write down the design decision", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["keep in mind that the user prefers metric units", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["make a note that the build box is slow", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["jot down the port number", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["add this summary to memory", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["save my notes before the session ends", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["how do I save a note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["which tool do I use to save a note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["show me what I stored yesterday", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["read my protected key", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["recall my bounds note", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["lookup the platform I saved", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["get user_tz", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["remember platform=linux", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["read the bounds", "ordinary", "monitor_health", undefined, {}],
+    ["get the list of platforms", "ordinary", "monitor_health", undefined, {}],
+    ["what are the bounds", "ordinary", "monitor_health", undefined, {}],
+    ["what do you not do", "ordinary", "monitor_health", undefined, {}],
+    ["remember my timezone, then sort out the rest later", "sensitive", null, "multi_intent", null],
+    ["remember my timezone and by the way export my identity bundle", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["please p u r g e the old token", "gated", "sanctuary_forget", "purge", {"args": "<operator-approved placeholders only>"}],
+    ["ZXhwb3J0IGlkZW50aXR5IGJ1bmRsZQ==", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["import the notes file", "gated", null, "import", {"args": "<operator-approved placeholders only>"}],
+    ["sign this design document", "gated", null, "sign", {"args": "<operator-approved placeholders only>"}],
+    ["delete the important note", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["what did I save and export it", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["lorem ".repeat(170) + "ipsum", "sensitive", null, "oversize", null],
+    ["to read it later, I need this saved", "sensitive", null, "multi_intent", null],
+    ["Save an Important note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["SIGN the export bundle", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do not save the note, recall the prior one", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["don't delete the note", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["never store secrets", "sensitive", null, "ambiguous", null],
+    ["%69mportant note to save", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["save this %69mport list", "gated", null, "import", {"args": "<operator-approved placeholders only>"}],
+    ["lorem ".repeat(240) + "now export the list " + "z".repeat(40), "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do you remember this value for next time", "sensitive", null, "conflict", null],
+    ["save ZXhwb3J0", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do not recall the saved note", "sensitive", null, "ambiguous", null],
+    ["save a backup and exp-ort the identity bundle", "gated", null, "identity bundle", {"args": "<operator-approved placeholders only>"}],
+    ["save and ex important port the identity bundle", "gated", null, "identity bundle", {"args": "<operator-approved placeholders only>"}],
+    ["exp-ort the identity bundle", "gated", null, "identity bundle", {"args": "<operator-approved placeholders only>"}],
+    ["ex important port the keys", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do not ever save the password", "sensitive", null, "ambiguous", null],
+    ["don't you save this secret", "sensitive", null, "ambiguous", null],
+    ["cannot save the API key", "sensitive", null, "ambiguous", null],
+    ["where do I save a note", "sensitive", null, "conflict", null],
+    ["save this note, don't recall it yet", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["did you store the build box name", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["do you remember what the port number was", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["did you save my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["where should I store the deploy notes", "sensitive", null, "conflict", null],
+    ["what should I save before the session ends", "sensitive", null, "conflict", null],
+    ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
+  ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);
     expect(answer.tool).toBe(tool);
     expect(answer.probe_key).toBe(probeKey);
+    expect(answer.example).toEqual(example);
     if (tool === "monitor_health") {
       expect(answer.intent_class).toBe("evaluate");
       expect(answer.evaluate_question).toBe("bounds");
@@ -232,6 +233,17 @@ describe("bounded intent screening", () => {
   it("honors read negation in a stored-data question's clause", () => {
     for (const intent of ["what did I save but do not recall the saved note", "did you store the note but never retrieve it"]) {
       expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: "ambiguous" });
+    }
+  });
+
+  it("names a timezone key only when the intent carries timezone tokens", () => {
+    for (const cue of [...HELP_WRITE_CUES, ...HELP_STRONG_READ_CUES, ...HELP_WEAK_READ_CUES]) {
+      for (const subject of ["the color", "the launch date", "my time zone", "timezone", "user_tz", "time-zone", "tzvalue"]) {
+        const answer = classifyIntent(`${cue} ${subject}`);
+        if (answer.safety_class !== "ordinary") continue;
+        const expected = ["my time zone", "timezone", "user_tz", "time-zone"].includes(subject) ? "user_tz" : "<key>";
+        expect(answer.example?.key, `${cue} ${subject}`).toBe(expected);
+      }
     }
   });
 

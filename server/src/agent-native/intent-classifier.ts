@@ -233,14 +233,18 @@ function collectCues(fold: string): Cue[] {
   return cues.sort((a, b) => a.start - b.start || b.end - a.end).filter((cue, index, all) =>
     index === 0 || cue.start !== all[index - 1].start);
 }
-function memoryAnswer(kind: "write" | "read"): IntentClassification {
+function memoryAnswer(kind: "write" | "read", fold: string): IntentClassification {
+  // A timezone token authorizes the concrete timezone example; other memory guidance stays a fill-in template.
+  const tokens = fold.match(/[a-z0-9]+/g) ?? [];
+  const timezone = tokens.some((token, index) => token === "timezone" || token === "tz" ||
+    (token === "time" && tokens[index + 1] === "zone"));
   return kind === "write" ? {
     safety_class: "ordinary", tool: COOPERATIVE_TOOL_NAMES.remember,
-    example: { key: "user_tz", value: "America/Los_Angeles" },
+    example: timezone ? { key: "user_tz", value: "America/Los_Angeles" } : { key: "<key>", value: "<value>" },
     why_sanctuary: "State is encrypted, identity-bound, and audited.",
   } : {
     safety_class: "ordinary", tool: COOPERATIVE_TOOL_NAMES.recall,
-    example: { key: "user_tz" },
+    example: { key: timezone ? "user_tz" : "<key>" },
     why_sanctuary: "Recall preserves verification status in the response.",
   };
 }
@@ -266,7 +270,7 @@ function state_QUESTION_GUARD(fold: string, writes: Cue[], allCues: Cue[]): Inte
   if (!storedQuestion) return sensitive("conflict");
   // Stored-data questions honor the read-class negation in the clause supplying their write cue.
   const readNegated = allCues.some(cue => cue.negated && cue.kind !== "write" && writes.some(write => write.clause === cue.clause));
-  return readNegated ? sensitive("ambiguous") : memoryAnswer("read");
+  return readNegated ? sensitive("ambiguous") : memoryAnswer("read", fold);
 }
 function state_MAIN_VERB(fold: string, cues: Cue[]): IntentClassification | undefined {
   const writes = cues.filter(cue => cue.kind === "write");
@@ -285,7 +289,7 @@ function state_MAIN_VERB(fold: string, cues: Cue[]): IntentClassification | unde
   });
   if (remaining.some(cue => cue.kind === "write") && remaining.some(cue => cue.kind !== "write")) return sensitive("conflict");
   const first = remaining[0];
-  if (first) return memoryAnswer(first.kind === "write" ? "write" : "read");
+  if (first) return memoryAnswer(first.kind === "write" ? "write" : "read", fold);
 }
 export function classifyIntent(intent: string): IntentClassification {
   const points = Array.from(intent);
@@ -315,7 +319,7 @@ export function classifyIntent(intent: string): IntentClassification {
   const state_EVALUATE_FALLBACK = route && !writes.length;
   if (state_EVALUATE_FALLBACK) return evaluateAnswer(route);
   const state_STORED_REFERENCE = new RegExp(`\\b(?:${HELP_STORED_REFERENCES.join("|")})\\b`).test(fold) && !writes.length && !allCues.some(cue => cue.negated && cue.kind !== "write");
-  if (state_STORED_REFERENCE) return memoryAnswer("read");
+  if (state_STORED_REFERENCE) return memoryAnswer("read", fold);
   return state_AMBIGUOUS();
 }
 function state_OVERSIZE(): IntentClassification { return sensitive("oversize"); }

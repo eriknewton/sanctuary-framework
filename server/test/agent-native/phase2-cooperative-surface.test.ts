@@ -874,7 +874,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(tierRow!.details).toMatchObject({ safety_class: "ordinary", runnable_example: false });
   });
 
-  it("a memory verb outranks an evaluate noun: every hijack probe keeps its byte-identical memory route", async () => {
+  it("a memory verb outranks an evaluate noun: ordinary intents receive their memory argument template", async () => {
     const env = await setup();
     // state_REMEMBER wins over any evaluate noun in the same intent.
     for (const intent of [
@@ -888,7 +888,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       expect(result, intent).toEqual({
         safety_class: "ordinary",
         tool: "sanctuary_remember",
-        example: { key: "user_tz", value: "America/Los_Angeles" },
+        example: { key: "<key>", value: "<value>" },
         why_sanctuary: "State is encrypted, identity-bound, and audited.",
         audit_ref: result.audit_ref,
       });
@@ -900,7 +900,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       expect(result, intent).toEqual({
         safety_class: "ordinary",
         tool: "sanctuary_recall",
-        example: { key: "user_tz" },
+        example: { key: "<key>" },
         why_sanctuary: "Recall preserves verification status in the response.",
         audit_ref: result.audit_ref,
       });
@@ -918,6 +918,25 @@ describe("agent-native Phase 2 cooperative surface", () => {
       const result = await callTool(env.facadeTools, "sanctuary_help", { intent });
       expect(result.intent_class, intent).toBe("evaluate");
     }
+  });
+  it("reports binding availability only for bound-only help guidance in an unbound session", async () => {
+    const storage = new MemoryStorage();
+    const key = generateRandomKey();
+    const auditLog = new AuditLog(storage, key);
+    const { tools, identityManager, namespaceRegistry } = createL1Tools(new StateStore(storage, key), storage, key, "recovery-key", auditLog);
+    let binding: SessionBinding | undefined = session("help-owner");
+    const facade = createAgentNativeCooperativeTools({ identityManager, namespaceRegistry, auditLog,
+      primitiveTools: tools, currentSessionBinding: () => binding,
+    }).tools;
+    const bound = await callTool(facade, "sanctuary_help", { intent: "save the note" });
+    expect(bound).toMatchObject({ tool: "sanctuary_remember" });
+    expect(bound).not.toHaveProperty("session_bound");
+    binding = undefined;
+    const unbound = await callTool(facade, "sanctuary_help", { intent: "save the note" });
+    expect(unbound).toMatchObject({ tool: "sanctuary_remember", session_bound: false });
+    const posture = await callTool(facade, "sanctuary_help", { intent: "what does this protect" });
+    expect(posture).toHaveProperty("tool", "sanctuary_active_protections");
+    expect(posture).not.toHaveProperty("session_bound");
   });
 
   it("returns only disclosable who-am-i fields and positive active protections", async () => {

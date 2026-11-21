@@ -29,6 +29,7 @@ import {
   normalizedArgsHash,
   OpaqueNamespaceRegistry,
   resolveActiveSessionIdentity,
+  SessionIdentityError,
   sha256,
   type SessionBinding,
 } from "./safety-base.js";
@@ -37,6 +38,14 @@ import {
   isCompoundExecutableToolName,
   type CompoundExecutableToolName,
 } from "./tool-names.js";
+
+const UNBOUND_COOPERATIVE_TOOLS = new Set<string>([
+  COOPERATIVE_TOOL_NAMES.help, COOPERATIVE_TOOL_NAMES.capabilities,
+  COOPERATIVE_TOOL_NAMES.whoAmI, COOPERATIVE_TOOL_NAMES.activeProtections,
+]);
+const BOUND_ONLY_COOPERATIVE_TOOLS = new Set<string>(
+  Object.values(COOPERATIVE_TOOL_NAMES).filter(tool => !UNBOUND_COOPERATIVE_TOOLS.has(tool))
+);
 
 const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 
@@ -674,7 +683,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.help,
-      description: "Given a free-text intent (for example \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, with a runnable example for ordinary requests. Evaluation questions (what this protects, the bounds, which platforms, how to verify, how to uninstall) return intent_class \"evaluate\" with a guidance string and the related read-only tools. Guidance for sensitive or gated requests is deliberately coarse and never reveals policy internals. Returns the guidance plus an audit_ref. For the start-here catalog of cooperative tools call sanctuary_capabilities; the complete advertised tool list is MCP tools/list.",
+      description: "Given a free-text intent (for example \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, with an argument template for ordinary requests. Evaluation questions (what this protects, the bounds, which platforms, how to verify, how to uninstall) return intent_class \"evaluate\" with a guidance string and the related read-only tools. Guidance for sensitive or gated requests is deliberately coarse and never reveals policy internals. Intents longer than 4,096 characters are rejected; past 1,024 characters only a risk screen runs. Returns the guidance plus an audit_ref. For the start-here catalog of cooperative tools call sanctuary_capabilities; the complete advertised tool list is MCP tools/list.",
       tool_class: "read",
       // The cap must match HELP_INTENT_SCHEMA_MAX_CHARS in intent-classifier.ts.
       // It must match sanctuary_help in test/fixtures/tools-list-wire-golden.json and test/structure/__fixtures__/public-surface/mcp-tool-surface.json.
@@ -687,6 +696,16 @@ export function createAgentNativeCooperativeTools(
       handler: async (args) => {
         try {
           const classified = classifyIntent(args.intent as string);
+          let sessionBound: false | undefined;
+          // Bound-only guidance exposes its binding requirement when the session has no identity.
+          if (classified.tool && BOUND_ONLY_COOPERATIVE_TOOLS.has(classified.tool)) {
+            try {
+              active();
+            } catch (error) {
+              if (!(error instanceof SessionIdentityError)) throw error;
+              sessionBound = false;
+            }
+          }
           await recordHelpProbe(args.intent as string, classified.probe_key, classified.safety_class);
           const auditRef = await audit("sanctuary_help", {
             safety_class: classified.safety_class,
@@ -696,7 +715,7 @@ export function createAgentNativeCooperativeTools(
             // unchanged for them.
             runnable_example: classified.safety_class === "ordinary" && classified.example !== null,
           });
-          return toolResult({ ...classified, probe_key: undefined, audit_ref: auditRef });
+          return toolResult({ ...classified, probe_key: undefined, session_bound: sessionBound, audit_ref: auditRef });
         } catch {
           return deny("audit:sanctuary_help", "wait");
         }
