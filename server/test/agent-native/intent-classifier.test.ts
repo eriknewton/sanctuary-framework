@@ -295,11 +295,13 @@ describe("bounded intent screening", () => {
     } else expect(answer.intent_class).toBeUndefined();
   });
   it("closes guidance for invisible insertions throughout ordinary tool intents", () => {
-    const insertions = ["\u200b", "\u00ad", "\ufe0f", "\u2060", "%E2%80%8B"];
+    const insertions = ["\u200b", "\u00ad", "\ufe0f", "\u2060", "%E2%80%8B", "%25E2%2580%258B", "\uff05E2\uff0580\uff058B"];
     const continuingCases = intentCases.filter(([, safetyClass, tool]) => tool !== null && safetyClass !== "gated");
-    // 45 of 134 rows carry an ungated tool: 1,384 code-point boundaries times 5 forms = 6,920 calls.
+    // 45 of 139 rows carry an ungated tool: 1,384 code-point boundaries times 7 forms = 9,688 calls.
     // Derive the count from the table so every continuing row and both end boundaries stay covered.
     const callCount = continuingCases.reduce((total, [intent]) => total + (Array.from(intent).length + 1) * insertions.length, 0);
+    expect(continuingCases).toHaveLength(45);
+    expect(callCount).toBe(9688);
     let calls = 0;
     for (const [intent] of continuingCases) {
       const points = Array.from(intent);
@@ -310,6 +312,24 @@ describe("bounded intent screening", () => {
           calls += 1;
           expect(answer.safety_class === "gated" || (answer.tool === null && answer.example === null), text).toBe(true);
         }
+      }
+    }
+    expect(calls).toBe(callCount);
+  });
+  it("closes guidance for decoded note tokens throughout ordinary tool intents", () => {
+    const invisibles = ["\u200b", "\u00ad", "\ufe0f"];
+    const continuingCases = intentCases.filter(([, safetyClass, tool]) => tool !== null && safetyClass !== "gated");
+    // 45 of 139 rows carry an ungated tool: 45 rows times 3 encoded note forms = 135 calls.
+    const callCount = continuingCases.length * invisibles.length;
+    expect(continuingCases).toHaveLength(45);
+    expect(callCount).toBe(135);
+    let calls = 0;
+    for (const [intent] of continuingCases) {
+      for (const invisible of invisibles) {
+        const text = `${intent} ${Buffer.from(`note${invisible}`, "utf8").toString("base64")}`;
+        const answer = classifyIntent(text);
+        calls += 1;
+        expect(answer.safety_class === "gated" || (answer.tool === null && answer.example === null), text).toBe(true);
       }
     }
     expect(calls).toBe(callCount);
