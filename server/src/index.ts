@@ -78,6 +78,7 @@ import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
+import { assertToolOutcomesRegistered } from "./tool-outcome.js";
 import { toolResult } from "./router.js";
 import {
   ApprovalProofStore,
@@ -2435,6 +2436,11 @@ export async function createSanctuaryServer(options?: {
       return proxyRouter!.getTierForTool(parsed.serverName, parsed.toolName);
     });
   }
+
+  // 18a. Every registered tool must have a declared success shape: the router
+  // refuses every other outcome, so a tool without one must not reach an agent.
+  // Must match TOOL_OUTCOME_SHAPES in tool-outcome.ts.
+  assertToolOutcomesRegistered(allTools);
 
   // 19. Create MCP server with approval gate (proxy tools are included in allTools)
   const server = createServer(allTools, {
