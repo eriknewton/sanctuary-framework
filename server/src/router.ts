@@ -22,6 +22,7 @@ import type { AuditLog } from "./operational/audit-log.js";
 import { refusalResult, type SessionBinding } from "./agent-native/safety-base.js";
 import {
   CountingDenialRecorder,
+  DenialLedger,
   type DenialCause,
   type DenialRecorder,
   type DenialRecordInput,
@@ -196,9 +197,11 @@ export function createServer(
 ): Server {
   const gate = options?.gate;
   assertToolClasses(tools);
-  // Every refusal reaches a ledger: production passes the shared one; a router
-  // built without one counts refusals in a ledger with no sink and starts no I/O.
-  const denialLedger: DenialRecorder = options?.denialLedger ?? new CountingDenialRecorder();
+  // Every refusal reaches a ledger on every path: production passes the shared
+  // one; a router given only an audit log builds its own over that log; a
+  // router with neither (unit fixtures) counts refusals with no sink and no I/O.
+  const denialLedger: DenialRecorder = options?.denialLedger
+    ?? (options?.auditLog ? new DenialLedger(options.auditLog, Date.now) : new CountingDenialRecorder());
 
   const server = new Server(
     {
