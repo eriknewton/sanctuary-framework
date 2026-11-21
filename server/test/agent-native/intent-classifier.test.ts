@@ -30,9 +30,12 @@ describe("bounded intent screening", () => {
     expect(classifyIntent("importantish").probe_key).toBe("import");
     expect(classifyIntent("designated").probe_key).toBe("sign");
   });
-  it("screens every needle with a hyphen at each inner position", () => {
+  it("screens every needle with word joiners at each inner position", () => {
     for (const needle of HELP_NEEDLES) {
-      for (let offset = 1; offset < needle.length; offset += 1) gated(`${needle.slice(0, offset)}-${needle.slice(offset)}`);
+      // U+10EAD is the supplementary-plane Yezidi hyphen; its source offsets span two UTF-16 units.
+      for (const joiner of ["-", "_", ".", "—", "\u{10ead}"]) {
+        for (let offset = 1; offset < needle.length; offset += 1) gated(`${needle.slice(0, offset)}${joiner}${needle.slice(offset)}`);
+      }
     }
   });
   it("screens every needle with each benign word between its halves", () => {
@@ -194,6 +197,10 @@ describe("bounded intent screening", () => {
     ["not_save the note", "sensitive", null, "ambiguous", null],
     ["not.save the note", "sensitive", null, "ambiguous", null],
     ["not/save the note", "sensitive", null, "ambiguous", null],
+    ["save the notes before you del_ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del.ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del\u{10ead}ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save notes.txt for later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);

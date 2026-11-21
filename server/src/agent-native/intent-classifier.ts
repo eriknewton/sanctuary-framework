@@ -150,14 +150,20 @@ function scanCopies(fold: string): string | undefined {
   // Each offset names its benign occurrence, so checking a hit takes constant work.
   const benignOccurrence = new Int32Array(fold.length).fill(-1);
   spans.forEach((span, index) => benignOccurrence.fill(index, span.start, span.end));
-  const scan = (source: string, removeHyphens: boolean, ignoreBenign: boolean): string | undefined => {
+  const scan = (source: string, removeJoiners: boolean, ignoreBenign: boolean): string | undefined => {
     const direct: string[] = [];
     const compact: string[] = [];
     const directOffsets: number[] = [];
     const compactOffsets: number[] = [];
     for (let i = 0; i < source.length; i += 1) {
       const char = source[i];
-      if (removeHyphens && char === "-") continue;
+      // Copies B and C remove complete joiner code points while keeping UTF-16 offsets for benign-span checks.
+      const point = String.fromCodePoint(source.codePointAt(i)!);
+      if (removeJoiners && /[\p{Pd}_.]/u.test(point)) {
+        // The loop advances one code unit; skip any remaining unit of this code point as well.
+        i += point.length - 1;
+        continue;
+      }
       direct.push(char);
       directOffsets.push(i);
       if (/[a-z0-9:/._-]/.test(char)) {
