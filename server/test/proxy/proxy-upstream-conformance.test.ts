@@ -4,6 +4,7 @@ import { describe, expect, it, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer, type ToolDefinition } from "../../src/router.js";
+import { refusalResult } from "../../src/agent-native/safety-base.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
@@ -129,9 +130,8 @@ describe("proxy upstream transport conformance", () => {
       },
     });
 
-    const payload = textJson(result);
-    expect(payload.error).toBe("Operation not permitted");
-    expect(JSON.stringify(payload)).not.toContain("must not reach upstream");
+    expect(result).toEqual(refusalResult());
+    expect(JSON.stringify(result)).not.toContain("must not reach upstream");
     expect(await forwardedCallCount(harness)).toBe(0);
 
     const audit = await auditEntries(harness.auditLog);
@@ -204,19 +204,15 @@ describe("proxy upstream transport conformance", () => {
       name: "proxy/real_stdio/malformed",
       arguments: {},
     });
-    const malformedPayload = textJson(malformed);
-    expect(malformedPayload.proxy).toBe(true);
-    expect(malformedPayload.code).toBeUndefined();
-    expect(malformedPayload.error).toBe("Operation not permitted");
+    // Both reach the agent as the one refusal; which failure it was stays in the audit rows below.
+    expect(malformed).toEqual(refusalResult());
 
     const exploded = await harness.client.callTool({
       name: "proxy/real_stdio/explode",
       arguments: {},
     });
-    const errorPayload = textJson(exploded);
-    expect(errorPayload.proxy).toBe(true);
-    expect(errorPayload.code).toBe("upstream_error");
-    expect(String(errorPayload.error)).not.toContain("/tmp/private-path");
+    expect(exploded).toEqual(refusalResult());
+    expect(JSON.stringify(exploded)).not.toContain("/tmp/private-path");
     expect(await forwardedCallCount(harness)).toBe(2);
 
     const audit = await auditEntries(harness.auditLog);

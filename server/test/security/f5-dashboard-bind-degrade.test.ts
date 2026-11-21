@@ -46,7 +46,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { fixedDenial } from "../../src/agent-native/safety-base.js";
+import { refusalResult } from "../../src/agent-native/safety-base.js";
 import { createSanctuaryServer } from "../../src/index.js";
 import {
   StderrApprovalChannel,
@@ -85,10 +85,6 @@ const DASHBOARD_ENV_KEYS = [
   "SANCTUARY_DASHBOARD_PORT",
 ] as const;
 
-// Must match `GENERIC_GATE_DENIAL_REMEDIATION` in router.ts (not exported):
-// the fixed remediation class every gate denial returns to the caller,
-// regardless of which policy rule or tier fired.
-const GENERIC_GATE_DENIAL_REMEDIATION = "unavailable";
 
 describe("F5: a busy embedded-dashboard port degrades the MCP stdio boot instead of crashing it", () => {
   let fortress: TempFortress;
@@ -173,11 +169,10 @@ describe("F5: a busy embedded-dashboard port degrades the MCP stdio boot instead
       namespace: "f5-test-ns",
       key: "f5-test-key",
     });
-    expect(denied.isError).toBe(true);
+    // Must match refusalResult() in agent-native/safety-base.ts, the one
+    // result router.ts returns for every refusal whichever rule or tier fired.
+    expect(denied).toEqual(refusalResult());
     const deniedPayload = parseToolResult(denied);
-    expect(deniedPayload).toEqual(
-      fixedDenial("audit:gate:state_delete", GENERIC_GATE_DENIAL_REMEDIATION, null),
-    );
     const deniedText = JSON.stringify(deniedPayload).toLowerCase();
     expect(deniedText).not.toContain("port");
     expect(deniedText).not.toContain("tier");

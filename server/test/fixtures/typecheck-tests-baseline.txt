@@ -12,7 +12,7 @@ test/audit/tools.test.ts(109,57): error TS2345: Argument of type '{ query: Mock<
 test/audit/tools.test.ts(45,10): error TS2352: Conversion of type '{ version: string; state_dir: string; master_key_source: string; }' to type 'SanctuaryConfig' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/auto-trigger/auto-trigger.test.ts(911,22): error TS2304: Cannot find name 'HeadersInit'.
 test/auto-trigger/auto-trigger.test.ts(914,24): error TS2304: Cannot find name 'HeadersInit'.
-test/broker-mcp/audit-integrity-gate-classification.test.ts(45,17): error TS18046: 'result.content' is of type 'unknown'.
+test/broker-mcp/audit-integrity-gate-classification.test.ts(46,17): error TS18046: 'result.content' is of type 'unknown'.
 test/broker-mcp/broker-server.test.ts(87,3): error TS2578: Unused '@ts-expect-error' directive.
 test/castle-wall/export/exporter.test.ts(618,43): error TS2493: Tuple type '[]' of length '0' has no element at index '1'.
 test/castle-wall/ipc/macos-flow-events.test.ts(1136,13): error TS2322: Type '() => Promise<{ status: "verified"; }>' is not assignable to type '() => Promise<AuditChainVerdict>'.
@@ -594,7 +594,7 @@ test/principal-policy/posture-stream.test.ts(303,7): error TS18046: 'home' is of
 test/principal-policy/posture-stream.test.ts(350,12): error TS18046: 'body' is of type 'unknown'.
 test/principal-policy/posture-stream.test.ts(365,12): error TS18046: 'body' is of type 'unknown'.
 test/principal-policy/posture-stream.test.ts(401,12): error TS18046: 'body' is of type 'unknown'.
-test/principal-policy/router-gate-denial-opacity.test.ts(70,17): error TS18046: 'result.content' is of type 'unknown'.
+test/principal-policy/router-gate-denial-opacity.test.ts(88,17): error TS18046: 'result.content' is of type 'unknown'.
 test/principal-policy/unified-inbox-psi3.test.ts(32,22): error TS2304: Cannot find name 'HeadersInit'.
 test/principal-policy/webhook.test.ts(334,14): error TS18046: 'data' is of type 'unknown'.
 test/principal-policy/webhook.test.ts(400,14): error TS18046: 'data' is of type 'unknown'.
@@ -603,7 +603,7 @@ test/proxy/dynamic-discovery.test.ts(145,9): error TS2322: Type 'Mock<() => Prom
 test/proxy/dynamic-discovery.test.ts(213,7): error TS2353: Object literal may only specify known properties, and 'tier2_confirm_on_anomaly' does not exist in type 'PrincipalPolicy'.
 test/proxy/dynamic-discovery.test.ts(218,7): error TS2322: Type 'Mock<() => Promise<{ request_id: string; decision: string; decided_at: string; decided_by: string; }>>' is not assignable to type '(request: ApprovalRequest) => Promise<ApprovalResponse>'.
 test/proxy/dynamic-proxy.test.ts(16,5): error TS2322: Type 'Mock<() => Promise<{ content: { type: string; text: string; }[]; }>>' is not assignable to type 'ToolHandler'.
-test/proxy/proxy-upstream-conformance.test.ts(437,17): error TS18046: 'result.content' is of type 'unknown'.
+test/proxy/proxy-upstream-conformance.test.ts(433,17): error TS18046: 'result.content' is of type 'unknown'.
 test/proxy/ssrf-validator.test.ts(102,34): error TS2345: Argument of type '{ address: string; family: number; }[]' is not assignable to parameter of type 'LookupAddress'.
 test/proxy/ssrf-validator.test.ts(111,34): error TS2345: Argument of type '{ address: string; family: number; }[]' is not assignable to parameter of type 'LookupAddress'.
 test/proxy/ssrf-validator.test.ts(132,34): error TS2345: Argument of type '{ address: string; family: number; }[]' is not assignable to parameter of type 'LookupAddress'.
@@ -620,9 +620,9 @@ test/sdw/sdw-d2-export-import.test.ts(1379,7): error TS2322: Type 'Record<string
 test/sdw/sdw-d2-export-import.test.ts(1393,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
 test/sdw/sdw-phase1.test.ts(336,47): error TS2345: Argument of type '"catalog.future"' is not assignable to parameter of type '"catalog.environment"'.
 test/sdw/sdw-phase1.test.ts(369,64): error TS2554: Expected 2 arguments, but got 3.
-test/security/agent-audit-allowlist.test.ts(150,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/security/agent-audit-allowlist.test.ts(151,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
-test/security/agent-audit-allowlist.test.ts(350,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
+test/security/agent-audit-allowlist.test.ts(152,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
+test/security/agent-audit-allowlist.test.ts(351,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/security/at-rest-decrypt-fixtures.test.ts(302,41): error TS2345: Argument of type 'string' is not assignable to parameter of type '"l4-known-signers" | "l2-sentinel-finding-v1" | "l2-privacy-placeholders" | "l2-query-anonymity-tier-b-v1" | "l2-privacy-policies-v1" | "l2-english-policy-activation-v1" | ... 4 more ... | "l2-anomaly-classifier-state-v1"'.
 test/security/dashboard-no-query-token.test.ts(110,13): error TS2339: Property 'session_id' does not exist on type 'unknown'.
 test/security/dashboard-no-query-token.test.ts(117,12): error TS18046: 'body' is of type 'unknown'.

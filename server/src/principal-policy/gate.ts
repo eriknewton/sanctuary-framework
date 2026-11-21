@@ -463,6 +463,26 @@ export class ApprovalGate {
   }
 
   /**
+   * Record a refusal the router decided before this gate ran (argument
+   * preparation refused the call). Must match the pre-gate stage in router.ts's
+   * runBoundedCall: it writes the same one critical `gate_deny:<operation>` row
+   * an automatic gate denial writes, so every refused call leaves exactly one
+   * gate decision row whichever stage refused it.
+   *
+   * @param operation - The name `evaluate` would have received
+   *   (`approvalTargetToolName ?? name`).
+   */
+  async recordPreGateRefusal(operation: string): Promise<void> {
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: `gate_deny:${extractOperationName(operation)}`,
+      identity_id: "system",
+      result: "failure",
+      details: { decided_by: "pre_gate" },
+    });
+  }
+
+  /**
    * Evaluate a tool call against the Principal Policy.
    *
    * @param toolName - Full MCP tool name (e.g., "state_export")

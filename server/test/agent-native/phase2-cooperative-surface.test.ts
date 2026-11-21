@@ -19,6 +19,7 @@ import {
   classifyApprovalRequest,
   canonicalJson,
   fingerprintIdentityId,
+  boundaryRefusal,
   fixedDenial,
   MemoryHandleOwnershipConflictError,
   MEMORY_HANDLE_RECORD_VERSION,
@@ -991,8 +992,8 @@ describe("agent-native Phase 2 cooperative surface", () => {
         cursor: opened.cursor,
       });
     }
-    expect(last.denied).toBe(true);
-    expect(last.retry_after).toBe("minutes");
+    // A rate denial is the one boundary refusal: no retry bucket tells the agent which limit it met.
+    expect(last).toEqual(boundaryRefusal());
   });
 
   it("applies compound hide and forget marker side effects", async () => {

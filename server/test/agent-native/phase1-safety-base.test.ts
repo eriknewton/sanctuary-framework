@@ -11,6 +11,7 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import {
   classifyApprovalRequest,
+  boundaryRefusal,
   COOPERATIVE_DENIAL_DISCOVERY_HINT,
   fixedDenial,
   fingerprintIdentityId,
@@ -660,16 +661,17 @@ describe("agent-native Phase 1 safety base", () => {
     );
   });
 
-  it("uses only coarse retry_after values in fixed denials", () => {
+  it("the fixed-denial builder returns the one boundary refusal whatever its arguments", () => {
     expect(fixedDenial("audit:ref", "wait", "minutes")).toEqual({
       denied: true,
       message: "This action is not available in the current context.",
-      remediation_class: "wait",
-      retry_after: "minutes",
-      audit_ref: "audit:ref",
+      remediation_class: "request_review",
+      retry_after: null,
+      audit_ref: "audit:refusal",
       discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
     });
-    expect(fixedDenial("audit:ref").retry_after).toBeNull();
+    expect(fixedDenial("audit:ref")).toBe(boundaryRefusal());
+    expect(fixedDenial("audit:other", "unavailable", "hours")).toBe(boundaryRefusal());
   });
 
   it("shares concurrent first-use persisted claims inside one registry", async () => {

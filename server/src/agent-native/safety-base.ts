@@ -34,35 +34,72 @@ export const FIXED_DENIAL_MESSAGE =
   "This action is not available in the current context." as const;
 
 /**
- * Static discovery pointer attached to every cooperative denial
- * (enforcement-as-teacher, harness-agnostic non-wall part; design Section 5
- * move 3).
+ * Static discovery pointer carried by the one boundary refusal.
  *
  * SAFETY (AGENTS.md hard rule 7 - no-policy-inference): this string is a
- * compile-time CONSTANT and is IDENTICAL on every denial, regardless of which
- * tool, tier, or rule produced it. It names only the general discovery
+ * compile-time CONSTANT and is IDENTICAL on every refusal, regardless of which
+ * tool, tier, stage or rule produced it. It names only the general discovery
  * entrypoints (sanctuary_help / sanctuary_capabilities), never a per-request
- * tool. It therefore cannot leak which tier/rule fired or what the caller
- * attempted: the field is byte-for-byte the same on every denial. It teaches
- * "where to look" without revealing "what tripped". Do NOT parameterize this
- * by intent, tool, or denial reason.
+ * tool, so it teaches "what to do next" without revealing "what tripped". Do
+ * NOT parameterize this by intent, tool, or denial reason.
  */
 export const COOPERATIVE_DENIAL_DISCOVERY_HINT =
-  `To find the sanctioned Sanctuary tool for what you need, call ${COOPERATIVE_TOOL_NAMES.help} with your intent, or ${COOPERATIVE_TOOL_NAMES.capabilities} for the cooperative tool catalog.` as const;
+  `Do not repeat this call as it is. Change the request, or tell your operator what you were trying to do. To find the sanctioned Sanctuary tool for a need, call ${COOPERATIVE_TOOL_NAMES.help} with your intent, or ${COOPERATIVE_TOOL_NAMES.capabilities} for the catalog.` as const;
 
+/**
+ * The one refusal body every non-success tool outcome carries. Every field is
+ * a fixed value, so no tool, stage, tier or cause can be told apart from it;
+ * the real cause is recorded operator-side by the denial ledger.
+ */
+export const BOUNDARY_REFUSAL = Object.freeze({
+  denied: true,
+  message: FIXED_DENIAL_MESSAGE,
+  remediation_class: "request_review",
+  retry_after: null,
+  audit_ref: "audit:refusal",
+  discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
+} as const);
+
+/** Compact serialization of BOUNDARY_REFUSAL; must match the text router.ts returns for every refusal. */
+export const REFUSAL_TEXT: string = JSON.stringify(BOUNDARY_REFUSAL);
+
+// Readonly properties keep the type assignable to the SDK's result type; the object itself is frozen.
+export type RefusalResult = {
+  readonly content: Array<{ readonly type: "text"; readonly text: string }>;
+  readonly isError: true;
+};
+
+const REFUSAL_RESULT: RefusalResult = Object.freeze({
+  content: Object.freeze([Object.freeze({ type: "text", text: REFUSAL_TEXT } as const)]) as Array<{ readonly type: "text"; readonly text: string }>,
+  isError: true,
+} as const);
+
+/**
+ * The MCP result for every refusal. Must match the refusal return in
+ * router.ts's runBoundedCall: the same frozen object every call, with no
+ * `_meta`, no second item and no structured content.
+ */
+export function refusalResult(): RefusalResult {
+  return REFUSAL_RESULT;
+}
+
+export function boundaryRefusal(): typeof BOUNDARY_REFUSAL {
+  return BOUNDARY_REFUSAL;
+}
+
+/**
+ * Source-compatible alias for builders that predate the boundary refusal: it
+ * IGNORES every argument and returns BOUNDARY_REFUSAL, so no caller can put a
+ * per-site audit ref, remediation class or retry bucket in front of an agent.
+ * DEBT(AGENT-SEAT-FIXED-DENIAL-ALIAS): the argument-ignoring alias stays so the warehouse lane's builders return the constant without an edit; it retires when that lane migrates to boundaryRefusal().
+ */
+// DEBT(AGENT-SEAT-HERMES-OUTCOMES): Hermes bridge outcomes on the Hermes wire are not converted to this refusal; MCP results are covered by the router boundary.
 export function fixedDenial(
-  auditRef: string,
-  remediationClass: RemediationClass = "request_review",
-  retryAfter: RetryAfterBucket = null
+  _auditRef?: string,
+  _remediationClass?: RemediationClass,
+  _retryAfter?: RetryAfterBucket
 ): FixedDenial {
-  return {
-    denied: true,
-    message: FIXED_DENIAL_MESSAGE,
-    remediation_class: remediationClass,
-    retry_after: retryAfter,
-    audit_ref: auditRef,
-    discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
-  };
+  return BOUNDARY_REFUSAL;
 }
 
 export function canonicalJson(value: unknown): string {

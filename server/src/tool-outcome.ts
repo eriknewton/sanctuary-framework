@@ -11,6 +11,9 @@
  * import it without an import cycle.
  */
 
+import { isNamespaceDiscoveryLimitError } from "./storage/interface.js";
+import type { DenialCause } from "./agent-native/denial-ledger.js";
+
 export type ToolOutcome = "success" | "refusal";
 
 /**
@@ -265,4 +268,56 @@ export function classifyToolOutcome(toolName: string, result: unknown, tool?: ob
     : "standard";
   const accepts = shape === "standard" ? standardOutcome : OUTCOME_PREDICATES[shape];
   return accepts(result) ? "success" : "refusal";
+}
+
+/**
+ * The operator-side cause of a refusal decided while preparing a tool's
+ * approval-target arguments, chosen by error type and never by message text.
+ * Must match the argument-stage cause entries of DENIAL_CAUSES in
+ * agent-native/denial-ledger.ts; narrowing a cause here needs no router edit.
+ */
+// DEBT(AGENT-SEAT-CI-DEFERRED-CAUSES): three operator-side ledger causes have no producer yet; the agent-facing refusal is unaffected.
+// They are an unbound-session cause at this stage (recorded as pre_gate_argument_refused, since the
+// session-identity error is also raised for a handle that is not the caller's), an unresolved-origin
+// cause for a write whose origin cannot be determined, and pre-gate refusals for the events, audit
+// search and compound tools in a session with no identity (they reach the gate first today). Only
+// the operator ledger is less specific; the agent sees the same refusal either way.
+export function argumentStageCause(error: unknown): Extract<DenialCause, "export_capacity" | "pre_gate_argument_refused"> {
+  return isNamespaceDiscoveryLimitError(error) ? "export_capacity" : "pre_gate_argument_refused";
+}
+
+/**
+ * The operator-side facts of a refused handler result: the top-level verdict
+ * key and value of its body, and the committed and audited flags a handler
+ * reports when its effect already happened. Reads only the top level; never
+ * parses deeper.
+ */
+export function refusedResultFacts(result: unknown): {
+  error_name: string;
+  error_message?: string;
+  facts?: Record<string, boolean>;
+} {
+  const texts = typeof result === "object" && result !== null && Array.isArray((result as { content?: unknown }).content)
+    ? ((result as { content: unknown[] }).content)
+      .map((item) => (typeof item === "object" && item !== null ? (item as { text?: unknown }).text : undefined))
+    : [];
+  const first = texts.length === 1 && typeof texts[0] === "string" ? texts[0] : undefined;
+  let body: unknown;
+  if (first !== undefined) {
+    try { body = JSON.parse(first); } catch { body = undefined; }
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return { error_name: "shape" };
+  const record = body as Record<string, unknown>;
+  const facts: Record<string, boolean> = {};
+  for (const key of ["committed", "audited"] as const) {
+    if (typeof record[key] === "boolean") facts[key] = record[key] as boolean;
+  }
+  const withFacts = Object.keys(facts).length > 0 ? { facts } : {};
+  for (const key of ["error", "denied", "status"] as const) {
+    if (Object.hasOwn(record, key)) {
+      const value = record[key];
+      return { error_name: key, error_message: typeof value === "string" ? value : JSON.stringify(value), ...withFacts };
+    }
+  }
+  return { error_name: (result as { isError?: unknown }).isError === true ? "is_error" : "shape", ...withFacts };
 }
