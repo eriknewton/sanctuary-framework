@@ -12,7 +12,7 @@ import { fingerprintIdentityId, type SessionBinding } from "../../src/agent-nati
 
 // A minute contains sixty thousand milliseconds, the audit summary interval.
 const interval = surface.HELP_PROBE_ROW_INTERVAL_MS ?? 60_000;
-// The next power of two above the closed set of thirty-eight probe keys.
+// The next power of two above the closed set of thirty-nine probe keys.
 const cap = surface.HELP_PROBE_MAX_KEYS ?? 64;
 const OPERATION = "sanctuary_help_probe_summary";
 afterEach(() => vi.restoreAllMocks());
@@ -37,7 +37,7 @@ function setup() {
   const rows = async () => (await auditLog.query({ operation_type: OPERATION, limit: cap * 3 })).entries;
   return { auditLog, call, rows, setOrigin, advance: (ms: number) => { now += ms; } };
 }
-const probeIntents = [...HELP_NEEDLES, "hmm", "save and hmm", "read and save", "x".repeat(HELP_INTENT_MAX_CHARS + 1),
+const probeIntents = [...HELP_NEEDLES, "東京", "hmm", "save and hmm", "read and save", "x".repeat(HELP_INTENT_MAX_CHARS + 1),
   Array.from({ length: HELP_MAX_VARIANTS + 1 }, (_, i) => `%61${i}x`).join(" ")];
 const uniqueIntents = [...new Map(probeIntents.map(intent => [classifyIntent(intent).probe_key, intent])).values()];
 
@@ -65,24 +65,109 @@ describe("help probe summaries", () => {
       for (const sample of samples) expect(sample.length).toBeLessThanOrEqual(120);
     }
   });
-  it("evicts the key seen longest ago when the map reaches its cap", async () => {
+  it("keeps one row per key across repeated admission cycles within an interval", async () => {
     const env = setup();
-    const entries = uniqueIntents.flatMap(intent => ["origin-one", "origin-two", "origin-three"].map(origin => ({ origin, intent })));
-    expect(entries.length).toBeGreaterThan(cap);
+    const entries = uniqueIntents.flatMap(intent => ["origin-one", "origin-two", "origin-three"].map(origin => ({ origin, intent }))).slice(0, cap + 1);
+    expect(entries).toHaveLength(cap + 1);
     const probe = async (index: number) => {
       env.setOrigin(entries[index]!.origin);
       await env.call(entries[index]!.intent);
     };
-    for (let i = 0; i < cap; i += 1) { await probe(i); env.advance(1); }
-    expect(await env.rows()).toHaveLength(cap);
-    await probe(0);
-    env.advance(1);
+    // Two complete waves exceed the cap without advancing the interval clock.
+    for (let wave = 0; wave < 2; wave += 1) {
+      for (let i = 0; i < entries.length; i += 1) await probe(i);
+      const rows = await env.rows();
+      expect(rows).toHaveLength(cap);
+      const keys = rows.map(row => `${row.identity_id}:${row.details?.probe_key}`);
+      expect(new Set(keys).size).toBe(rows.length);
+    }
+    env.advance(interval);
+    await probe(cap);
+    const rows = await env.rows();
+    expect(rows).toHaveLength(cap + 1);
+    // One unadmitted key in each of two waves contributes to the next summary.
+    expect(rows.at(-1)?.details?.overflow_count).toBe(2);
     await probe(cap);
     expect(await env.rows()).toHaveLength(cap + 1);
+  });
+  it("retains a pending append through full-table admission and late completion", async () => {
+    const env = setup();
+    const entries = uniqueIntents.flatMap(intent => ["origin-one", "origin-two", "origin-three"].map(origin => ({ origin, intent }))).slice(0, cap + 1);
+    const probe = async (index: number) => {
+      env.setOrigin(entries[index]!.origin);
+      return env.call(entries[index]!.intent);
+    };
+    const append = env.auditLog.appendCritical.bind(env.auditLog);
+    let release!: () => void;
+    let started!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    let first = true;
+    vi.spyOn(env.auditLog, "appendCritical").mockImplementation(async entry => {
+      if (entry.operation === OPERATION && first) {
+        first = false;
+        started();
+        await held;
+      }
+      return append(entry);
+    });
+    const pending = [probe(0)];
+    await entered;
+    try {
+      for (let i = 1; i < cap; i += 1) pending.push(probe(i));
+      await probe(cap);
+      expect(await env.rows()).toHaveLength(0);
+      env.advance(interval);
+      await probe(cap);
+      await probe(0);
+      expect(await env.rows()).toHaveLength(0);
+    } finally {
+      release();
+      await Promise.all(pending);
+    }
+    const settledRows = await env.rows();
+    expect(settledRows).toHaveLength(cap);
+    // The row after the held append carries both full-table admissions.
+    expect(settledRows[1]?.details?.overflow_count).toBe(2);
+    const keys = settledRows.map(row => `${row.identity_id}:${row.details?.probe_key}`);
+    expect(new Set(keys).size).toBe(cap);
+    expect(keys).toEqual(entries.slice(0, cap).map(entry => `${entry.origin}:${classifyIntent(entry.intent).probe_key}`));
     await probe(0);
+    await probe(cap);
+    expect(await env.rows()).toHaveLength(cap);
+    env.advance(interval);
+    await probe(cap);
     expect(await env.rows()).toHaveLength(cap + 1);
-    await probe(1);
+    expect((await env.rows()).at(-1)?.details?.overflow_count).toBe(1);
+    await probe(0);
     expect(await env.rows()).toHaveLength(cap + 2);
+  });
+  it("carries overflow into a successful row after an append rejects", async () => {
+    const env = setup();
+    const entries = uniqueIntents.flatMap(intent => ["origin-one", "origin-two", "origin-three"].map(origin => ({ origin, intent }))).slice(0, cap + 1);
+    const probe = async (index: number) => {
+      env.setOrigin(entries[index]!.origin);
+      return env.call(entries[index]!.intent);
+    };
+    for (let i = 0; i <= cap; i += 1) await probe(i);
+    expect(await env.rows()).toHaveLength(cap);
+    env.advance(interval);
+    const append = env.auditLog.appendCritical.bind(env.auditLog);
+    let reject = true;
+    vi.spyOn(env.auditLog, "appendCritical").mockImplementation(async entry => {
+      if (entry.operation === OPERATION && reject) {
+        reject = false;
+        throw new Error("append unavailable");
+      }
+      return append(entry);
+    });
+    expect(await probe(cap)).toHaveProperty("denied", true);
+    expect(await env.rows()).toHaveLength(cap);
+    await probe(1);
+    expect(await env.rows()).toHaveLength(cap + 1);
+    expect((await env.rows()).at(-1)?.details?.overflow_count).toBe(1);
+    await probe(2);
+    expect((await env.rows()).at(-1)?.details?.overflow_count).toBe(0);
   });
   it("reserves one row for fifty concurrent probes of a key", async () => {
     const env = setup();

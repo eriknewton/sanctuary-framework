@@ -72,7 +72,7 @@ interface EventCursor {
   reads: number;
 }
 
-// Thirty-two needles plus six named keys fit within sixty-four, the next power of two.
+// Thirty-two needles plus seven named keys fit within sixty-four, the next power of two.
 export const HELP_PROBE_MAX_KEYS = 64;
 // One minute, matching the window of other rate-bounded audit summaries.
 export const HELP_PROBE_ROW_INTERVAL_MS = 60_000;
@@ -85,6 +85,7 @@ interface HelpProbeSummary {
   first_seen_ms: number;
   last_seen_ms: number;
   last_row_ms?: number;
+  append_pending: boolean;
 }
 
 export interface CooperativeSurfaceOptions {
@@ -110,6 +111,8 @@ export function createAgentNativeCooperativeTools(
   const hidden = new Map<string, HiddenMarker>();
   const cursors = new Map<string, EventCursor>();
   const helpProbeSummaries = new Map<string, HelpProbeSummary>();
+  let helpProbeOverflow = 0;
+  let helpProbeAppendTail: Promise<void> = Promise.resolve();
   // The real clock keeps the row bound live when the caller supplies no clock.
   const helpProbeNow = options.now ?? Date.now;
   const approvalProofStore = options.approvalProofStore ?? new ApprovalProofStore();
@@ -295,13 +298,17 @@ export function createAgentNativeCooperativeTools(
   async function audit(
     operation: string,
     details: Record<string, unknown> = {},
-    result: "success" | "failure" = "success"
+    result: "success" | "failure" = "success",
+    identityIdSnapshot?: string
   ): Promise<string> {
-    let identityId = "system";
-    try {
-      identityId = active().identity_id;
-    } catch {
-      // Keep denial auditing fail-closed but non-throwing for missing sessions.
+    // Queued summaries retain their admission identity; other audit calls resolve the current binding.
+    let identityId = identityIdSnapshot ?? "system";
+    if (identityIdSnapshot === undefined) {
+      try {
+        identityId = active().identity_id;
+      } catch {
+        // Keep denial auditing fail-closed but non-throwing for missing sessions.
+      }
     }
     const auditRef = `audit:${operation}:${randomBytes(8).toString("hex")}`;
     await options.auditLog.appendCritical({
@@ -469,8 +476,12 @@ export function createAgentNativeCooperativeTools(
   async function recordHelpProbe(intent: string, probeKey: string | undefined, safetyClass: string) {
     if (safetyClass === "ordinary") return;
     let origin = "unbound";
+    let identityId = "system";
     try {
-      origin = active().requester_identity_fingerprint;
+      // The queue key and audit subject come from the same binding before any append can wait.
+      const binding = active();
+      origin = binding.requester_identity_fingerprint;
+      identityId = binding.identity_id;
     } catch (error) {
       if (!(error instanceof SessionIdentityError)) throw error;
     }
@@ -478,34 +489,62 @@ export function createAgentNativeCooperativeTools(
     const now = helpProbeNow();
     let current = helpProbeSummaries.get(summaryKey);
     if (!current) {
-      // Evict the least recently seen key before insertion so retained summaries stay bounded across origins.
+      // Only expired, settled reservations can be evicted without admitting another row inside their interval.
       if (helpProbeSummaries.size >= HELP_PROBE_MAX_KEYS) {
         let oldestKey: string | undefined;
         let oldestSeen = Infinity;
         for (const [key, summary] of helpProbeSummaries) {
-          if (summary.last_seen_ms < oldestSeen) {
+          if (!summary.append_pending && summary.last_row_ms !== undefined &&
+              now - summary.last_row_ms >= HELP_PROBE_ROW_INTERVAL_MS && summary.last_seen_ms < oldestSeen) {
             oldestKey = key;
             oldestSeen = summary.last_seen_ms;
           }
         }
-        if (oldestKey !== undefined) helpProbeSummaries.delete(oldestKey);
+        if (oldestKey === undefined) {
+          // A full table retains every live reservation; saturating at the exact-integer limit bounds overflow accounting.
+          helpProbeOverflow = Math.min(Number.MAX_SAFE_INTEGER, helpProbeOverflow + 1);
+          return;
+        }
+        helpProbeSummaries.delete(oldestKey);
       }
-      current = { count: 0, examples: [], first_seen_ms: now, last_seen_ms: now };
+      current = { count: 0, examples: [], first_seen_ms: now, last_seen_ms: now, append_pending: false };
       helpProbeSummaries.set(summaryKey, current);
     }
     current.count += 1;
     current.last_seen_ms = now;
     const sample = intent.slice(0, HELP_PROBE_SAMPLE_CHARS);
     if (current.examples.length < HELP_PROBE_MAX_SAMPLES && !current.examples.includes(sample)) current.examples.push(sample);
-    if (current.last_row_ms === undefined || now - current.last_row_ms >= HELP_PROBE_ROW_INTERVAL_MS) {
-      // Reserving before the await keeps the interval bound under concurrency and append rejection.
+    if (!current.append_pending && (current.last_row_ms === undefined || now - current.last_row_ms >= HELP_PROBE_ROW_INTERVAL_MS)) {
+      // Reserving before the await keeps pending appends and interval slots exclusive across admission waves.
       current.last_row_ms = now;
-      await audit("sanctuary_help_probe_summary", {
-        safety_class: safetyClass,
-        probe_key: probeKey ?? "sensitive",
-        count: current.count,
-        samples: [...current.examples],
-      });
+      current.append_pending = true;
+      const previousAppend = helpProbeAppendTail;
+      let releaseAppend!: () => void;
+      // Each queued append owns one non-evictable table entry, so the queue shares the table cap.
+      helpProbeAppendTail = new Promise<void>(resolve => { releaseAppend = resolve; });
+      let reservedOverflow = 0;
+      try {
+        // Serial append admission carries overflow into the next row after a pending reservation settles.
+        await previousAppend;
+        reservedOverflow = helpProbeOverflow;
+        helpProbeOverflow = 0;
+        await audit("sanctuary_help_probe_summary", {
+          safety_class: safetyClass,
+          probe_key: probeKey ?? "sensitive",
+          count: current.count,
+          samples: [...current.examples],
+          overflow_count: reservedOverflow,
+        }, "success", identityId);
+      } catch (error) {
+        // Failed rows return their overflow reservation so a later successful append can carry it once.
+        helpProbeOverflow = Math.min(Number.MAX_SAFE_INTEGER, helpProbeOverflow + reservedOverflow);
+        throw error;
+      } finally {
+        // The interval starts again at settlement so late completion cannot place two rows together.
+        current.last_row_ms = helpProbeNow();
+        current.append_pending = false;
+        releaseAppend();
+      }
     }
   }
 
