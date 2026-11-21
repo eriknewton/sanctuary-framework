@@ -12,6 +12,7 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { decrypt } from "../../src/core/encryption.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { refusalResult } from "../../src/agent-native/safety-base.js";
 
 const fixture = fileURLToPath(new URL("../fixtures/lifecycle-idle-child.ts", import.meta.url));
 const owned: Array<{ child: ChildProcess; root: string; done: Promise<unknown> }> = [];
@@ -372,9 +373,8 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")("L
         const heldIdentity = await lstat(paused.path!, { bigint: true });
         run.command("RESUME");
         if (trigger === "IMPORT") {
-          const refusal = JSON.parse((await saving).content[0].text);
-          expect(refusal).toMatchObject({ imported_attestations: 0, completeness_verification: "failed" });
-          expect(refusal.error).toEqual(expect.any(String));
+          // The refused import reaches the agent as the one refusal; why it failed is operator-side.
+          expect(await saving).toEqual(refusalResult());
         } else if (trigger === "CLAIM" || trigger === "IDENTITY") {
           expect((await saving).isError).toBe(true);
         } else {
