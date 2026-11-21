@@ -182,7 +182,7 @@ function scanCopies(fold: string): string | undefined {
       const char = source[i];
       // Copies B and C remove complete joiner code points while keeping UTF-16 offsets for benign-span checks.
       const point = String.fromCodePoint(source.codePointAt(i)!);
-      if (removeJoiners && /[\p{Pd}_.]/u.test(point)) {
+      if (removeJoiners && isHelpWordJoiner(point)) {
         // The loop advances one code unit; skip any remaining unit of this code point as well.
         i += point.length - 1;
         continue;
@@ -196,14 +196,16 @@ function scanCopies(fold: string): string | undefined {
     }
     const copies = [{ text: direct.join(""), offsets: directOffsets }, { text: compact.join(""), offsets: compactOffsets }];
     for (const needle of HELP_NEEDLES) {
+      // Joiner-removing copies and their needles share one alphabet; copy A retains literal URL punctuation.
+      const matchNeedle = removeJoiners ? Array.from(needle).filter(point => !isHelpWordJoiner(point)).join("") : needle;
       for (const { text, offsets } of copies) {
-        let index = text.indexOf(needle);
+        let index = text.indexOf(matchNeedle);
         while (index !== -1) {
           const start = offsets[index];
-          const end = offsets[index + needle.length - 1] + 1;
+          const end = offsets[index + matchNeedle.length - 1] + 1;
           // Only a hit wholly contained in one benign occurrence is eligible for this ignore.
           if (!ignoreBenign || (benignOccurrence[start] < 0 || benignOccurrence[start] !== benignOccurrence[end - 1])) return needle;
-          index = text.indexOf(needle, index + 1);
+          index = text.indexOf(matchNeedle, index + 1);
         }
       }
     }

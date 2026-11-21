@@ -32,8 +32,9 @@ describe("bounded intent screening", () => {
   });
   it("screens every needle with word joiners at each inner position", () => {
     for (const needle of HELP_NEEDLES) {
+      // Pin: dash joiners retain the round-one screening answer.
       // U+10EAD is the supplementary-plane Yezidi hyphen; its source offsets span two UTF-16 units.
-      for (const joiner of ["-", "_", ".", "—", "\u{10ead}"]) {
+      for (const joiner of ["-", "_", ".", "—", "\u{10ead}", "/", ":", "+", "😀", "\u200b"]) {
         for (let offset = 1; offset < needle.length; offset += 1) gated(`${needle.slice(0, offset)}${joiner}${needle.slice(offset)}`);
       }
     }
@@ -179,9 +180,11 @@ describe("bounded intent screening", () => {
     ["what did I save about the deploy, save the note", "sensitive", null, "conflict", null],
     ["what did I save about the deploy, do not save the note", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
     ["do not save the note, what did I save but never recall it", "sensitive", null, "ambiguous", null],
+    // Pin: preserves the round-one answer.
     ["save %EF%BD%85xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["save the notes before you deléte the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
     ["remember to еxport my identity bundle", "sensitive", null, "unreadable", null],
+    // Pin: preserves the round-one answer.
     ["save %C3%A9xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["save my café notes", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["remember my timezone", "ordinary", "sanctuary_remember", undefined, {"key": "user_tz", "value": "America/Los_Angeles"}],
@@ -194,11 +197,13 @@ describe("bounded intent screening", () => {
     ["save %zz %2565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["not-save the note", "sensitive", null, "ambiguous", null],
     ["not—save the note", "sensitive", null, "ambiguous", null],
+    // Pin: preserves the round-one answer.
     ["not_save the note", "sensitive", null, "ambiguous", null],
     ["not.save the note", "sensitive", null, "ambiguous", null],
     ["not/save the note", "sensitive", null, "ambiguous", null],
     ["save the notes before you del_ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
     ["save the notes before you del.ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    // Pin: preserves the round-one answer.
     ["save the notes before you del\u{10ead}ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
     ["save notes.txt for later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
@@ -212,6 +217,13 @@ describe("bounded intent screening", () => {
     ["not:save the note", "sensitive", null, "ambiguous", null],
     ["not\u00adsave the note", "sensitive", null, "ambiguous", null],
     ["not+save the note", "sensitive", null, "ambiguous", null],
+    ["save the notes before you del/ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del:ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del\u200bete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["remember the 3:30 standup", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["remember my %EF%BD%85xport notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["remember my %C3%A9xport notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["not!save the note", "sensitive", null, "ambiguous", null],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);
