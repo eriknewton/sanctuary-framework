@@ -8,32 +8,9 @@ import {
   type EvaluateRouteToolName,
 } from "./capabilities-catalog.js";
 
-/**
- * The memory verbs, defined once and derived three ways so the routes and
- * the evaluate-noun yield rule cannot drift apart (pinned from
- * EVALUATE_NOUN_WORDS in capabilities-catalog.ts). `remember` and `recall`
- * are the ordinary route regexes, byte-for-byte the sets the routes used
- * before the evaluate state existed; `ordinary` is their union (the
- * multi-clause check); `outranksEvaluateNoun` is every memory verb except the
- * bare read/get, which are also everyday words for "tell me" and so yield to
- * an evaluate noun.
- */
-const REMEMBER_VERB_WORDS = ["remember", "store", "save"] as const;
-const RECALL_VERB_WORDS = ["recall", "read", "lookup", "get"] as const;
-const BARE_READ_VERB_WORDS: ReadonlySet<string> = new Set(["read", "get"]);
-const wordAlternation = (words: readonly string[]): RegExp => new RegExp(`\\b(${words.join("|")})\\b`);
-export const MEMORY_VERBS = {
-  remember: wordAlternation(REMEMBER_VERB_WORDS),
-  recall: wordAlternation(RECALL_VERB_WORDS),
-  ordinary: wordAlternation([...REMEMBER_VERB_WORDS, ...RECALL_VERB_WORDS]),
-  outranksEvaluateNoun: wordAlternation(
-    [...REMEMBER_VERB_WORDS, ...RECALL_VERB_WORDS].filter((word) => !BARE_READ_VERB_WORDS.has(word))
-  ),
-} as const;
-
 export interface IntentClassification {
   safety_class: "ordinary" | "sensitive" | "gated";
-  /** Present only on the evaluate state; the ordinary/sensitive/gated routes are unchanged. */
+  /** Evaluate routes carry their question alongside ordinary guidance. */
   intent_class?: "evaluate";
   evaluate_question?: EvaluateQuestion;
   tool: CooperativeToolName | EvaluateRouteToolName | null;
@@ -196,62 +173,152 @@ function gated(probe_key: string): IntentClassification {
     remediation_class: "request_review", probe_key };
 }
 
+
+export const HELP_WRITE_CUES = [
+  "remember", "memorize", "memorise", "store", "save", "persist", "stash", "note down", "note that",
+  "jot", "jot down", "write down", "write this down", "write that down", "write it down",
+  "keep in mind", "keep track of", "keep a note", "keep a record", "keep note of",
+] as const;
+export const HELP_STRONG_READ_CUES = ["recall", "lookup", "look up", "retrieve", "fetch", "read back"] as const;
+export const HELP_WEAK_READ_CUES = ["read", "get"] as const;
+export const HELP_STORED_REFERENCES = ["saved", "stored", "remembered", "memorized", "recorded", "persisted", "noted", "kept"] as const;
+// Evaluate noun yielding must match EVALUATE_NOUNS and EVALUATE_ROUTES in capabilities-catalog.ts.
+export const MEMORY_VERBS = {
+  remember: HELP_WRITE_CUES,
+  recall: HELP_STRONG_READ_CUES,
+  weakRead: HELP_WEAK_READ_CUES,
+} as const;
+// Two intervening tokens keep local negation attached to its cue.
+const NEGATION_REACH = 2;
+// Twenty-four characters cover the longest marker (might), a pronoun and their spaces.
+const PURPOSE_LOOKBACK_CHARS = 24;
+// A note four words away is still the object of the verb.
+const WRITE_OBJECT_WORDS = 4;
+// The memory destination stays within a short, punctuation-free phrase.
+const WRITE_DESTINATION_CHARS = 60;
+interface Cue { start: number; end: number; kind: "write" | "strong" | "weak"; clause: number; negated: boolean }
+function collectCues(fold: string): Cue[] {
+  const cues: Cue[] = [];
+  let clauseStart = 0;
+  let clauseIndex = 0;
+  for (const clause of fold.split(CLAUSE_SPLITTER)) {
+    const start = fold.indexOf(clause, clauseStart);
+    const tokens = Array.from(clause.matchAll(/\S+/g));
+    const add = (pattern: RegExp, kind: Cue["kind"]) => {
+      for (const match of clause.matchAll(pattern)) {
+        const tokenIndex = tokens.findIndex(token => token.index <= match.index && token.index + token[0].length > match.index);
+        const earlier = tokens.slice(Math.max(0, tokenIndex - NEGATION_REACH - 1), tokenIndex);
+        const negated = earlier.some(token => /^(?:not|never|don't|cannot)$/.test(token[0]) || token[0].endsWith("n't"));
+        cues.push({ start: start + match.index, end: start + match.index + match[0].length, kind, clause: clauseIndex, negated });
+      }
+    };
+    add(new RegExp(`\\b(?:${[...MEMORY_VERBS.remember].sort((a, b) => b.length - a.length).join("|")})\\b`, "g"), "write");
+    add(/\bwrite\s+(?:a|an|the|this|that|my)\s+(?:note|memo|reminder)\b/g, "write");
+    for (const verb of clause.matchAll(/\b(?:make|take|leave|add)\b/g)) {
+      const following = tokens.filter(token => token.index >= verb.index + verb[0].length).slice(0, WRITE_OBJECT_WORDS);
+      const object = following.find(token => /^(?:note|notes|message|memo|reminder)\b/.test(token[0]));
+      if (object) {
+        const before = tokens.filter(token => token.index < verb.index).slice(-NEGATION_REACH - 1);
+        const negated = before.some(token => /^(?:not|never|don't|cannot)$/.test(token[0]) || token[0].endsWith("n't"));
+        cues.push({ start: start + verb.index, end: start + object.index + object[0].length, kind: "write", clause: clauseIndex, negated });
+      }
+    }
+    add(new RegExp(`\\b(?:put|add|commit)\\b[^,;.]{0,${WRITE_DESTINATION_CHARS}}\\b(?:to memory|in memory|into memory)\\b`, "g"), "write");
+    add(new RegExp(`\\b(?:${MEMORY_VERBS.recall.join("|")})\\b`, "g"), "strong");
+    add(new RegExp(`\\b(?:${MEMORY_VERBS.weakRead.join("|")})\\b`, "g"), "weak");
+    clauseStart = start + clause.length;
+    clauseIndex += 1;
+  }
+  // The earliest cue decides; a longer cue at the same offset keeps its full meaning.
+  return cues.sort((a, b) => a.start - b.start || b.end - a.end).filter((cue, index, all) =>
+    index === 0 || cue.start !== all[index - 1].start);
+}
+function memoryAnswer(kind: "write" | "read"): IntentClassification {
+  return kind === "write" ? {
+    safety_class: "ordinary", tool: COOPERATIVE_TOOL_NAMES.remember,
+    example: { key: "user_tz", value: "America/Los_Angeles" },
+    why_sanctuary: "State is encrypted, identity-bound, and audited.",
+  } : {
+    safety_class: "ordinary", tool: COOPERATIVE_TOOL_NAMES.recall,
+    example: { key: "user_tz" },
+    why_sanctuary: "Recall preserves verification status in the response.",
+  };
+}
+function evaluateAnswer(route: EvaluateRoute): IntentClassification {
+  return { safety_class: "ordinary", intent_class: "evaluate", evaluate_question: route.question,
+    tool: route.tool, example: route.example, why_sanctuary: route.why_sanctuary,
+    guidance: route.guidance, related_tools: EVALUATE_RELATED_TOOLS };
+}
+function state_MULTI_CLAUSE_AMBIGUOUS(fold: string, cues: Cue[]): boolean {
+  const clauses = fold.split(CLAUSE_SPLITTER);
+  return clauses.filter(clause => clause.trim()).length > 1 && clauses.some((clause, index) =>
+    clause.trim() && !cues.some(cue => cue.clause === index));
+}
+function state_QUESTION_GUARD(fold: string, writes: Cue[], allCues: Cue[]): IntentClassification | undefined {
+  if (!writes.length || !/^(?:what|which|where|did|does|do\s+(?:you|we)|have\s+(?:you|we|i))\b/.test(fold.trim())) return;
+  if (writes.every(cue => /\bto\s+$/.test(fold.slice(0, cue.start)))) return;
+  const storedQuestion = writes.every(cue => {
+    const before = fold.slice(0, cue.start);
+    const after = fold.slice(cue.end);
+    return /\b(?:did|have|has|had)\s+(?:i|you|we|they|it)\s+$/.test(before) ||
+      (fold.slice(cue.start, cue.end) === "remember" && /^\s*do\s+(?:you|we)\s+$/.test(before) && /^\s+(?:my|our|what|which|where|when|whether|if|how)\b/.test(after));
+  });
+  if (!storedQuestion) return sensitive("conflict");
+  // Stored-data questions honor the read-class negation in the clause supplying their write cue.
+  const readNegated = allCues.some(cue => cue.negated && cue.kind !== "write" && writes.some(write => write.clause === cue.clause));
+  return readNegated ? sensitive("ambiguous") : memoryAnswer("read");
+}
+function state_MAIN_VERB(fold: string, cues: Cue[]): IntentClassification | undefined {
+  const writes = cues.filter(cue => cue.kind === "write");
+  const remaining = cues.filter(cue => {
+    if (cue.kind === "write" || !writes.length) return true;
+    const before = fold.slice(Math.max(0, cue.start - PURPOSE_LOOKBACK_CHARS), cue.start);
+    const lastPunctuation = Math.max(fold.lastIndexOf(",", cue.start), fold.lastIndexOf(";", cue.start), fold.lastIndexOf(".", cue.start));
+    const context = fold.slice(lastPunctuation + 1, cue.start);
+    const precedingWords = before.trimEnd().split(/\s+/);
+    const markers = ["to", "can", "could", "will", "may", "might"];
+    const lastWord = precedingWords.at(-1) ?? "";
+    const purposeMarker = markers.includes(lastWord) ||
+      (markers.includes(precedingWords.at(-2) ?? "") && /^\w+$/.test(lastWord));
+    const purposeContext = /\b(?:so|in order|for)\b/.test(context) || writes.some(write => write.clause === cue.clause && write.start < cue.start);
+    return !(purposeMarker && purposeContext);
+  });
+  if (remaining.some(cue => cue.kind === "write") && remaining.some(cue => cue.kind !== "write")) return sensitive("conflict");
+  const first = remaining[0];
+  if (first) return memoryAnswer(first.kind === "write" ? "write" : "read");
+}
 export function classifyIntent(intent: string): IntentClassification {
   const points = Array.from(intent);
   if (points.length > HELP_INTENT_MAX_CHARS) {
     const prefix = screen(points.slice(0, HELP_BAND_SCAN_CHARS).join(""));
     const suffix = screen(points.slice(-HELP_BAND_SCAN_CHARS).join(""));
     if (prefix.needle ?? suffix.needle) return gated((prefix.needle ?? suffix.needle)!);
-    return sensitive("oversize");
+    return state_OVERSIZE();
   }
   const scanned = screen(intent);
-  if (scanned.needle) return gated(scanned.needle);
-  if (scanned.budgetHit) return sensitive("variant_budget");
-  const lower = scanned.fold;
-  const clauses = splitClauses(lower);
-  if (clauses.length > 1 && clauses.some(clause => !MEMORY_VERBS.ordinary.test(clause))) return sensitive("multi_intent");
-  // Routing reads only the received folded intent; evaluate yielding must match EVALUATE_NOUNS and EVALUATE_ROUTES in capabilities-catalog.ts.
-  const evaluateRoute = EVALUATE_ROUTES.find((route) => route.matches.test(lower));
-  const evaluateAnswer = (route: EvaluateRoute) => ({
-    safety_class: "ordinary" as const,
-    intent_class: "evaluate" as const,
-    evaluate_question: route.question,
-    tool: route.tool,
-    example: route.example,
-    why_sanctuary: route.why_sanctuary,
-    guidance: route.guidance,
-    related_tools: EVALUATE_RELATED_TOOLS,
-  });
-  if (evaluateRoute && EVALUATE_NOUNS.test(lower) && !MEMORY_VERBS.outranksEvaluateNoun.test(lower)) {
-    return evaluateAnswer(evaluateRoute);
-  }
-  if (MEMORY_VERBS.remember.test(lower)) {
-    return {
-      safety_class: "ordinary",
-      tool: COOPERATIVE_TOOL_NAMES.remember,
-      example: { key: "user_tz", value: "America/Los_Angeles" },
-      why_sanctuary: "State is encrypted, identity-bound, and audited.",
-    };
-  }
-  if (MEMORY_VERBS.recall.test(lower)) {
-    return {
-      safety_class: "ordinary",
-      tool: COOPERATIVE_TOOL_NAMES.recall,
-      example: { key: "user_tz" },
-      why_sanctuary: "Recall preserves verification status in the response.",
-    };
-  }
-  // state_EVALUATE_FALLBACK (see the state order above the memory routes).
-  if (evaluateRoute) {
-    return evaluateAnswer(evaluateRoute);
-  }
-  return {
-    safety_class: "sensitive",
-    tool: null,
-    example: null,
-    why_sanctuary: "The request is ambiguous, so runnable guidance is suppressed.",
-    remediation_class: "try_lower_scope",
-    probe_key: "ambiguous",
-  };
+  if (scanned.needle) return state_GATED(scanned.needle);
+  if (scanned.budgetHit) return state_VARIANT_BUDGET();
+  const fold = scanned.fold;
+  const allCues = collectCues(fold);
+  if (state_MULTI_CLAUSE_AMBIGUOUS(fold, allCues)) return sensitive("multi_intent");
+  // A negated cue class remains unavailable throughout routing and both fallbacks in its clause.
+  const cues = allCues.filter(cue => !cue.negated && !allCues.some(other =>
+    other.negated && other.clause === cue.clause && (other.kind === "write") === (cue.kind === "write")));
+  const writes = cues.filter(cue => cue.kind === "write");
+  const route = EVALUATE_ROUTES.find(candidate => candidate.matches.test(fold));
+  const state_EVALUATE_NOUN = route && EVALUATE_NOUNS.test(fold) && !writes.length && !cues.some(cue => cue.kind === "strong");
+  if (state_EVALUATE_NOUN) return evaluateAnswer(route);
+  const question = state_QUESTION_GUARD(fold, writes, allCues);
+  if (question) return question;
+  const main = state_MAIN_VERB(fold, cues);
+  if (main) return main;
+  const state_EVALUATE_FALLBACK = route && !writes.length;
+  if (state_EVALUATE_FALLBACK) return evaluateAnswer(route);
+  const state_STORED_REFERENCE = new RegExp(`\\b(?:${HELP_STORED_REFERENCES.join("|")})\\b`).test(fold) && !writes.length && !allCues.some(cue => cue.negated && cue.kind !== "write");
+  if (state_STORED_REFERENCE) return memoryAnswer("read");
+  return state_AMBIGUOUS();
 }
-
+function state_OVERSIZE(): IntentClassification { return sensitive("oversize"); }
+function state_VARIANT_BUDGET(): IntentClassification { return sensitive("variant_budget"); }
+function state_GATED(needle: string): IntentClassification { return gated(needle); }
+function state_AMBIGUOUS(): IntentClassification { return sensitive("ambiguous"); }
