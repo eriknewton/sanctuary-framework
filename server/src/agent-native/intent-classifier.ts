@@ -70,9 +70,29 @@ function mask(text: string): string {
   return result + text.slice(offset);
 }
 
+function isHelpWordJoiner(point: string): boolean {
+  return !/[\p{L}\p{N}\s]/u.test(point);
+}
+
+function separateNegationJoiners(text: string): string {
+  const points = Array.from(text);
+  for (let start = 0; start < points.length; start += 1) {
+    // Apostrophes are exempt only in negation tokenization, so contractions remain single tokens.
+    if (!isHelpWordJoiner(points[start]) || points[start] === "'") continue;
+    let end = start + 1;
+    while (end < points.length && isHelpWordJoiner(points[end]) && points[end] !== "'") end += 1;
+    // Runs between letters have the same boundary as whitespace, preserving source offsets for cue matching.
+    if (start > 0 && end < points.length && /\p{L}/u.test(points[start - 1]) && /\p{L}/u.test(points[end])) {
+      for (let i = start; i < end; i += 1) points[i] = " ".repeat(points[i].length);
+    }
+    start = end - 1;
+  }
+  return points.join("");
+}
+
 function normalizeHelpVariant(text: string): { normalized: string; fold: string; unreadable: boolean } {
-  // Every scan uses compatibility normalization, accent removal, then case folding so copies share one alphabet.
-  const normalized = text.normalize("NFKC").normalize("NFD").replace(/\p{M}/gu, "").replace(/[\u2018\u2019\u02bc]/g, "'");
+  // Removing default-ignorable code points before normalization gives every copy the same scan alphabet.
+  const normalized = text.replace(/\p{Default_Ignorable_Code_Point}/gu, "").normalize("NFKC").normalize("NFD").replace(/\p{M}/gu, "").replace(/[\u2018\u2019\u02bc]/g, "'");
   const fold = normalized.toLowerCase();
   // Letters outside the scanner's ASCII class must not disappear during compaction.
   const unreadable = /[^a-z]/u.test(fold.replace(/[^\p{L}]/gu, ""));
@@ -249,7 +269,7 @@ function collectCues(fold: string): Cue[] {
   for (const rawClause of fold.split(CLAUSE_SPLITTER)) {
     const start = fold.indexOf(rawClause, clauseStart);
     // Joiners between letters carry the same local negation boundary as whitespace, with source offsets preserved.
-    const clause = rawClause.replace(/(?<=[a-z])[\p{Pd}_./]+(?=[a-z])/gu, joiners => " ".repeat(joiners.length));
+    const clause = separateNegationJoiners(rawClause);
     const tokens = Array.from(clause.matchAll(/\S+/g));
     const add = (pattern: RegExp, kind: Cue["kind"]) => {
       for (const match of clause.matchAll(pattern)) {

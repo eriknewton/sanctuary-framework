@@ -209,6 +209,9 @@ describe("bounded intent screening", () => {
     ["save %2565xport%zz the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["save the notes before you del%2565te%ff the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
     [`save %${"25".repeat(decodePasses)}65xport%zz the notes`, "sensitive", null, "variant_budget", null],
+    ["not:save the note", "sensitive", null, "ambiguous", null],
+    ["not\u00adsave the note", "sensitive", null, "ambiguous", null],
+    ["not+save the note", "sensitive", null, "ambiguous", null],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);
