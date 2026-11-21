@@ -2,10 +2,12 @@
  * A verdict a tool reports inside an otherwise well-formed body, about whether
  * this call was permitted, reaches the agent through tools/call as the one
  * refusal, and the operator ledger records the post-allow cause. Each tool's
- * ordinary success passes through unchanged.
+ * ordinary success passes through unchanged, and a success that needs
+ * operator review carries no cause or error detail.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -26,6 +28,10 @@ import { createDistressTools, DISTRESS_REASONS, DISTRESS_SEVERITIES } from "../s
 import { defaultDistressConfig } from "../src/distress/config.js";
 import { createErc8004Tools, resolvePendingRequest } from "../src/key-17/erc8004-tools.js";
 import { DefaultPolicyGate, type PolicyGateConfig } from "../src/key-17/policy-gate.js";
+import { createSdwMemoryFileTools } from "../src/sdw/memory-file-tools.js";
+import { FilesystemStorage } from "../src/storage/filesystem.js";
+import { AuditPersistenceError } from "../src/operational/audit-log.js";
+import { TestSdwMemoryBackendAdapter } from "./sdw/test-memory-backend.js";
 import { expectedRefusal, expectedRefusalBody } from "./helpers/expected-refusal.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -391,5 +397,70 @@ describe("sanctuary/sign_erc8004_identity", () => {
       identity_id: "system",
       details: expect.objectContaining({ tool: SIGN_TOOL, cause: "post_allow_refusal", error_name: "status" }),
     })]);
+  });
+});
+
+describe("memory_transcode and memory_transcode_restore", () => {
+  const FIXTURE_SET = fileURLToPath(
+    new URL("../src/sdw/__fixtures__/claude-code-memory/unicode", import.meta.url),
+  );
+  // The completion audit rows; the tool appends each only after its files are written.
+  const COMPLETION_AUDITS: ReadonlySet<string> = new Set(["memory_transcode", "memory_transcode_restore"]);
+
+  async function scratchDir(prefix: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `${prefix}-`));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    return dir;
+  }
+
+  it("a completion audit that fails after the files are written stays a success, flagged for review, with no error class", async () => {
+    const adapter = new TestSdwMemoryBackendAdapter({
+      storage: new FilesystemStorage(await scratchDir("verdict-sdw-vault")),
+      masterKey: generateRandomKey(),
+      fortressId: "fortress:verdict-outcomes",
+      ownerRef: "fleet-self",
+    });
+    const operatorRows: Array<{ operation: string; result: string; details: Record<string, unknown> }> = [];
+    const toolAudit = {
+      async appendCritical(entry: { operation: string; result: string; details?: Record<string, unknown> }) {
+        if (COMPLETION_AUDITS.has(entry.operation)) {
+          throw new AuditPersistenceError("audit write did not persist", "disk_failure");
+        }
+        operatorRows.push({ operation: entry.operation, result: entry.result, details: entry.details ?? {} });
+      },
+    } as unknown as AuditLog;
+    const tools = createSdwMemoryFileTools({ adapter, auditLog: toolAudit });
+    const routerAudit = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const parent = await scratchDir("verdict-sdw-out");
+
+    const [ingested, transcoded] = await callsThroughRouter(tools, [
+      { name: "memory_ingest", args: { harness: "claude-code", dir: FIXTURE_SET } },
+      {
+        name: "memory_transcode",
+        args: { from_harness: "claude-code", to_harness: "codex", mode: "reversible", dir: join(parent, "codex") },
+      },
+    ], routerAudit);
+    expect(parse(ingested).complete).toBe(true);
+    const archiveId = parse(transcoded).archive_id as string;
+    const [restored] = await callsThroughRouter(tools, [
+      { name: "memory_transcode_restore", args: { archive_id: archiveId, dir: join(parent, "claude") } },
+    ], routerAudit);
+
+    for (const [result, effect] of [[transcoded, { transcoded: true }], [restored, { restored: true }]] as const) {
+      expect(result!.isError).toBeUndefined();
+      const body = parse(result);
+      expect(body).toMatchObject({ ...effect, audit_outcome_recorded: false, operator_review_required: true });
+      expect(body).not.toHaveProperty("audit_error_class");
+      expect((result as { content: Array<{ text: string }> }).content[0]!.text).not.toContain("AuditPersistenceError");
+    }
+    // A success leaves no ledger row; the class reaches the operator in the tool's own audit row.
+    expect(await denialRows(routerAudit)).toEqual([]);
+    for (const operation of COMPLETION_AUDITS) {
+      expect(operatorRows).toContainEqual({
+        operation: `${operation}_audit_failed`,
+        result: "failure",
+        details: expect.objectContaining({ archive_id: archiveId, error_class: "AuditPersistenceError" }),
+      });
+    }
   });
 });
