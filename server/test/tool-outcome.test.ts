@@ -4,6 +4,9 @@
  * still reject a verdict, and proxied tools are judged by origin.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const probe = vi.hoisted(() => ({
   registered: [] as string[][],
@@ -98,6 +101,7 @@ describe("tool outcome registry", () => {
       audit_export_siem: "siem_export",
       handshake_exchange: "handshake_preview",
       sanctuary_distress: "distress_signal",
+      "sanctuary/sign_erc8004_identity": "erc8004_signing",
       sovereignty_audit: "sovereignty_report",
     });
   });
@@ -124,6 +128,9 @@ describe("tool outcome registry", () => {
       attestation: {}, verification: { counterparty_valid: false, recorded: false, errors: ["bad signature"] },
     }))).toBe("success");
     expect(classifyToolOutcome("sanctuary_distress", json({ ok: true, event_id: "distress:1" }))).toBe("success");
+    for (const status of ["pending_approval", "signed"]) {
+      expect(classifyToolOutcome("sanctuary/sign_erc8004_identity", json({ request_id: "r", status }))).toBe("success");
+    }
   });
 
   it("refuses each verdict a custom shape names, and only that verdict", () => {
@@ -131,6 +138,7 @@ describe("tool outcome registry", () => {
       attestation: {}, verification: { recorded: false, record_error: "refused" },
     }))).toBe("refusal");
     expect(classifyToolOutcome("sanctuary_distress", json({ ok: false, rate_limited: true }))).toBe("refusal");
+    expect(classifyToolOutcome("sanctuary/sign_erc8004_identity", json({ request_id: "r", status: "denied", reason: "x" }))).toBe("refusal");
     // The same fields on a strict-rule tool are not verdicts it reports.
     expect(classifyToolOutcome("state_read", json({ verification: { record_error: "x" }, ok: false }))).toBe("success");
   });
@@ -178,5 +186,55 @@ describe("proxied origin", () => {
   it("a proxied result with no origin fact is a refusal", () => {
     const marked = markProxiedTool({ name: "proxy/s/t" });
     expect(classifyToolOutcome("proxy/s/t", json({ ok: true }), marked)).toBe("refusal");
+  });
+});
+
+describe("denied-status tripwire", () => {
+  const SERVER_ROOT = join(fileURLToPath(import.meta.url), "..", "..");
+  // A source line that can put status: "denied" into an object or a status type.
+  const DENIED_STATUS = /\bstatus\??\s*:\s*[^;=\n]*"denied"/;
+  // Lanes outside the MCP router (their outcomes travel on the Hermes wire), and
+  // the classifier itself, which names the verdict it refuses.
+  const OUT_OF_SCOPE = new Set(["src/hermes-memory-bridge", "src/hermes-memory-client", "src/tool-outcome.ts"]);
+
+  // Every source file that can produce a denied status, and how it reaches an
+  // agent. Built from this tree's inventory: a new producer fails the first test
+  // until it is placed here, and a producer reaching a registered tool's body
+  // must name that tool. A tripwire over source text, not a reachability proof.
+  const PRODUCERS: Record<string, { readonly tools: readonly string[] } | { readonly unreached: string }> = {
+    "src/key-17/erc8004-tools.ts": { tools: ["sanctuary/sign_erc8004_identity"] },
+    "src/castle-wall/observe/promote.ts": { unreached: "operator CLI promotion outcome; no MCP tool returns it" },
+    "src/coordination/context-transfer.ts": { unreached: "hub and CLI context transfer; no MCP tool returns it" },
+    "src/coordination/coordinator.ts": { unreached: "hub task coordinator; no MCP tool returns it" },
+    "src/operational/privacy-core.ts": { unreached: "proxy privacy decision; proxied results are judged by their origin fact" },
+    "src/cognitive/tools.ts": { unreached: "the status of a signed internal receipt payload, inside the signed bytes" },
+  };
+
+  function sourceFiles(dir: string): string[] {
+    const files: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      const rel = relative(SERVER_ROOT, path).split("\\").join("/");
+      if (OUT_OF_SCOPE.has(rel)) continue;
+      if (entry.isDirectory()) files.push(...sourceFiles(path));
+      else if (entry.name.endsWith(".ts")) files.push(rel);
+    }
+    return files;
+  }
+
+  it("lists every source file that can produce a denied status", () => {
+    const producers = sourceFiles(join(SERVER_ROOT, "src"))
+      .filter((rel) => DENIED_STATUS.test(readFileSync(join(SERVER_ROOT, rel), "utf8")));
+    expect(new Set(producers)).toEqual(new Set(Object.keys(PRODUCERS)));
+  });
+
+  it("every registered tool whose body can carry a denied status refuses it", () => {
+    const reached = Object.values(PRODUCERS).flatMap((entry) => ("tools" in entry ? entry.tools : []));
+    expect(reached.length).toBeGreaterThan(0);
+    for (const name of reached) {
+      expect(Object.hasOwn(TOOL_OUTCOME_SHAPES, name)).toBe(true);
+      expect(TOOL_OUTCOME_SHAPES[name]).not.toBe("standard");
+      expect(classifyToolOutcome(name, json({ request_id: "r", status: "denied", reason: "x" }))).toBe("refusal");
+    }
   });
 });

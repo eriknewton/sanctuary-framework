@@ -24,6 +24,8 @@ import { generateSHR } from "../src/shr/generator.js";
 import type { SignedSHR } from "../src/shr/types.js";
 import { createDistressTools, DISTRESS_REASONS, DISTRESS_SEVERITIES } from "../src/distress/tools.js";
 import { defaultDistressConfig } from "../src/distress/config.js";
+import { createErc8004Tools, resolvePendingRequest } from "../src/key-17/erc8004-tools.js";
+import { DefaultPolicyGate, type PolicyGateConfig } from "../src/key-17/policy-gate.js";
 import { expectedRefusal } from "./helpers/expected-refusal.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -260,6 +262,74 @@ describe("sanctuary_distress", () => {
     expect(await denialRows(routerAudit)).toEqual([expect.objectContaining({
       identity_id: "system",
       details: expect.objectContaining({ tool: "sanctuary_distress", cause: "post_allow_refusal" }),
+    })]);
+  });
+});
+
+describe("sanctuary/sign_erc8004_identity", () => {
+  const SIGN_TOOL = "sanctuary/sign_erc8004_identity";
+  const REQUEST = {
+    registry_address: `0x${"ab".repeat(20)}`,
+    chain_id: 1,
+    agent_id: "agent-erc8004-witness",
+    nonce: 0,
+  };
+
+  function signingFixture(policy: PolicyGateConfig) {
+    const toolAudit = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const { tools, pendingStore } = createErc8004Tools({
+      masterKey: generateRandomKey(),
+      policyGate: new DefaultPolicyGate(policy),
+      auditLog: toolAudit,
+      identityId: "erc8004-witness",
+      operatorId: "erc8004-witness",
+      fortressId: "fortress-erc8004-witness",
+    });
+    return { tools, pendingStore, toolAudit };
+  }
+
+  it("a request the signing policy denies reaches the agent as the one refusal", async () => {
+    const { tools } = signingFixture({
+      global_default: "deny",
+      erc8004: { default_decision: "deny", counterparty_rules: [] },
+    });
+    const routerAudit = new AuditLog(new MemoryStorage(), generateRandomKey());
+
+    const result = await callThroughRouter(tools, SIGN_TOOL, REQUEST, routerAudit);
+
+    expect(result).toEqual(expectedRefusal());
+    expect(await denialRows(routerAudit)).toEqual([expect.objectContaining({
+      identity_id: "system",
+      details: expect.objectContaining({
+        tool: SIGN_TOOL,
+        cause: "post_allow_refusal",
+        error_name: "status",
+        error_message: "denied",
+      }),
+    })]);
+  });
+
+  it("polling a request the operator denied reaches the agent as the one refusal, and pending stays a success", async () => {
+    // The composition root's configuration: approval required, no approval channel.
+    const { tools, pendingStore, toolAudit } = signingFixture({
+      global_default: "operator_approval_required",
+      erc8004: { default_decision: "operator_approval_required", counterparty_rules: [] },
+    });
+    const pendingAudit = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const pending = await callThroughRouter(tools, SIGN_TOOL, REQUEST, pendingAudit);
+    expect(pending.isError).toBeUndefined();
+    const { request_id: requestId, status } = parse(pending);
+    expect(status).toBe("pending_approval");
+    expect(await denialRows(pendingAudit)).toEqual([]);
+
+    await resolvePendingRequest(pendingStore, toolAudit, "erc8004-witness", requestId, false, "fortress-erc8004-witness");
+    const routerAudit = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const polled = await callThroughRouter(tools, SIGN_TOOL, { ...REQUEST, request_id: requestId }, routerAudit);
+
+    expect(polled).toEqual(expectedRefusal());
+    expect(await denialRows(routerAudit)).toEqual([expect.objectContaining({
+      identity_id: "system",
+      details: expect.objectContaining({ tool: SIGN_TOOL, cause: "post_allow_refusal", error_name: "status" }),
     })]);
   });
 });

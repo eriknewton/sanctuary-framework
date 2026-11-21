@@ -136,6 +136,15 @@ const OUTCOME_PREDICATES = {
     const body = standardBody(result);
     return body !== undefined && body.ok !== false;
   },
+  // One JSON object. A signing request the key-17 policy or the operator
+  // denied says status: "denied", on the request path and the poll path
+  // alike, and a policy verdict is a refusal; pending_approval stays the
+  // documented answer that carries the request id to poll. Must match the
+  // Erc8004ToolResponse status values in key-17/erc8004-tools.ts.
+  erc8004_signing: (result: unknown): boolean => {
+    const body = standardBody(result);
+    return body !== undefined && body.status !== "denied";
+  },
 } as const;
 
 export type ToolOutcomeShape = "standard" | keyof typeof OUTCOME_PREDICATES;
@@ -217,7 +226,7 @@ export const TOOL_OUTCOME_SHAPES: Readonly<Record<string, ToolOutcomeShape>> = O
   "reputation_query_weighted": "standard",
   "reputation_record": "standard",
   "sanctuary/resolve_erc8004_identity": "standard",
-  "sanctuary/sign_erc8004_identity": "standard",
+  "sanctuary/sign_erc8004_identity": "erc8004_signing",
   "sanctuary_active_protections": "standard",
   "sanctuary_audit_search": "standard",
   "sanctuary_bootstrap": "standard",
