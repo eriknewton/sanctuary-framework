@@ -112,6 +112,7 @@ export function createAgentNativeCooperativeTools(
   const cursors = new Map<string, EventCursor>();
   const helpProbeSummaries = new Map<string, HelpProbeSummary>();
   let helpProbeOverflow = 0;
+  let helpProbeOverflowUnconfirmed = 0;
   let helpProbeAppendTail: Promise<void> = Promise.resolve();
   // The real clock keeps the row bound live when the caller supplies no clock.
   const helpProbeNow = options.now ?? Date.now;
@@ -527,17 +528,21 @@ export function createAgentNativeCooperativeTools(
         // Serial append admission carries overflow into the next row after a pending reservation settles.
         await previousAppend;
         reservedOverflow = helpProbeOverflow;
+        const reservedUnconfirmed = helpProbeOverflowUnconfirmed;
+        // Each count is carried once; unconfirmed counts remain distinct from newly observed overflow.
         helpProbeOverflow = 0;
+        helpProbeOverflowUnconfirmed = 0;
         await audit("sanctuary_help_probe_summary", {
           safety_class: safetyClass,
           probe_key: probeKey ?? "sensitive",
           count: current.count,
           samples: [...current.examples],
           overflow_count: reservedOverflow,
+          overflow_unconfirmed_count: reservedUnconfirmed,
         }, "success", identityId);
       } catch (error) {
-        // Failed rows return their overflow reservation so a later successful append can carry it once.
-        helpProbeOverflow = Math.min(Number.MAX_SAFE_INTEGER, helpProbeOverflow + reservedOverflow);
+        // A throw from the audit append does not establish that the row was not stored.
+        helpProbeOverflowUnconfirmed = Math.min(Number.MAX_SAFE_INTEGER, helpProbeOverflowUnconfirmed + reservedOverflow);
         throw error;
       } finally {
         // The interval starts again at settlement so late completion cannot place two rows together.

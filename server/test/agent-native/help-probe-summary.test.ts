@@ -6,7 +6,7 @@ import { classifyIntent, HELP_NEEDLES, HELP_INTENT_MAX_CHARS, HELP_MAX_VARIANTS 
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, AUDIT_CHECKPOINT_NAMESPACE } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { fingerprintIdentityId, type SessionBinding } from "../../src/agent-native/safety-base.js";
 
@@ -16,10 +16,9 @@ const interval = surface.HELP_PROBE_ROW_INTERVAL_MS ?? 60_000;
 const cap = surface.HELP_PROBE_MAX_KEYS ?? 64;
 const OPERATION = "sanctuary_help_probe_summary";
 afterEach(() => vi.restoreAllMocks());
-function setup() {
-  const storage = new MemoryStorage();
+function setup(storage = new MemoryStorage(), checkpointInterval?: number) {
   const key = generateRandomKey();
-  const auditLog = new AuditLog(storage, key);
+  const auditLog = new AuditLog(storage, key, { checkpointInterval });
   let binding: SessionBinding | undefined;
   let now = 0;
   const setOrigin = (identityId?: string) => {
@@ -142,7 +141,7 @@ describe("help probe summaries", () => {
     await probe(0);
     expect(await env.rows()).toHaveLength(cap + 2);
   });
-  it("carries overflow into a successful row after an append rejects", async () => {
+  it("reports overflow as unconfirmed when an append throws before storage", async () => {
     const env = setup();
     const entries = uniqueIntents.flatMap(intent => ["origin-one", "origin-two", "origin-three"].map(origin => ({ origin, intent }))).slice(0, cap + 1);
     const probe = async (index: number) => {
@@ -165,9 +164,50 @@ describe("help probe summaries", () => {
     expect(await env.rows()).toHaveLength(cap);
     await probe(1);
     expect(await env.rows()).toHaveLength(cap + 1);
-    expect((await env.rows()).at(-1)?.details?.overflow_count).toBe(1);
+    expect((await env.rows()).at(-1)?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 1 });
     await probe(2);
-    expect((await env.rows()).at(-1)?.details?.overflow_count).toBe(0);
+    expect((await env.rows()).at(-1)?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 0 });
+  });
+  it("reports a stored row's overflow as unconfirmed after a checkpoint write throws", async () => {
+    class CheckpointStorage extends MemoryStorage {
+      failCheckpoint = false;
+      checkpointFailures = 0;
+      override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        if (this.failCheckpoint && namespace === AUDIT_CHECKPOINT_NAMESPACE && key.startsWith("audit-checkpoint-")) {
+          this.failCheckpoint = false;
+          this.checkpointFailures += 1;
+          throw new Error("checkpoint unavailable");
+        }
+        return super.write(namespace, key, data);
+      }
+    }
+    const storage = new CheckpointStorage();
+    // Every critical append checkpoints after its entry write.
+    const env = setup(storage, 1);
+    const entries = uniqueIntents.flatMap(intent => ["origin-one", "origin-two", "origin-three"].map(origin => ({ origin, intent }))).slice(0, cap + 1);
+    const probe = async (index: number) => {
+      env.setOrigin(entries[index]!.origin);
+      return env.call(entries[index]!.intent);
+    };
+    for (let i = 0; i <= cap; i += 1) await probe(i);
+    expect(await env.rows()).toHaveLength(cap);
+    env.advance(interval);
+    const storedBefore = (await storage.list("_audit")).length;
+    storage.failCheckpoint = true;
+    expect(await probe(cap)).toHaveProperty("denied", true);
+    expect(storage.checkpointFailures).toBe(1);
+    expect(await storage.list("_audit")).toHaveLength(storedBefore + 1);
+    const stored = await env.rows();
+    expect(stored).toHaveLength(cap + 1);
+    expect(stored.at(-1)?.details?.overflow_count).toBe(1);
+    await probe(1);
+    const carried = (await env.rows()).slice(cap);
+    expect(carried).toHaveLength(2);
+    expect(carried.reduce((sum, row) => sum + Number(row.details?.overflow_count), 0)).toBe(1);
+    expect(carried[0]?.details?.overflow_unconfirmed_count).toBe(0);
+    expect(carried[1]?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 1 });
+    await probe(2);
+    expect((await env.rows()).at(-1)?.details).toMatchObject({ overflow_count: 0, overflow_unconfirmed_count: 0 });
   });
   it("reserves one row for fifty concurrent probes of a key", async () => {
     const env = setup();
