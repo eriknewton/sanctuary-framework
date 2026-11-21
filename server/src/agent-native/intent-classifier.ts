@@ -79,6 +79,13 @@ function normalizeHelpVariant(text: string): { normalized: string; fold: string;
   return { normalized, fold, unreadable };
 }
 
+function decodeHelpPercent(text: string): string {
+  // Decode every valid byte while keeping malformed percent text literal; invalid UTF-8 cannot stop later passes.
+  const chunks = text.split(/(%[0-9a-f]{2})/gi).map(chunk =>
+    /^%[0-9a-f]{2}$/i.test(chunk) ? Buffer.from(chunk.slice(1), "hex") : Buffer.from(chunk, "utf8"));
+  return new TextDecoder("utf-8", { fatal: false }).decode(Buffer.concat(chunks));
+}
+
 /** Return bounded folded decodings and their retained work counts for intent screening. */
 export function buildHelpVariants(normalized: string): { variants: string[]; bytes: number; budgetHit: boolean; unreadable: boolean } {
   const original = normalizeHelpVariant(normalized);
@@ -110,21 +117,17 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
   const decodePercent = (text: string): boolean => {
     let current = text;
     for (let pass = 0; pass < HELP_MAX_DECODE_PASSES; pass += 1) {
-      let decoded: string;
-      try { decoded = decodeURIComponent(current); }
-      catch { return true; /* Previously retained text remains available to the screen. */ }
+      const decoded = decodeHelpPercent(current);
       if (decoded === current) return true;
       if (!add(decoded)) return false;
       // Normalize each retained output before another pass so compatibility percent signs share the same fixed point.
       current = normalizeHelpVariant(decoded).normalized;
     }
-    try {
-      // A chain still changing at the pass bound cannot authorize runnable guidance.
-      if (decodeURIComponent(current) !== current) {
-        budgetHit = true;
-        return false;
-      }
-    } catch { /* The last retained text has no further valid percent decoding. */ }
+    // A chain still changing at the pass bound cannot authorize runnable guidance.
+    if (decodeHelpPercent(current) !== current) {
+      budgetHit = true;
+      return false;
+    }
     return true;
   };
   if (!decodePercent(normalized)) return { variants: [...variants], bytes, budgetHit, unreadable };

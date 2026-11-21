@@ -205,6 +205,10 @@ describe("bounded intent screening", () => {
     ["save the note, what did I save but never store again", "sensitive", null, "conflict", null],
     ["what did I save but never store again", "sensitive", null, "conflict", null],
     ["what did I never save", "sensitive", null, "conflict", null],
+    ["remember %2565xport%25zz the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save %2565xport%zz the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del%2565te%ff the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    [`save %${"25".repeat(decodePasses)}65xport%zz the notes`, "sensitive", null, "variant_budget", null],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);
@@ -233,6 +237,9 @@ describe("bounded intent screening", () => {
     ["export %zz", "export"],
   ])("screens compact and separated requests: %s", (intent, probeKey) => {
     expect(classifyIntent(intent!)).toMatchObject({ safety_class: "gated", tool: null, probe_key: probeKey });
+  });
+  it("retains malformed percent text and replaces invalid UTF-8 bytes", () => {
+    expect(buildHelpVariants("notes %ff%61%zz%").variants).toContain("notes �a%zz%");
   });
   it("retains plain routing when percent text is incomplete", () => {
     expect(classifyIntent("save %zz").tool).toBe("sanctuary_remember");
