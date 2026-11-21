@@ -309,7 +309,8 @@ function state_QUESTION_GUARD(fold: string, cues: Cue[], allCues: Cue[]): Intent
   for (const [index, clause] of fold.split(CLAUSE_SPLITTER).entries()) {
     const start = fold.indexOf(clause, clauseStart);
     clauseStart = start + clause.length;
-    const writes = cues.filter(cue => cue.clause === index && cue.kind === "write");
+    // Question syntax uses every write cue; local negation only controls the resulting guidance.
+    const writes = allCues.filter(cue => cue.clause === index && cue.kind === "write");
     if (!writes.length || !/^(?:what|which|where|did|does|do\s+(?:you|we)|have\s+(?:you|we|i))\b/.test(clause.trim())) continue;
     if (writes.every(cue => /\bto\s+$/.test(fold.slice(start, cue.start)))) continue;
     const storedQuestion = writes.every(cue => {

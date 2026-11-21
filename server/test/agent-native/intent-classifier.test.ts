@@ -202,6 +202,9 @@ describe("bounded intent screening", () => {
     ["save the notes before you del\u{10ead}ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
     ["save notes.txt for later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
     ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
+    ["save the note, what did I save but never store again", "sensitive", null, "conflict", null],
+    ["what did I save but never store again", "sensitive", null, "conflict", null],
+    ["what did I never save", "sensitive", null, "conflict", null],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
     expect(answer.safety_class).toBe(safetyClass);
