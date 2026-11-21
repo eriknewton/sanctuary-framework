@@ -189,6 +189,11 @@ describe("bounded intent screening", () => {
     [`save %${"25".repeat(decodePasses)}65xport the notes`, "sensitive", null, "variant_budget", null],
     [`save %${"25".repeat(decodePasses - 1)}65xport the notes`, "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
     ["save %zz %2565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["not-save the note", "sensitive", null, "ambiguous", null],
+    ["not—save the note", "sensitive", null, "ambiguous", null],
+    ["not_save the note", "sensitive", null, "ambiguous", null],
+    ["not.save the note", "sensitive", null, "ambiguous", null],
+    ["not/save the note", "sensitive", null, "ambiguous", null],
     ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);

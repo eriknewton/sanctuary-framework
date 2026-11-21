@@ -237,8 +237,10 @@ function collectCues(fold: string): Cue[] {
   const cues: Cue[] = [];
   let clauseStart = 0;
   let clauseIndex = 0;
-  for (const clause of fold.split(CLAUSE_SPLITTER)) {
-    const start = fold.indexOf(clause, clauseStart);
+  for (const rawClause of fold.split(CLAUSE_SPLITTER)) {
+    const start = fold.indexOf(rawClause, clauseStart);
+    // Joiners between letters carry the same local negation boundary as whitespace, with source offsets preserved.
+    const clause = rawClause.replace(/(?<=[a-z])[\p{Pd}_./]+(?=[a-z])/gu, joiners => " ".repeat(joiners.length));
     const tokens = Array.from(clause.matchAll(/\S+/g));
     const add = (pattern: RegExp, kind: Cue["kind"]) => {
       for (const match of clause.matchAll(pattern)) {
