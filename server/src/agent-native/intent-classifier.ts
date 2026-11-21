@@ -68,15 +68,28 @@ function mask(text: string): string {
   return result + text.slice(offset);
 }
 
-/** Return bounded folded decodings and their retained work counts for intent screening. */
-export function buildHelpVariants(normalized: string): { variants: string[]; bytes: number; budgetHit: boolean } {
+function normalizeHelpVariant(text: string): { normalized: string; fold: string; unreadable: boolean } {
+  // Every scan uses compatibility normalization, accent removal, then case folding so copies share one alphabet.
+  const normalized = text.normalize("NFKC").normalize("NFD").replace(/\p{M}/gu, "").replace(/[\u2018\u2019\u02bc]/g, "'");
   const fold = normalized.toLowerCase();
+  // Letters outside the scanner's ASCII class must not disappear during compaction.
+  const unreadable = /[^a-z]/u.test(fold.replace(/[^\p{L}]/gu, ""));
+  return { normalized, fold, unreadable };
+}
+
+/** Return bounded folded decodings and their retained work counts for intent screening. */
+export function buildHelpVariants(normalized: string): { variants: string[]; bytes: number; budgetHit: boolean; unreadable: boolean } {
+  const original = normalizeHelpVariant(normalized);
+  const { fold } = original;
+  let unreadable = original.unreadable;
   const masked = mask(fold);
   const variants = new Set<string>();
   let bytes = 0;
   let budgetHit = false;
   const add = (value: string): boolean => {
-    const folded = value.toLowerCase();
+    const variant = normalizeHelpVariant(value);
+    const folded = variant.fold;
+    unreadable ||= variant.unreadable;
     if (folded === fold || folded === masked || variants.has(folded)) return true;
     const size = Buffer.byteLength(folded, "utf8");
     // Both budgets apply before retention, keeping every scanned copy within bounded work.
@@ -93,7 +106,7 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
     return true;
   };
   try {
-    if (!add(decodeURIComponent(normalized))) return { variants: [...variants], bytes, budgetHit };
+    if (!add(decodeURIComponent(normalized))) return { variants: [...variants], bytes, budgetHit, unreadable };
   } catch { /* Plain text remains available to the screen. */ }
   for (const token of normalized.split(/[^a-z0-9%+/=_-]+/i)) {
     if (token.includes("%")) {
@@ -102,11 +115,15 @@ export function buildHelpVariants(normalized: string): { variants: string[]; byt
       } catch { /* Plain text remains available to the screen. */ }
     }
     if (token.length >= BASE64_MIN_CHARS && /^[a-z0-9+/=_-]+$/i.test(token)) {
-      if (!add(Buffer.from(token, "base64").toString("utf8"))) break;
+      try {
+        // Only valid UTF-8 bytes represent a text variant; the original token is always screened.
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(token, "base64"));
+        if (!add(decoded)) break;
+      } catch { /* Non-text bytes leave only the original token to screen. */ }
     }
   }
   if (!budgetHit) add(normalized.replace(/0/g, "o").replace(/1/g, "i").replace(/3/g, "e").replace(/4/g, "a").replace(/@/g, "a"));
-  return { variants: [...variants], bytes, budgetHit };
+  return { variants: [...variants], bytes, budgetHit, unreadable };
 }
 
 function scanCopies(fold: string): string | undefined {
@@ -147,10 +164,11 @@ function scanCopies(fold: string): string | undefined {
   };
   return scan(masked, false, false) ?? scan(masked, true, false) ?? scan(fold, true, true);
 }
-function screen(text: string): { needle?: string; budgetHit: boolean; fold: string } {
-  const normalized = text.normalize("NFKC").replace(/[\u2018\u2019\u02bc]/g, "'");
-  const fold = normalized.toLowerCase();
-  const { variants, budgetHit } = buildHelpVariants(normalized);
+function screen(text: string): { needle?: string; budgetHit: boolean; fold: string; unreadable?: boolean } {
+  const { normalized, fold } = normalizeHelpVariant(text);
+  const { variants, budgetHit, unreadable } = buildHelpVariants(normalized);
+  // No scan copy may erase an unreadable letter from the original or any decoded text.
+  if (unreadable) return { budgetHit, fold, unreadable };
   const clauses = splitClauses(fold);
   const texts = [...(clauses.length > 1 ? clauses : []), fold, ...variants];
   // A needle found in any scanned copy wins, so benign words and encodings preserve the same review boundary.
@@ -309,10 +327,12 @@ export function classifyIntent(intent: string): IntentClassification {
   if (points.length > HELP_INTENT_MAX_CHARS) {
     const prefix = screen(points.slice(0, HELP_BAND_SCAN_CHARS).join(""));
     const suffix = screen(points.slice(-HELP_BAND_SCAN_CHARS).join(""));
+    if (prefix.unreadable || suffix.unreadable) return sensitive("unreadable");
     if (prefix.needle ?? suffix.needle) return gated((prefix.needle ?? suffix.needle)!);
     return state_OVERSIZE();
   }
   const scanned = screen(intent);
+  if (scanned.unreadable) return sensitive("unreadable");
   if (scanned.needle) return state_GATED(scanned.needle);
   if (scanned.budgetHit) return state_VARIANT_BUDGET();
   const fold = scanned.fold;

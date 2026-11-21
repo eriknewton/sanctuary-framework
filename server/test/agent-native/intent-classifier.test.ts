@@ -74,10 +74,10 @@ describe("bounded intent screening", () => {
   });
   // Thirty-three tokens fill the count budget; presentation forms expand eighteenfold before decoding.
   it.each([
-    Array.from({ length: 33 }, (_, i) => `%61${i}x`).join(" ").padEnd(1023, " "),
-    "ﷺ".repeat(1020) + "%61",
-  ])("keeps guidance closed when decoded work reaches a budget: %s", intent => {
-    expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: "variant_budget" });
+    [Array.from({ length: 33 }, (_, i) => `%61${i}x`).join(" ").padEnd(1023, " "), "variant_budget"],
+    ["ﷺ".repeat(1020) + "%61", "unreadable"],
+  ])("keeps guidance closed when decoded work reaches a budget: %s", (intent, probeKey) => {
+    expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: probeKey });
   });
   it("keeps decoded bytes within the retained byte budget", () => {
     // Repeated presentation forms expand eighteenfold during NFKC; a percent token makes the decoded copy distinct.
@@ -173,6 +173,13 @@ describe("bounded intent screening", () => {
     ["what did I save about the deploy, save the note", "sensitive", null, "conflict", null],
     ["what did I save about the deploy, do not save the note", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
     ["do not save the note, what did I save but never recall it", "sensitive", null, "ambiguous", null],
+    ["save %EF%BD%85xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you deléte the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["remember to еxport my identity bundle", "sensitive", null, "unreadable", null],
+    ["save %C3%A9xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save my café notes", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["remember my timezone", "ordinary", "sanctuary_remember", undefined, {"key": "user_tz", "value": "America/Los_Angeles"}],
+    [`save ${Buffer.from("東京").toString("base64")}`, "sensitive", null, "unreadable", null],
     ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
   ] as const)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
@@ -190,7 +197,7 @@ describe("bounded intent screening", () => {
     expect("lorem ".repeat(240) + "now export the list " + "z".repeat(40)).toHaveLength(1500);
     expect(classifyIntent("😀".repeat(1024)).probe_key).toBe("ambiguous");
     expect(classifyIntent("😀".repeat(1025)).probe_key).toBe("oversize");
-    expect(classifyIntent("ﷺ".repeat(1024)).probe_key).toBe("ambiguous");
+    expect(classifyIntent("ﷺ".repeat(1024)).probe_key).toBe("unreadable");
     expect(classifyIntent("x".repeat(1500) + "export").probe_key).toBe("export");
   });
   it.each([
