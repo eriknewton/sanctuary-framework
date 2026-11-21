@@ -594,7 +594,7 @@ test/principal-policy/posture-stream.test.ts(303,7): error TS18046: 'home' is of
 test/principal-policy/posture-stream.test.ts(350,12): error TS18046: 'body' is of type 'unknown'.
 test/principal-policy/posture-stream.test.ts(365,12): error TS18046: 'body' is of type 'unknown'.
 test/principal-policy/posture-stream.test.ts(401,12): error TS18046: 'body' is of type 'unknown'.
-test/principal-policy/router-gate-denial-opacity.test.ts(93,17): error TS18046: 'result.content' is of type 'unknown'.
+test/principal-policy/router-gate-denial-opacity.test.ts(94,17): error TS18046: 'result.content' is of type 'unknown'.
 test/principal-policy/unified-inbox-psi3.test.ts(32,22): error TS2304: Cannot find name 'HeadersInit'.
 test/principal-policy/webhook.test.ts(334,14): error TS18046: 'data' is of type 'unknown'.
 test/principal-policy/webhook.test.ts(400,14): error TS18046: 'data' is of type 'unknown'.

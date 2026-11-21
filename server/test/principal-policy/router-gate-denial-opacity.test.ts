@@ -14,7 +14,8 @@ import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
 import type { ToolCallTrapRuntime } from "../../src/honeypot/tool-call-trap-runtime.js";
-import { DENIAL_CAUSES, DenialLedger, type DenialCause, type DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
+import { DENIAL_CAUSES, DENIAL_WINDOW_MS, DenialLedger, type DenialCause, type DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
+import { SIEM_EXPORT_FORMATS } from "../../src/audit/siem-tools.js";
 import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import { ClientManager, type UpstreamTool } from "../../src/proxy/client-manager.js";
 import { ResponseScreen } from "../../src/proxy/response-screen.js";
@@ -203,6 +204,20 @@ vi.mock("../../src/router.js", async (importOriginal) => {
   };
 });
 
+// The composition root builds its ledger over Date.now. This shifts that
+// ledger's clock only, so the readback pin below can close a window without
+// waiting a real minute; it stays 0 until then.
+const ledgerClock = vi.hoisted(() => ({ offsetMs: 0 }));
+vi.mock("../../src/agent-native/denial-ledger.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/agent-native/denial-ledger.js")>();
+  class ShiftedClockDenialLedger extends actual.DenialLedger {
+    constructor(...[auditLog, clock, options]: ConstructorParameters<typeof actual.DenialLedger>) {
+      super(auditLog, () => clock() + ledgerClock.offsetMs, options);
+    }
+  }
+  return { ...actual, DenialLedger: ShiftedClockDenialLedger };
+});
+
 const FIXTURE_UPSTREAM = "fx";
 const FIXTURE_UPSTREAM_TOOL: UpstreamTool = {
   name: "read",
@@ -270,18 +285,21 @@ const REFUSED_TOOLS = [
 // The events tool's own caps: at most 10 reads per cursor, at most 25 events per read.
 const EVENT_PAGES_READ = 10;
 const EVENTS_PER_PAGE = 25;
+// The events tool reads the caller's most recent 500 own entries.
+const OWN_EVENTS_WINDOW = 500;
+// sanctuary_audit_search has no paging; this is its largest allowed limit.
+const AUDIT_SEARCH_MAX_LIMIT = 25;
 const BOUNDARY_ROW_OPERATIONS = new Set(["denial_cause", "denial_cause_summary"]);
 // Must match the verdict keys refusedResultFacts reads in tool-outcome.ts whose value is not free text.
 const VERDICT_ERROR_NAMES = new Set(["denied", "status"]);
 // Operator-side markers of the boundary's rows: their operations, the pre-gate
-// decision field and value, and every closed cause literal except `other`,
-// which is also an ordinary word in unrelated rows.
+// decision field and value, and every closed cause literal, `other` included.
 const BOUNDARY_ROW_MARKERS = [
   "denial_cause",
   "gate_deny:",
   "decided_by",
   "pre_gate",
-  ...DENIAL_CAUSES.filter((cause) => cause !== "other"),
+  ...DENIAL_CAUSES,
 ];
 
 const REFUSAL_CASES: RefusalCase[] = [
@@ -471,7 +489,17 @@ const REFUSAL_CASES: RefusalCase[] = [
 // Operations the approval callback approves so their handlers run; every other
 // approval request is denied, and one operation's request throws.
 // audit_export_siem is Tier 1 under the default policy; the readback pin exports through it.
-const APPROVED_OPERATIONS = new Set(["sanctuary_compound_execute", "identity_sign", "audit_export_siem"]);
+// The readback pin calls the other readback tools often enough to trip the
+// Tier 2 frequency check, so their approval requests are approved as well.
+const READBACK_OPERATIONS = [
+  "audit_export_siem",
+  "sanctuary_audit_search",
+  "sanctuary_events_open_cursor",
+  "sanctuary_events_read",
+  "sanctuary_events_close",
+  "monitor_audit_log",
+];
+const APPROVED_OPERATIONS = new Set(["sanctuary_compound_execute", "identity_sign", ...READBACK_OPERATIONS]);
 const THROWING_OPERATION = "principal_policy_view";
 
 describe("one refusal through the production composition root", () => {
@@ -625,12 +653,30 @@ describe("one refusal through the production composition root", () => {
     // refusal in every boundary stage in this one server, no agent-callable
     // audit surface returns one of them or any of their operator-side fields.
     // Dropped from this run: a check that the readback tools show no new row
-    // after each refused call, and a full cursor table.
+    // after each refused call.
+    const stageRefusal = (label: string) => REFUSAL_CASES.find((candidate) => candidate.label === label)!;
     for (const label of STAGE_REFUSALS) {
-      const refusal = REFUSAL_CASES.find((candidate) => candidate.label === label)!;
-      expect(await refusal.run(booted), label).toEqual(expectedRefusal());
+      expect(await stageRefusal(label).run(booted), label).toEqual(expectedRefusal());
     }
+    // Roll one window over: a second refusal on the same tool, then the
+    // ledger's clock moves one window on and the next refusal closes it, so
+    // its summary row is persisted before anything is read back.
+    const rollover = stageRefusal("Tier 1 denied");
+    expect(await rollover.run(booted)).toEqual(expectedRefusal());
+    expect(await rollover.run(booted)).toEqual(expectedRefusal());
+    ledgerClock.offsetMs += DENIAL_WINDOW_MS;
+    expect(await rollover.run(booted)).toEqual(expectedRefusal());
+    const summaryRows = await vi.waitFor(async () => {
+      const rows = (await booted.app.auditLog.query({ operation_type: "denial_cause_summary", limit: 1_000 })).entries;
+      expect(rows.some((row) => row.details?.tool === "state_delete")).toBe(true);
+      return rows;
+    });
     const ledgerRows = (await booted.app.auditLog.query({ operation_type: "denial_cause", limit: 1_000 })).entries;
+    // Each row's denial_ref is operator-side; no readback may carry one.
+    const ledgerRefs = [...ledgerRows, ...summaryRows]
+      .map((row) => row.details?.denial_ref)
+      .filter((ref): ref is string => typeof ref === "string");
+    expect(ledgerRefs.length).toBe(ledgerRows.length + summaryRows.length);
     // A first row's message is free text, except where its error name is a
     // body's verdict key: that value (`true`, a status word) is not a message.
     // The fixed refusal message is public, since every refusal carries it.
@@ -645,19 +691,38 @@ describe("one refusal through the production composition root", () => {
     // sanctuary_audit_search rows carry `summary: { result }` at base as well; it is kept.
     const searchFields = ["audit_ref", "timestamp", "operation", "verification", "summary"];
     const rowSets: Array<[string, unknown, string[]]> = [];
-    for (const query of ["denial_cause", "gate_deny", "pre_gate", ...REFUSED_TOOLS]) {
-      const searched = body(await call(booted, "sanctuary_audit_search", { query, limit: 25 }));
+    // sanctuary_audit_search has no paging: each query reads its largest page.
+    const searchQueries = ["denial_cause", "denial_cause_summary", "gate_deny", "pre_gate", ...DENIAL_CAUSES, ...REFUSED_TOOLS];
+    for (const query of searchQueries) {
+      const searched = body(await call(booted, "sanctuary_audit_search", { query, limit: AUDIT_SEARCH_MAX_LIMIT }));
       rowSets.push([`sanctuary_audit_search ${query}`, searched.results, searchFields]);
     }
-    const opened = body(await call(booted, "sanctuary_events_open_cursor", {}));
-    const events: unknown[] = [];
-    let cursor = opened.cursor as string | undefined;
-    for (let page = 0; cursor !== undefined && page < EVENT_PAGES_READ; page += 1) {
-      const read = body(await call(booted, "sanctuary_events_read", { cursor, opts: { limit: EVENTS_PER_PAGE } }));
-      events.push(...(read.events as unknown[]));
-      cursor = typeof read.next_cursor === "string" && read.next_cursor.length > 0 ? read.next_cursor : undefined;
+    // The events cursor is read page by page until a page comes back empty.
+    // One cursor stops after EVENT_PAGES_READ reads, fewer than this server's
+    // own events fill, so there is one cursor per operation the caller's own
+    // events carry, plus one per boundary row operation.
+    const ownEvents = (await booted.app.auditLog.query({ identity_id: booted.identityId, limit: OWN_EVENTS_WINDOW })).entries;
+    const cursorOperations = new Set([...ownEvents.map((entry) => entry.operation), ...BOUNDARY_ROW_OPERATIONS]);
+    let eventsRead = 0;
+    for (const operation of cursorOperations) {
+      const opened = body(await call(booted, "sanctuary_events_open_cursor", { filter: { operation } }));
+      const events: unknown[] = [];
+      let reachedEnd = false;
+      for (let page = 0; !reachedEnd && page < EVENT_PAGES_READ; page += 1) {
+        const read = body(await call(booted, "sanctuary_events_read", { cursor: opened.cursor, opts: { limit: EVENTS_PER_PAGE } }));
+        const pageEvents = read.events as unknown[];
+        events.push(...pageEvents);
+        reachedEnd = pageEvents.length === 0;
+      }
+      expect((await call(booted, "sanctuary_events_close", { cursor: opened.cursor })).isError).not.toBe(true);
+      const surface = `sanctuary_events_read ${operation}`;
+      expect(reachedEnd, surface).toBe(true);
+      if (BOUNDARY_ROW_OPERATIONS.has(operation)) expect(events, surface).toEqual([]);
+      eventsRead += events.length;
+      rowSets.push([surface, events, ["cursor_event_id", ...view]]);
     }
-    rowSets.push(["sanctuary_events_read", events, ["cursor_event_id", ...view]]);
+    // The per-operation cursors together returned every own event there was before they opened.
+    expect(eventsRead).toBeGreaterThanOrEqual(ownEvents.length);
     const monitored = body(await call(booted, "monitor_audit_log", { limit: 1_000 }));
     rowSets.push(["monitor_audit_log", monitored.entries, view]);
 
@@ -674,7 +739,8 @@ describe("one refusal through the production composition root", () => {
     }
     expect(rowSets.some(([surface, rows]) => surface === "monitor_audit_log" && (rows as unknown[]).length > 0)).toBe(true);
     // Every SIEM format renders the same redacted view; each export body is checked whole.
-    for (const format of ["cef", "ocsf"]) {
+    expect([...SIEM_EXPORT_FORMATS].sort()).toEqual(["cef", "ecs", "ocsf", "xdm"]);
+    for (const format of SIEM_EXPORT_FORMATS) {
       const exported = await call(booted, "audit_export_siem", { format, limit: 1_000 });
       expect(exported.isError, format).toBeUndefined();
       allRowsText.push(...(exported.content as Array<{ text: string }>).map((item) => item.text));
@@ -682,6 +748,7 @@ describe("one refusal through the production composition root", () => {
     for (const text of allRowsText) {
       for (const marker of BOUNDARY_ROW_MARKERS) expect(text, marker).not.toContain(marker);
       for (const message of ledgerMessages) expect(text).not.toContain(message);
+      for (const ref of ledgerRefs) expect(text).not.toContain(ref);
     }
   });
 });
