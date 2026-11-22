@@ -380,8 +380,9 @@ async function gatedWorker(mode: string) {
   const notADirectory = join(base, "plain-file");
   const { execArgv } = resolveWorkerModule();
   const resultFile = join(base, "gated-record.json");
-  // The same environment the client hands its worker, so the status reply fits the shared schema.
-  const env: NodeJS.ProcessEnv = {};
+  // The same environment the client hands its worker, so the status reply fits the shared schema,
+  // plus the suite's test-run marker, which every spawned test child must carry (test/wrap/keychain-exec-guard.test.ts).
+  const env: NodeJS.ProcessEnv = { VITEST: process.env.VITEST };
   for (const name of WORKER_ENV_NAMES) if (process.env[name] !== undefined) env[name] = process.env[name];
   const child = fork(GATED_CHILD, [resultFile, mode], { env, execArgv, stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
   children.add(child);
