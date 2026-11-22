@@ -187,4 +187,19 @@ describe("results store commit refusals", () => {
     expect(Object.keys(body)).toContain("__proto__");
     await expect(results.markCommitted(fixtureRequestId(1), body)).rejects.toMatchObject({ kind: "invalid_record" });
   });
+
+  it("a body with an own string-valued __proto__ field is refused, not committed without it", async () => {
+    const storage = new StrictMemoryStorage();
+    const keys = fixtureStoreKeys();
+    const clock = { now: START };
+    const { oplog, results } = open(storage, keys, clock);
+    await oplog.ensure();
+    await results.ensure();
+    await results.putPending({ request_id: fixtureRequestId(1), seat: FIXTURE_SEAT, kind: "summarize", deadline: START + MINUTE });
+    // A string assigned through the prototype setter is ignored, so a copied body would silently lose the field.
+    const body = JSON.parse('{"summary":"text","__proto__":"field"}') as Record<string, string>;
+    expect(Object.keys(body)).toContain("__proto__");
+    await expect(results.markCommitted(fixtureRequestId(1), body)).rejects.toMatchObject({ kind: "invalid_record" });
+    expect(await results.get(fixtureRequestId(1))).toBeNull();
+  });
 });

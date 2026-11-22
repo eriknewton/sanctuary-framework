@@ -499,6 +499,9 @@ export function validateBody(input: unknown): LocalResultBody {
   // A running lower bound on the canonical size stops an oversized body before it is serialized.
   let lowerBound = 2;
   for (const name of Object.keys(body)) {
+    // Assigning this name into the copy would run the prototype setter instead of storing a field, so the
+    // stored body would differ from the one submitted; the name is refused rather than dropped.
+    if (name === "__proto__") throw new LocalStoreError("invalid_record");
     const value = body[name];
     lowerBound += name.length + 3;
     if (typeof value === "string") {
