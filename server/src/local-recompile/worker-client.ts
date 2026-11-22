@@ -102,7 +102,14 @@ export class LocalWorkerClient {
     this.resultsKey = copyStoreKey(options.resultsKey);
     // The init every spawn sends is checked against the shared schema once here, so a root the
     // worker would refuse fails at construction instead of driving a respawn loop.
-    assertSendable("to_worker", this.initMessage(this.oplogKey, this.resultsKey));
+    try {
+      assertSendable("to_worker", this.initMessage(this.oplogKey, this.resultsKey));
+    } catch (error) {
+      // A refused construction keeps no key material: both copies are zeroed before the refusal.
+      this.oplogKey.fill(0);
+      this.resultsKey.fill(0);
+      throw error;
+    }
     this.timers = options.timers ?? realTimers;
     this.spawnWorker = options.spawn ?? fork;
     this.onEvent = options.onEvent ?? (() => undefined);
@@ -167,15 +174,20 @@ export class LocalWorkerClient {
     if (!child.connected) return false;
     const id = (this.writes += 1);
     let accepted = false;
+    let delivered = false;
     try {
       accepted = child.send(message, (error: Error | null) => {
+        if (error != null) return;
+        delivered = true;
         // Only a delivered write, to the current child, that raised the backlog clears it.
-        if (error == null && child === this.child && id === this.backlogWrite) this.backlogged = false;
+        if (child === this.child && id === this.backlogWrite) this.backlogged = false;
       });
     } catch {
       return false;
     }
-    if (!accepted) {
+    // A write already delivered when send returns (its callback ran first) leaves nothing queued, so it
+    // never raises the backlog, whatever order the transport reports the two in.
+    if (!accepted && !delivered) {
       this.backlogged = true;
       this.backlogWrite = id;
     }
@@ -238,8 +250,9 @@ export class LocalWorkerClient {
   }
 
   private onMessage(child: ChildProcess, raw: unknown): void {
-    // A superseded child, or any child once close has begun, is not listened to.
-    if (child !== this.child || this.closing) return;
+    // A superseded child, a child that faulted (state_DEAD until its exit), or any child once close has
+    // begun is not listened to: a ready or status it had already sent is dropped.
+    if (child !== this.child || this.closing || this.currentState === "state_DEAD") return;
     // Received messages pass the same schema and size cap as sent ones.
     const message = acceptMessage("to_parent", raw);
     if (message === null) {
@@ -262,8 +275,15 @@ export class LocalWorkerClient {
     } else if (message.type === "status") {
       this.onEvent({ type: "status", status: message });
     } else {
-      // A faulted worker gets no more work and is killed, so its exit drives the usual respawn.
+      // A fault ends the child's turn at once, before its exit arrives: it gets no more work, leaves
+      // state_SPAWNING or state_READY for state_DEAD, and its ready and stable timers stop, so it can
+      // neither become ready nor reset the backoff. It is killed, and its exit drives the usual respawn.
       this.readyChild = undefined;
+      for (const timer of [this.readyTimer, this.stableTimer]) {
+        if (timer !== undefined) this.timers.clearTimeout(timer);
+      }
+      this.readyTimer = this.stableTimer = undefined;
+      this.setState("state_DEAD");
       this.onEvent({ type: "fault", kind: message.kind });
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }

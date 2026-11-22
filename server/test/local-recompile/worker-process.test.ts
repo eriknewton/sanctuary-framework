@@ -1,5 +1,5 @@
 // fail-before-exempt: new worker process module, no base behaviour.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fork, type ChildProcess, type ForkOptions } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -580,6 +580,129 @@ describe("local job worker client protocol states", () => {
     await client.close();
   });
 
+  it("a superseded child's delivery never clears the current child's backlog", async () => {
+    const { client, fakes, clock, events } = await fakeClient();
+    client.start();
+    const first = fakes[0]!;
+    first.emit("message", { type: "ready" });
+    first.hold = true;
+    first.sendResult = false;
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    first.kill("SIGKILL");
+    const respawn = events.find((event) => event.type === "respawn_scheduled") as { delay_ms: number };
+    clock.fire(respawn.delay_ms);
+    const second = fakes[1]!;
+    second.emit("message", { type: "ready" });
+    second.hold = true;
+    second.sendResult = false;
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    first.flush(null);
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    second.flushOne(null);
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    second.hold = false;
+    second.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("an earlier write's delivery never clears a backlog a later write raised", async () => {
+    const { client, fakes } = await fakeClient();
+    client.start();
+    const fake = fakes[0]!;
+    fake.emit("message", { type: "ready" });
+    fake.hold = true;
+    // The first write is taken outright; the second is queued behind a backlog.
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    fake.sendResult = false;
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    fake.sendResult = true;
+    fake.flushOne(null);
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    fake.flushOne(null);
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    fake.hold = false;
+    fake.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("a write delivered before send returns never raises the backlog", async () => {
+    const { client, fakes } = await fakeClient();
+    client.start();
+    const fake = fakes[0]!;
+    fake.emit("message", { type: "ready" });
+    // The fake runs the delivery callback inside send and then reports the write as queued.
+    fake.sendResult = false;
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    fake.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("send reads false for a disconnected child and for a send that throws, and writes nothing", async () => {
+    const { client, fakes } = await fakeClient();
+    client.start();
+    const fake = fakes[0]!;
+    fake.emit("message", { type: "ready" });
+    const before = fake.sent.length;
+    fake.throwOnSend = true;
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    fake.throwOnSend = false;
+    fake.connected = false;
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    expect(fake.sent.length).toBe(before);
+    fake.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("a fault while spawning leaves state_SPAWNING at once, stops the ready deadline and drops a ready behind it", async () => {
+    const { client, fakes, clock, events } = await fakeClient({ child: () => Object.assign(new FakeChild(), { deferExit: true }) });
+    client.start();
+    const fake = fakes[0]!;
+    fake.emit("message", { type: "fault", kind: "store_open" });
+    expect(client.state).toBe("state_DEAD");
+    expect(clock.count(WORKER_READY_TIMEOUT_MS)).toBe(0);
+    expect(fake.signalCode).toBe("SIGKILL");
+    // The child's exit has not arrived yet; a ready it sent before dying is dropped.
+    fake.emit("message", { type: "ready" });
+    expect(client.state).toBe("state_DEAD");
+    expect(events.filter((event) => event.type === "state" && event.state === "state_READY")).toEqual([]);
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    fake.emitExit();
+    expect(client.state).toBe("state_BACKOFF");
+    await client.close();
+  });
+
+  it("a fault while ready stops the backoff reset and drops a status behind it", async () => {
+    const { client, fakes, clock, events } = await fakeClient({ child: () => Object.assign(new FakeChild(), { deferExit: true }) });
+    client.start();
+    const fake = fakes[0]!;
+    fake.emit("message", { type: "ready" });
+    expect(clock.count(WORKER_RESPAWN_MAX_MS)).toBe(1);
+    fake.emit("message", { type: "fault", kind: "housekeeping" });
+    expect(client.state).toBe("state_DEAD");
+    expect(clock.count(WORKER_RESPAWN_MAX_MS)).toBe(0);
+    fake.emit("message", { type: "status", state: "state_READY", env_names: [], exec_argv: [], queue_depth: 0 });
+    expect(events.filter((event) => event.type === "status")).toEqual([]);
+    fake.emitExit();
+    expect(client.state).toBe("state_BACKOFF");
+    await client.close();
+  });
+
+  it("a refused construction zeroes its copies of both keys", async () => {
+    const { keys } = await fortress();
+    const fill = vi.spyOn(Uint8Array.prototype, "fill");
+    try {
+      expect(() => new LocalWorkerClient({ storageRoot: "relative/state", ...keys, spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow(WorkerProtocolError);
+      const zeroed = fill.mock.contexts.filter((target, index) => (target as Uint8Array).length === STORE_KEY_BYTES && fill.mock.calls[index]![0] === 0);
+      expect(zeroed).toHaveLength(2);
+      expect((zeroed as Uint8Array[]).every((key) => key.every((byte) => byte === 0))).toBe(true);
+      // The caller's own keys are untouched.
+      expect(keys.oplogKey.some((byte) => byte !== 0)).toBe(true);
+    } finally {
+      fill.mockRestore();
+    }
+  });
+
   it("a worker that never becomes ready is killed at the deadline and a late ready from it is ignored", async () => {
     const { client, fakes, clock } = await fakeClient();
     client.start();
@@ -627,6 +750,10 @@ class FakeChild extends EventEmitter {
   sendResult = true;
   /** When set, delivery callbacks wait for flush instead of running at once. */
   hold = false;
+  /** When set, send throws as a closed channel can. */
+  throwOnSend = false;
+  /** When set, kill records the signal but the exit arrives only on emitExit, as a real process's does. */
+  deferExit = false;
   private readonly held: Array<(error: Error | null) => void> = [];
   constructor(options: { pid?: number | undefined } = { pid: FakeChild.nextPid }) {
     super();
@@ -634,6 +761,7 @@ class FakeChild extends EventEmitter {
     FakeChild.nextPid += 1;
   }
   send(message: unknown, callback?: (error: Error | null) => void): boolean {
+    if (this.throwOnSend) throw new Error("fixture channel closed");
     // The IPC channel serializes at send time, so the fake records a copy.
     this.sent.push(structuredClone(message));
     if (callback && this.hold) this.held.push(callback);
@@ -644,12 +772,19 @@ class FakeChild extends EventEmitter {
   flush(error: Error | null): void {
     for (const callback of this.held.splice(0)) callback(error);
   }
+  /** Deliver only the oldest held write with this outcome. */
+  flushOne(error: Error | null): void {
+    this.held.shift()?.(error);
+  }
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
     if (this.exitCode !== null || this.signalCode !== null) return false;
     this.signalCode = signal;
     this.connected = false;
-    this.emit("exit", null, signal);
+    if (!this.deferExit) this.emit("exit", null, signal);
     return true;
+  }
+  emitExit(): void {
+    this.emit("exit", null, this.signalCode);
   }
   unref(): void {}
 }
