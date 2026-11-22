@@ -31,13 +31,14 @@ const KNOWN_STATUSES: readonly AssuranceStatus[] = [
   "in_flight",
   "unknown",
 ];
-// 27 = the 23 rows pinned when this harness landed, plus the three rows appended
+// 29 = the 23 rows pinned when this harness landed, plus the three rows appended
 // 2026-09-03 (Rung 1 memory custody, catalog v3 verification, fleet licensing),
 // plus the Rung 2 activation row (signed model manifest verified at provisioning),
-// plus the credential surrogacy slice 1a row (row 28, `partial`, 2026-09-30).
+// plus the credential surrogacy slice 1a row (row 28, `partial`, 2026-09-30),
+// plus the zero-outbound drill row (row 29, `proven`, Linux 1.8.4 only, 2026-11-22).
 // Rows are appended at the END of the table so fixture row IDs stay stable.
 // Must match the data-row count of the table in ASSURANCE_MATRIX.md.
-export const EXPECTED_ASSURANCE_ROW_COUNT = 28;
+export const EXPECTED_ASSURANCE_ROW_COUNT = 29;
 
 export interface AssuranceRow {
   id: string;
