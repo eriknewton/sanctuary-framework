@@ -1,0 +1,433 @@
+// fail-before-exempt: the extracted classifier is a new module; screening and routing assertions are witnessed against its unchanged extraction commit.
+/** Intent screening preserves ordinary guidance within explicit work bounds. */
+import { describe, expect, it } from "vitest";
+import * as classifier from "../../src/agent-native/intent-classifier.js";
+const {
+  classifyIntent, buildHelpVariants, HELP_NEEDLES, HELP_BENIGN_WORDS, HELP_MASK,
+  HELP_WRITE_CUES, HELP_STRONG_READ_CUES, HELP_WEAK_READ_CUES,
+  HELP_MAX_VARIANTS, HELP_MAX_VARIANT_BYTES, HELP_INTENT_MAX_CHARS, HELP_BAND_SCAN_CHARS,
+} = classifier;
+
+// A decode chain gets one quarter of the variant slots; the fallback also runs the prior-source witness.
+const decodePasses = classifier.HELP_MAX_DECODE_PASSES ?? HELP_MAX_VARIANTS / 4;
+
+const gated = (intent: string) => expect(classifyIntent(intent).safety_class, intent).toBe("gated");
+
+describe("bounded intent screening", () => {
+  it("keeps the needle and benign tables disjoint and masks whole words", () => {
+    for (const word of HELP_BENIGN_WORDS) {
+      expect(HELP_NEEDLES.some(needle => word.includes(needle))).toBe(true);
+      expect(HELP_NEEDLES as readonly string[]).not.toContain(word);
+      expect(classifyIntent(word).safety_class, word).not.toBe("gated");
+      for (const needle of HELP_NEEDLES) gated(`${word} ${needle}`);
+    }
+    for (const needle of HELP_NEEDLES) {
+      gated(needle);
+      expect(needle).not.toContain(HELP_MASK);
+    }
+
+    for (const cue of [...HELP_WRITE_CUES, ...HELP_STRONG_READ_CUES, ...HELP_WEAK_READ_CUES]) expect(cue).not.toContain(HELP_MASK);
+    expect(classifyIntent("importantish").probe_key).toBe("import");
+    expect(classifyIntent("designated").probe_key).toBe("sign");
+  });
+  it("screens non-URL needles with word joiners at each inner position", () => {
+    for (const needle of HELP_NEEDLES) {
+      if (needle === "http://" || needle === "https://") continue;
+      // Pin: dash joiners retain the round-one screening answer.
+      // U+10EAD is the supplementary-plane Yezidi hyphen; its source offsets span two UTF-16 units.
+      for (const joiner of ["-", "_", ".", "—", "\u{10ead}", "/", ":", "+", "😀", "\u200b"]) {
+        for (let offset = 1; offset < needle.length; offset += 1) gated(`${needle.slice(0, offset)}${joiner}${needle.slice(offset)}`);
+      }
+    }
+  });
+  it("screens non-URL needles with each benign word between its halves", () => {
+    for (const needle of HELP_NEEDLES) {
+      if (needle === "http://" || needle === "https://") continue;
+      const middle = Math.floor(needle.length / 2);
+      for (const word of HELP_BENIGN_WORDS) gated(`${needle.slice(0, middle)} ${word} ${needle.slice(middle)}`);
+    }
+  });
+  it("screens each base64 needle in its original case beside a write cue", () => {
+    for (const needle of HELP_NEEDLES) gated(`save ${Buffer.from(needle).toString("base64")}`);
+    expect(classifyIntent("save ZXhwb3J0").probe_key).toBe("export");
+  });
+  it("masks decoded benign words and screens decoded needles", () => {
+    expect(classifyIntent("%69mportant note to save").safety_class).toBe("ordinary");
+    expect(classifyIntent("save %69mport").probe_key).toBe("import");
+    for (const word of HELP_BENIGN_WORDS) {
+      const encoded = Array.from(word, char => `%${char.charCodeAt(0).toString(16)}`).join("");
+      expect(classifyIntent(encoded).safety_class, word).not.toBe("gated");
+    }
+  });
+  it("drops identical variants and limits the benign ignore to one whole span", () => {
+    expect(buildHelpVariants("important").variants).not.toContain("important");
+    expect(classifyIntent("important").safety_class).not.toBe("gated");
+    expect(classifyIntent("ex important port").probe_key).toBe("export");
+    expect(classifyIntent("imp-ortant").probe_key).toBe("import");
+  });
+  it("bounds retained variants and bytes for percent-token input", () => {
+    const tokens = Array.from({ length: HELP_MAX_VARIANTS + 1 }, (_, i) => `%61${i}x`).join(" ");
+    const intent = tokens.padEnd(HELP_INTENT_MAX_CHARS - 1, " ");
+    expect(intent).toHaveLength(1023);
+    const result = buildHelpVariants(intent);
+    expect(result.variants.length).toBeLessThanOrEqual(HELP_MAX_VARIANTS);
+    expect(result.bytes).toBeLessThanOrEqual(HELP_MAX_VARIANT_BYTES);
+    expect(result.budgetHit).toBe(true);
+    const exactCount = Array.from({ length: HELP_MAX_VARIANTS - 1 }, (_, i) => `%61${i}x`).join(" ");
+    expect(buildHelpVariants(exactCount)).toMatchObject({ budgetHit: true });
+    expect(classifyIntent(intent).probe_key).toBe("variant_budget");
+    expect(classifyIntent(`export ${intent}`.slice(0, HELP_INTENT_MAX_CHARS)).probe_key).toBe("export");
+    const encodedNeedle = `%65xport ${intent}`.slice(0, HELP_INTENT_MAX_CHARS);
+    expect(buildHelpVariants(encodedNeedle).budgetHit).toBe(true);
+    expect(classifyIntent(encodedNeedle).probe_key).toBe("export");
+  });
+  // Thirty-three tokens fill the count budget; presentation forms expand eighteenfold before decoding.
+  it.each([
+    [Array.from({ length: 33 }, (_, i) => `%61${i}x`).join(" ").padEnd(1023, " "), "variant_budget"],
+    ["ﷺ".repeat(1020) + "%61", "unreadable"],
+  ])("keeps guidance closed when decoded work reaches a budget: %s", (intent, probeKey) => {
+    expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: probeKey });
+  });
+  it("keeps decoded bytes within the retained byte budget", () => {
+    // Repeated presentation forms expand eighteenfold during NFKC; a percent token makes the decoded copy distinct.
+    const normalized = ("ﷺ".repeat(1020) + "%61").normalize("NFKC");
+    const result = buildHelpVariants(normalized);
+    expect(result.budgetHit).toBe(true);
+    expect(result.bytes).toBeLessThanOrEqual(HELP_MAX_VARIANT_BYTES);
+    expect(result.variants.length).toBeLessThanOrEqual(HELP_MAX_VARIANTS);
+  });
+  it("screens the prefix and suffix independently of the middle", () => {
+    const intent = "x".repeat(997) + "export" + "x".repeat(997);
+    expect(intent).toHaveLength(2000);
+    expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: "oversize" });
+    expect(classifyIntent("export " + "x".repeat(1500)).probe_key).toBe("export");
+    // Each 512-code-point edge is screened independently across a 976-code-point middle.
+    const separated = "x".repeat(509) + "exp" + "x".repeat(976) + "ort" + "x".repeat(509);
+    expect(separated).toHaveLength(2000);
+    expect(classifyIntent(separated).probe_key).toBe("oversize");
+  });
+  it("keeps only complete contraction suffixes inside negation tokens", () => {
+    for (const apostrophe of ["'", "\u2019"]) {
+      for (const suffix of ["s", "re", "ll", "ve", "d", "m"]) {
+        expect(classifyIntent(`not${apostrophe}${suffix} save the note`).tool).toBe("sanctuary_remember");
+        expect(classifyIntent(`not${apostrophe}${suffix}a save the note`).probe_key).toBe("ambiguous");
+      }
+      expect(classifyIntent(`don${apostrophe}t save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`not${apostrophe}t save the note`).probe_key).toBe("ambiguous");
+    }
+  });
+  it("screens default-ignorables across Unicode categories", () => {
+    expect(buildHelpVariants("%EF%BB%BFsave").variants).toContain("save");
+    expect(buildHelpVariants(Buffer.from("\ufeffsave").toString("base64")).variants).toContain("save");
+    for (const intent of ["%EF%BB%BFsave the note", "\ufeff\ufeffsave the note", "save\ufeff the note"]) {
+      expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", probe_key: "ambiguous", tool: null, example: null });
+    }
+    // Soft hyphen, grapheme joiner, Hangul filler, zero-width space, variation selector, BOM and tag cover distinct categories.
+    for (const point of ["\u00ad", "\u034f", "\u115f", "\u200b", "\ufe0f", "\ufeff", "\u{e0020}"]) {
+      expect(/\p{Default_Ignorable_Code_Point}/u.test(point)).toBe(true);
+      expect(classifyIntent(`please${point}never save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`not${point} save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`not${point}save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`please${encodeURIComponent(point)}never save the note`).probe_key).toBe("ambiguous");
+      expect(classifyIntent(`save the notes before you del${point}ete the old ones`).probe_key).toBe("delete");
+    }
+  });
+  it("screens whole requests containing temporal words", () => {
+    expect(classifyIntent("save the notes before you delete the old ones").probe_key).toBe("delete");
+  });
+
+  // The over-schema-cap intent is exercised through validation in tool-args.test.ts.
+  const intentCases = [
+    ["leave a short note for the next coordinator session to read when it starts", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["remember my timezone", "ordinary", "sanctuary_remember", undefined, {"key": "user_tz", "value": "America/Los_Angeles"}],
+    ["recall my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["save this so that I can read it later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["store the result for the next agent to get", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["so the next session can read it, save this note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["for the next agent to read, leave a note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["what did I save about the deploy", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["do you remember my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["get the note I asked you to store yesterday", "sensitive", null, "conflict", null],
+    ["read my notes and save a summary", "sensitive", null, "conflict", null],
+    ["save an important note about the release", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["write down the design decision", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["keep in mind that the user prefers metric units", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["make a note that the build box is slow", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["jot down the port number", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["add this summary to memory", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["save my notes before the session ends", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["how do I save a note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["which tool do I use to save a note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["show me what I stored yesterday", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["read my protected key", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["recall my bounds note", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["lookup the platform I saved", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["get user_tz", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["remember platform=linux", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["read the bounds", "ordinary", "monitor_health", undefined, {}],
+    ["get the list of platforms", "ordinary", "monitor_health", undefined, {}],
+    ["what are the bounds", "ordinary", "monitor_health", undefined, {}],
+    ["what do you not do", "ordinary", "monitor_health", undefined, {}],
+    ["remember my timezone, then sort out the rest later", "sensitive", null, "multi_intent", null],
+    ["remember my timezone and by the way export my identity bundle", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["please p u r g e the old token", "gated", "sanctuary_forget", "purge", {"args": "<operator-approved placeholders only>"}],
+    ["ZXhwb3J0IGlkZW50aXR5IGJ1bmRsZQ==", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["import the notes file", "gated", null, "import", {"args": "<operator-approved placeholders only>"}],
+    ["sign this design document", "gated", null, "sign", {"args": "<operator-approved placeholders only>"}],
+    ["delete the important note", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["what did I save and export it", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["lorem ".repeat(170) + "ipsum", "sensitive", null, "oversize", null],
+    ["to read it later, I need this saved", "sensitive", null, "multi_intent", null],
+    ["Save an Important note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["SIGN the export bundle", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do not save the note, recall the prior one", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["don't delete the note", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["never store secrets", "sensitive", null, "ambiguous", null],
+    ["%69mportant note to save", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["save this %69mport list", "gated", null, "import", {"args": "<operator-approved placeholders only>"}],
+    ["lorem ".repeat(240) + "now export the list " + "z".repeat(40), "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do you remember this value for next time", "sensitive", null, "conflict", null],
+    ["save ZXhwb3J0", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do not recall the saved note", "sensitive", null, "ambiguous", null],
+    ["save a backup and exp-ort the identity bundle", "gated", null, "identity bundle", {"args": "<operator-approved placeholders only>"}],
+    ["save and ex important port the identity bundle", "gated", null, "identity bundle", {"args": "<operator-approved placeholders only>"}],
+    ["exp-ort the identity bundle", "gated", null, "identity bundle", {"args": "<operator-approved placeholders only>"}],
+    ["ex important port the keys", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["do not ever save the password", "sensitive", null, "ambiguous", null],
+    ["don't you save this secret", "sensitive", null, "ambiguous", null],
+    ["cannot save the API key", "sensitive", null, "ambiguous", null],
+    ["where do I save a note", "sensitive", null, "conflict", null],
+    ["save this note, don't recall it yet", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["did you store the build box name", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["do you remember what the port number was", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["did you save my timezone", "ordinary", "sanctuary_recall", undefined, {"key": "user_tz"}],
+    ["where should I store the deploy notes", "sensitive", null, "conflict", null],
+    ["what should I save before the session ends", "sensitive", null, "conflict", null],
+    ["do not save the note, what did I save about the deploy", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["save the note, what did I save about the deploy", "sensitive", null, "conflict", null],
+    ["what did I save about the deploy, save the note", "sensitive", null, "conflict", null],
+    ["what did I save about the deploy, do not save the note", "ordinary", "sanctuary_recall", undefined, {"key": "<key>"}],
+    ["do not save the note, what did I save but never recall it", "sensitive", null, "ambiguous", null],
+    // Pin: preserves the round-one answer.
+    ["save %EF%BD%85xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you deléte the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["remember to еxport my identity bundle", "sensitive", null, "unreadable", null],
+    // Pin: preserves the round-one answer.
+    ["save %C3%A9xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save my café notes", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["remember my timezone", "ordinary", "sanctuary_remember", undefined, {"key": "user_tz", "value": "America/Los_Angeles"}],
+    [`save ${Buffer.from("東京").toString("base64")}`, "sensitive", null, "unreadable", null],
+    ["save %2565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["remember %EF%BC%8565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save %252565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    [`save %${"25".repeat(decodePasses)}65xport the notes`, "sensitive", null, "variant_budget", null],
+    [`save %${"25".repeat(decodePasses - 1)}65xport the notes`, "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save %zz %2565xport the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["not-save the note", "sensitive", null, "ambiguous", null],
+    ["not—save the note", "sensitive", null, "ambiguous", null],
+    // Pin: preserves the round-one answer.
+    ["not_save the note", "sensitive", null, "ambiguous", null],
+    ["not.save the note", "sensitive", null, "ambiguous", null],
+    ["not/save the note", "sensitive", null, "ambiguous", null],
+    ["save the notes before you del_ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del.ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    // Pin: preserves the round-one answer.
+    ["save the notes before you del\u{10ead}ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save notes.txt for later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["assign-ature the form", "gated", null, "signature", {"args": "<operator-approved placeholders only>"}],
+    ["save the note, what did I save but never store again", "sensitive", null, "conflict", null],
+    ["what did I save but never store again", "sensitive", null, "conflict", null],
+    ["what did I never save", "sensitive", null, "conflict", null],
+    ["remember %2565xport%25zz the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save %2565xport%zz the notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del%2565te%ff the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    [`save %${"25".repeat(decodePasses)}65xport%zz the notes`, "sensitive", null, "variant_budget", null],
+    ["not:save the note", "sensitive", null, "ambiguous", null],
+    ["not\u00adsave the note", "sensitive", null, "ambiguous", null],
+    ["not+save the note", "sensitive", null, "ambiguous", null],
+    ["save the notes before you del/ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del:ete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["save the notes before you del\u200bete the old ones", "gated", "sanctuary_forget", "delete", {"args": "<operator-approved placeholders only>"}],
+    ["remember the 3:30 standup", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    // These two percent rows distinguish round one only.
+    ["remember my %EF%BD%85xport notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["remember my %C3%A9xport notes", "gated", null, "export", {"args": "<operator-approved placeholders only>"}],
+    ["not!save the note", "sensitive", null, "ambiguous", null],
+    ["save http.txt for later", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["remember the https setup", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["save the http status", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["not'save the note", "sensitive", null, "ambiguous", null],
+    ["not:'save the note", "sensitive", null, "ambiguous", null],
+    ["not'-save the note", "sensitive", null, "ambiguous", null],
+    ["don't save the note", "sensitive", null, "ambiguous", null],
+    ["the user's note, save it", "sensitive", null, "multi_intent", null],
+    ["please\u00adnever save the note", "sensitive", null, "ambiguous", null],
+    ["do\u200bnot save the note", "sensitive", null, "ambiguous", null],
+    ["please%C2%ADnever save the note", "sensitive", null, "ambiguous", null],
+    ["do\u200byou remember my timezone", "sensitive", null, "ambiguous", null],
+    ["\u200bwhat did I save about the deploy", "sensitive", null, "ambiguous", null],
+    ["\u00addo you remember my timezone", "sensitive", null, "ambiguous", null],
+    ["do%E2%80%8Byou remember my timezone", "sensitive", null, "ambiguous", null],
+    ["sa\ufe0fve the note", "sensitive", null, "ambiguous", null],
+    ["please%C2%AD%20never save the note", "sensitive", null, "ambiguous", null],
+    ["save the import\u00adant notes", "sensitive", null, "ambiguous", null],
+    ["save the drop\u00addown menu", "sensitive", null, "ambiguous", null],
+    ["remember the sig\u00adnal", "sensitive", null, "ambiguous", null],
+    ["don\u200b't save the note", "sensitive", null, "ambiguous", null],
+    ["not's\u200bsave the note", "sensitive", null, "ambiguous", null],
+    ["don%E2%80%8B't save the note", "sensitive", null, "ambiguous", null],
+    ["\ufeffsave the note", "ordinary", "sanctuary_remember", undefined, {"key": "<key>", "value": "<value>"}],
+    ["do%25E2%2580%258Byou remember my timezone", "sensitive", null, "ambiguous", null],
+    ["save the note%25%45%32%25%38%30%25%38%42", "sensitive", null, "ambiguous", null],
+    ["save the note\uff05E2\uff0580\uff058B", "sensitive", null, "ambiguous", null],
+    ["save bm90ZeKAiw==", "sensitive", null, "ambiguous", null],
+    ["save aW1wb3J0wq1hbnQ=", "sensitive", null, "ambiguous", null],
+    ["%EF%BB%BF save the note", "sensitive", null, "ambiguous", null],
+    ["%25EF%25BB%25BF save the note", "sensitive", null, "ambiguous", null],
+    ["remember 77u/c2F2ZSB0aGUgbm90ZQ==", "sensitive", null, "ambiguous", null],
+    ["save 77u/bm90ZQ==", "sensitive", null, "ambiguous", null],
+  ] as const;
+  it.each(intentCases)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
+    const answer = classifyIntent(intent);
+    expect(answer.safety_class).toBe(safetyClass);
+    expect(answer.tool).toBe(tool);
+    expect(answer.probe_key).toBe(probeKey);
+    expect(answer.example).toEqual(example);
+    if (tool === "monitor_health") {
+      expect(answer.intent_class).toBe("evaluate");
+      expect(answer.evaluate_question).toBe("bounds");
+    } else expect(answer.intent_class).toBeUndefined();
+  });
+  it("closes guidance for invisible insertions throughout ordinary tool intents", () => {
+    const insertions = ["\u200b", "\u00ad", "\ufe0f", "\u2060", "%E2%80%8B", "%25E2%2580%258B", "\uff05E2\uff0580\uff058B"];
+    const continuingCases = intentCases.filter(([, safetyClass, tool]) => tool !== null && safetyClass !== "gated");
+    // 45 of 143 rows carry an ungated tool: 1,384 code-point boundaries times 7 forms = 9,688 calls.
+    // Derive the count from the table so every continuing row and both end boundaries stay covered.
+    const callCount = continuingCases.reduce((total, [intent]) => total + (Array.from(intent).length + 1) * insertions.length, 0);
+    expect(continuingCases).toHaveLength(45);
+    expect(callCount).toBe(9688);
+    let calls = 0;
+    for (const [intent] of continuingCases) {
+      const points = Array.from(intent);
+      for (let boundary = 0; boundary <= points.length; boundary += 1) {
+        for (const insertion of insertions) {
+          const text = points.slice(0, boundary).join("") + insertion + points.slice(boundary).join("");
+          const answer = classifyIntent(text);
+          calls += 1;
+          expect(answer.safety_class === "gated" || (answer.tool === null && answer.example === null), text).toBe(true);
+        }
+      }
+    }
+    expect(calls).toBe(callCount);
+  });
+  it("closes guidance for decoded note tokens throughout ordinary tool intents", () => {
+    const invisibles = ["\u200b", "\u00ad", "\ufe0f"];
+    const continuingCases = intentCases.filter(([, safetyClass, tool]) => tool !== null && safetyClass !== "gated");
+    // 45 of 143 rows carry an ungated tool: 45 rows times 3 encoded note forms = 135 calls.
+    const callCount = continuingCases.length * invisibles.length;
+    expect(continuingCases).toHaveLength(45);
+    expect(callCount).toBe(135);
+    let calls = 0;
+    for (const [intent] of continuingCases) {
+      for (const invisible of invisibles) {
+        const text = `${intent} ${Buffer.from(`note${invisible}`, "utf8").toString("base64")}`;
+        const answer = classifyIntent(text);
+        calls += 1;
+        expect(answer.safety_class === "gated" || (answer.tool === null && answer.example === null), text).toBe(true);
+      }
+    }
+    expect(calls).toBe(callCount);
+  });
+  it("classifies a received leading BOM intent exactly as the same intent without it", () => {
+    // The entry exemption removes one received U+FEFF before banding, so band edges never depend on an invisible byte.
+    // 8 visible characters plus (band - 9) put the next character at the last prefix index; 600 more exceed the limit.
+    const bandPrefixEnd = "del-ete " + "x".repeat(HELP_BAND_SCAN_CHARS - 9);
+    const intents = [
+      bandPrefixEnd + "\u0416" + "x".repeat(600),
+      bandPrefixEnd + "x" + "\u0416" + "x".repeat(600),
+      "x".repeat(1500) + "export",
+    ];
+    for (const intent of intents) {
+      expect(Array.from(intent).length).toBeGreaterThan(HELP_INTENT_MAX_CHARS);
+      expect(classifyIntent(`\ufeff${intent}`), intent.slice(0, 16)).toEqual(classifyIntent(intent));
+    }
+    // At exactly the limit, a received BOM must not move the intent onto the oversize path:
+    // 7 + (band - 9) + 6 + (band - 4) = 2 * band = the limit, and the encoded letter straddles the band edge.
+    const atLimit = "delete " + " ".repeat(HELP_BAND_SCAN_CHARS - 9) + "%D0%96" + " ".repeat(HELP_BAND_SCAN_CHARS - 4);
+    expect(Array.from(atLimit)).toHaveLength(HELP_INTENT_MAX_CHARS);
+    expect(classifyIntent(`\ufeff${atLimit}`)).toEqual(classifyIntent(atLimit));
+    expect(classifyIntent(atLimit)).toMatchObject({ tool: null, example: null });
+    expect(classifyIntent(intents[1]!)).toMatchObject({ safety_class: "gated", tool: "sanctuary_forget" });
+    expect(classifyIntent(intents[2]!)).toMatchObject({ safety_class: "gated" });
+  });
+  it("counts received code points before normalization and scans each band edge", () => {
+    expect("lorem ".repeat(170) + "ipsum").toHaveLength(1025);
+    expect("lorem ".repeat(240) + "now export the list " + "z".repeat(40)).toHaveLength(1500);
+    expect(classifyIntent("😀".repeat(1024)).probe_key).toBe("ambiguous");
+    expect(classifyIntent("😀".repeat(1025)).probe_key).toBe("oversize");
+    expect(classifyIntent("ﷺ".repeat(1024)).probe_key).toBe("unreadable");
+    expect(classifyIntent("x".repeat(1500) + "export").probe_key).toBe("export");
+  });
+  it.each([
+    ["privatekey", "privatekey"],
+    ["secretkey", "secretkey"],
+    ["save cHJpdmF0ZWtleQ==", "privatekey"],
+    ["save c2VjcmV0a2V5", "secretkey"],
+    ["exp-ort", "export"],
+    ["export %zz", "export"],
+  ])("screens compact and separated requests: %s", (intent, probeKey) => {
+    expect(classifyIntent(intent!)).toMatchObject({ safety_class: "gated", tool: null, probe_key: probeKey });
+  });
+  it("retains malformed percent text and replaces invalid UTF-8 bytes", () => {
+    expect(buildHelpVariants("notes %ff%61%zz%").variants).toContain("notes �a%zz%");
+  });
+  it("retains plain routing when percent text is incomplete", () => {
+    expect(classifyIntent("save %zz").tool).toBe("sanctuary_remember");
+  });
+  it("routes every declared memory cue through its cue class", () => {
+    for (const cue of HELP_WRITE_CUES) expect(classifyIntent(`${cue} the color`).tool, cue).toBe("sanctuary_remember");
+    for (const cue of [...HELP_STRONG_READ_CUES, ...HELP_WEAK_READ_CUES]) expect(classifyIntent(`${cue} the color`).tool, cue).toBe("sanctuary_recall");
+    for (const verb of ["make", "take", "leave", "add"]) {
+      for (const object of ["note", "notes", "message", "memo", "reminder"]) expect(classifyIntent(`${verb} a short ${object}`).tool).toBe("sanctuary_remember");
+    }
+    for (const verb of ["put", "add", "commit"]) {
+      for (const destination of ["to memory", "in memory", "into memory"]) expect(classifyIntent(`${verb} this ${destination}`).tool).toBe("sanctuary_remember");
+    }
+  });
+  it("reads question openers as whitespace-separated words", () => {
+    expect(classifyIntent("do  you remember my timezone").tool).toBe("sanctuary_recall");
+    expect(classifyIntent("do  you remember this value for next time")).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: "conflict" });
+  });
+  it("retains distinct read cues within write-object phrases", () => {
+    for (const intent of ["make a read note", "add a read note", "put read into memory", "commit get into memory"]) {
+      expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: "conflict" });
+    }
+  });
+  it("keeps local negation attached through two intervening tokens and normalized apostrophes", () => {
+    for (const cue of [...HELP_WRITE_CUES, ...HELP_STRONG_READ_CUES, ...HELP_WEAK_READ_CUES]) {
+      for (const prefix of ["not", "never", "don't you", "cannot", "do not ever", "don’t", "don‘t", "couldnʼt", "not please kindly"]) {
+        expect(classifyIntent(`${prefix} ${cue} the color`).tool, `${prefix} ${cue}`).toBeNull();
+      }
+    }
+    expect(classifyIntent("not please kindly maybe save the color").tool).toBe("sanctuary_remember");
+    expect(classifyIntent("save the color but never store the shape").tool).toBeNull();
+  });
+
+  it("honors read negation in a stored-data question's clause", () => {
+    for (const intent of ["what did I save but do not recall the saved note", "did you store the note but never retrieve it"]) {
+      expect(classifyIntent(intent)).toMatchObject({ safety_class: "sensitive", tool: null, probe_key: "ambiguous" });
+    }
+  });
+
+  it("names a timezone key only when the intent carries timezone tokens", () => {
+    for (const cue of [...HELP_WRITE_CUES, ...HELP_STRONG_READ_CUES, ...HELP_WEAK_READ_CUES]) {
+      for (const subject of ["the color", "the launch date", "my time zone", "timezone", "user_tz", "time-zone", "tzvalue"]) {
+        const answer = classifyIntent(`${cue} ${subject}`);
+        if (answer.safety_class !== "ordinary") continue;
+        const expected = ["my time zone", "timezone", "user_tz", "time-zone"].includes(subject) ? "user_tz" : "<key>";
+        expect(answer.example?.key, `${cue} ${subject}`).toBe(expected);
+      }
+    }
+  });
+
+});

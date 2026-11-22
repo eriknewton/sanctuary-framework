@@ -1914,7 +1914,8 @@
       "type": "object",
       "properties": {
         "intent": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 4096
         }
       },
       "required": [

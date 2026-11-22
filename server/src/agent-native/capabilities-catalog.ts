@@ -46,7 +46,7 @@ export interface CapabilityEntry {
 export const COOPERATIVE_CAPABILITIES: readonly CapabilityEntry[] = [
   {
     tool: COOPERATIVE_TOOL_NAMES.help,
-    does: "Classifies a free-text intent and returns which Sanctuary tool to use, with a runnable example for ordinary requests; evaluation questions (what this protects, the bounds, which platforms, how to verify, how to uninstall) route to the read-only posture tools or to the CLI command that answers.",
+    does: "Classifies a free-text intent and returns which Sanctuary tool to use, with an argument template for ordinary requests; evaluation questions (what this protects, the bounds, which platforms, how to verify, how to uninstall) route to the read-only posture tools or to the CLI command that answers.",
     when: "You are unsure which tool fits, or you are deciding whether to install or keep this server. Ask here first before acting.",
   },
   {
@@ -231,7 +231,7 @@ export interface EvaluateRoute {
  * `classifyIntent` consults EVALUATE_ROUTES before the ordinary memory
  * routes, but only over a bare read/get verb: any other memory verb
  * (remember, store, save, recall, lookup; the sets in
- * MEMORY_VERBS, `cooperative-surface.ts`) outranks the noun, so "remember
+ * MEMORY_VERBS, which must match the yielding rule in `intent-classifier.ts`) outranks the noun, so "remember
  * platform=linux" and "recall my bounds note" stay memory intents while
  * "read the bounds" is a bounds question. "protected" is deliberately absent:
  * it is an adjective about the agent's own data ("read my protected key"), not
@@ -268,7 +268,7 @@ export const EVALUATE_NOUNS = new RegExp(`\\b(${EVALUATE_NOUN_WORDS.join("|")})\
 
 /**
  * Evaluate-intent routing table, consumed by `classifyIntent` in
- * `cooperative-surface.ts`. Ordered from the most specific question to the
+ * `intent-classifier.ts`; its evaluate states must match this table. Ordered from the most specific question to the
  * broadest so "how do I verify the install" lands on `verify`, not on
  * `install_decision`. Every route is read-only or CLI guidance: nothing here
  * can mutate state. A runnable example is offered only where the tool runs
