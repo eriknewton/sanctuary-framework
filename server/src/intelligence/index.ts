@@ -380,3 +380,6 @@ export type {
   IntelligenceSubstrateFailurePayload,
   IntelligenceSubstrateInvokedPayload,
 } from "../contracts/v1.2/intelligence-events.js";
+
+export { isLoopbackOllamaEndpoint, resolveLoopbackConnectTarget, type LoopbackConnectTarget, type LoopbackTargetResult } from "./loopback-endpoint.js";
+export { SensitiveGenerationClient, STREAM_LINE_MAX_BYTES, STREAM_FINAL_LINE_MAX_BYTES, STREAM_TOTAL_MAX_BYTES, LOCAL_CALL_TIMEOUT_MS, TAGS_RESPONSE_MAX_BYTES, type SensitiveGenerationResult, type SensitiveTagsResult, type SensitiveGenerateRequest, type SensitiveGenerationRefusal } from "./sensitive-generation-client.js";
