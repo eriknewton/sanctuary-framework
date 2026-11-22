@@ -288,7 +288,7 @@ export class LocalOplog {
     this.key.fill(0);
   }
 
-  /** Create genesis, anchor and head when absent; otherwise check the head authenticates and names the last row. */
+  /** Create genesis, anchor and head when absent; otherwise check the head authenticates and names the last row, and the anchor authenticates. */
   async ensure(): Promise<"created" | "verified"> {
     return this.locked(async () => {
       const existing = await this.readControl(HEAD_KEY);
@@ -296,11 +296,17 @@ export class LocalOplog {
         const head = validateHead(existing);
         const last = await this.readRow(head.seq);
         if (last === null || rowHash(last.row) !== head.row_hash) throw new LocalStoreError("invalid_record");
+        // Every later append prunes from the anchor, so a head without an authenticating anchor refuses at boot.
+        const anchor = await this.readControl(ANCHOR_KEY);
+        if (anchor === null) throw new LocalStoreError("invalid_record");
+        validateAnchor(anchor);
         return "verified";
       }
       // A store with rows or an anchor but no head is damaged, never re-initialized over.
       if ((await this.readControl(ANCHOR_KEY)) !== null) throw new LocalStoreError("invalid_record");
       let genesis = await this.readRow(0);
+      // Only an interrupted first boot leaves genesis without a head; a genesis with a successor lost its head.
+      if (genesis !== null && (await this.readRow(1)) !== null) throw new LocalStoreError("invalid_record");
       if (genesis === null) {
         const row = validateOplogRow({ seq: 0, prev_hash: OPLOG_GENESIS_PREV_HASH, at: this.clock(), kind: "genesis", body: {} });
         genesis = { row, bytes: await this.publishRow(row) };
@@ -342,10 +348,15 @@ export class LocalOplog {
       let expectedBytes = head.total_bytes;
       const intentValue = await this.readControl(PRUNE_INTENT_KEY);
       if (intentValue !== null) {
-        // An interrupted prune has already moved the anchor; the rows it names are leaving.
         const intent = validateIntent(intentValue);
-        if (head.base_seq === intent.from_seq) expectedBytes -= intent.removed_bytes;
-        base = intent.to_seq;
+        // state_PRUNE_INTENDED: the intent is durable but neither the anchor nor the head has moved, so
+        // every row from the old base is still present. Otherwise (state_PRUNE_ANCHORED) the anchor names
+        // to_seq and the rows before it are leaving.
+        const intended = head.base_seq === intent.from_seq && anchor.base_seq === intent.from_seq;
+        if (!intended) {
+          if (head.base_seq === intent.from_seq) expectedBytes -= intent.removed_bytes;
+          base = intent.to_seq;
+        }
       }
       if (anchor.base_seq !== base) return { ok: false, seq: base, reason: "anchor" };
       let previous = anchor.base_prev_hash;
