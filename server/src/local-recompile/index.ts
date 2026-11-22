@@ -1,6 +1,7 @@
 /**
- * Local recompile: the operator log, the results store and (in a later
- * slice) the job worker. This slice registers no MCP tool.
+ * Local recompile: the operator log, the results store and the job worker
+ * client. This slice registers no MCP tool. The worker entry itself is a
+ * build root (dist/local-recompile-worker.js), never re-exported here.
  */
 export {
   LOCAL_OPLOG_PURPOSE,
@@ -49,3 +50,18 @@ export {
   type LocalResultState,
 } from "./results-store.js";
 export { ensureLocalStores, type EnsureLocalStoresResult } from "./ensure-stores.js";
+export {
+  IPC_MESSAGE_MAX_BYTES,
+  WORKER_ENV_NAMES,
+  WORKER_FAULT_KINDS,
+  WORKER_HEAP_MAX_MB,
+  WORKER_READY_TIMEOUT_MS,
+  WORKER_RESPAWN_INITIAL_MS,
+  WORKER_RESPAWN_MAX_MS,
+  WORKER_STATES,
+  type ParentMessage,
+  type WorkerFaultKind,
+  type WorkerMessage,
+  type WorkerState,
+} from "./worker-protocol.js";
+export { LocalWorkerClient, type LocalWorkerClientOptions, type WorkerClientEvent } from "./worker-client.js";
