@@ -98,18 +98,22 @@ export class LocalWorkerClient {
     }
     this.storageRoot = options.storageRoot;
     // Required, exactly 32 bytes each, copied so the caller can zero its own.
-    this.oplogKey = copyStoreKey(options.oplogKey);
-    this.resultsKey = copyStoreKey(options.resultsKey);
-    // The init every spawn sends is checked against the shared schema once here, so a root the
-    // worker would refuse fails at construction instead of driving a respawn loop.
+    let oplogKey: Uint8Array | undefined;
+    let resultsKey: Uint8Array | undefined;
     try {
-      assertSendable("to_worker", this.initMessage(this.oplogKey, this.resultsKey));
+      oplogKey = copyStoreKey(options.oplogKey);
+      resultsKey = copyStoreKey(options.resultsKey);
+      // The init every spawn sends is checked against the shared schema once here, so a root the
+      // worker would refuse fails at construction instead of driving a respawn loop.
+      assertSendable("to_worker", this.initMessage(oplogKey, resultsKey));
     } catch (error) {
-      // A refused construction keeps no key material: both copies are zeroed before the refusal.
-      this.oplogKey.fill(0);
-      this.resultsKey.fill(0);
+      // A refused construction keeps no key material: every copy made so far is zeroed before the refusal.
+      oplogKey?.fill(0);
+      resultsKey?.fill(0);
       throw error;
     }
+    this.oplogKey = oplogKey;
+    this.resultsKey = resultsKey;
     this.timers = options.timers ?? realTimers;
     this.spawnWorker = options.spawn ?? fork;
     this.onEvent = options.onEvent ?? (() => undefined);

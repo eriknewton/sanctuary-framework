@@ -371,11 +371,13 @@ interface GatedRecord {
   triggers: string[];
   duplicateInitKeysZeroed: boolean | null;
   sweepCallsDuringTicks: number;
+  lateInitKeysZeroed: boolean | null;
 }
 
 /** Fork the real worker under the gated fixture (`__fixtures__/worker-gated-child.ts`); its record is read after exit. */
 async function gatedWorker(mode: string) {
   const { base, keys, storageRoot } = await fortress();
+  const notADirectory = join(base, "plain-file");
   const { execArgv } = resolveWorkerModule();
   const resultFile = join(base, "gated-record.json");
   // The same environment the client hands its worker, so the status reply fits the shared schema.
@@ -397,6 +399,11 @@ async function gatedWorker(mode: string) {
       return (await log.verifyChain()).ok;
     },
     init: () => child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey }),
+    /** An init whose stores cannot open, so the worker faults with store_open. */
+    failingInit: async () => {
+      await writeFile(notADirectory, "not a fortress");
+      child.send({ type: "init", storage_root: join(notADirectory, "state"), oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    },
     /** The fixture's record and the exit code, once the child has exited. */
     record: async (): Promise<GatedRecord & { exitCode: number | null }> => {
       const [exitCode] = (await exited) as [number | null];
@@ -445,6 +452,39 @@ describe("local job worker terminal states", () => {
     expect(record.sent).toEqual([{ type: "ready", after: [] }]);
     expect(record.exitCode).toBe(0);
     expect(await worker.reopen()).toBe(true);
+  }, 60_000);
+
+  it("an init that arrives after a shutdown is ignored and its key bytes are zeroed", async () => {
+    const worker = await gatedWorker("init-after-shutdown");
+    const ready = nextMessage(worker.child, (message) => message.type === "ready");
+    worker.init();
+    await ready;
+    worker.child.send({ type: "shutdown" });
+    const record = await worker.record();
+    expect(record.lateInitKeysZeroed).toBe(true);
+    expect(record.sent.filter((message) => message.after.includes("shutdown"))).toEqual([]);
+    expect(record.exitCode).toBe(0);
+  }, 60_000);
+
+  it("an init that arrives after a fault is ignored and its key bytes are zeroed", async () => {
+    const worker = await gatedWorker("init-after-fault");
+    const faulted = nextMessage(worker.child, (message) => message.type === "fault");
+    await worker.failingInit();
+    expect(await faulted).toEqual({ type: "fault", kind: "store_open" });
+    const record = await worker.record();
+    expect(record.lateInitKeysZeroed).toBe(true);
+    expect(record.sent).toEqual([{ type: "fault", after: [] }]);
+    expect(record.exitCode).toBe(1);
+  }, 60_000);
+
+  it("a shutdown that arrives after the parent disconnected still ends with exit code 0", async () => {
+    const worker = await gatedWorker("shutdown-after-disconnect");
+    const swept = nextMessage(worker.child, (message) => message.type === "status");
+    worker.init();
+    await swept;
+    worker.child.disconnect();
+    const record = await worker.record();
+    expect(record.exitCode).toBe(0);
   }, 60_000);
 
   it("a housekeeping tick that finds a sweep running skips instead of starting a second", async () => {
@@ -697,6 +737,22 @@ describe("local job worker client protocol states", () => {
       expect(zeroed).toHaveLength(2);
       expect((zeroed as Uint8Array[]).every((key) => key.every((byte) => byte === 0))).toBe(true);
       // The caller's own keys are untouched.
+      expect(keys.oplogKey.some((byte) => byte !== 0)).toBe(true);
+    } finally {
+      fill.mockRestore();
+    }
+  });
+
+  it("a refused second key zeroes the copy already made of the first", async () => {
+    const { keys } = await fortress();
+    const SHORT_KEY_BYTES = 16; // half an AES-256 key, refused by the key copy
+    const fill = vi.spyOn(Uint8Array.prototype, "fill");
+    try {
+      expect(() => new LocalWorkerClient({ storageRoot: "/fixture", oplogKey: keys.oplogKey, resultsKey: new Uint8Array(SHORT_KEY_BYTES), spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow();
+      const zeroed = fill.mock.contexts.filter((target, index) => (target as Uint8Array).length === STORE_KEY_BYTES && fill.mock.calls[index]![0] === 0);
+      expect(zeroed).toHaveLength(1);
+      expect(zeroed[0] as Uint8Array).not.toBe(keys.oplogKey);
+      expect((zeroed[0] as Uint8Array).every((byte) => byte === 0)).toBe(true);
       expect(keys.oplogKey.some((byte) => byte !== 0)).toBe(true);
     } finally {
       fill.mockRestore();

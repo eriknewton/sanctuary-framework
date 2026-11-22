@@ -64,7 +64,9 @@ function closeStores(): void {
 function stop(): void {
   state = "state_DEAD";
   closeStores();
-  process.disconnect?.();
+  // A channel the parent already closed is not disconnected again: Node reports that as an error,
+  // which would turn a clean shutdown into an uncaught failure.
+  if (process.connected) process.disconnect?.();
 }
 
 function fault(kind: WorkerFaultKind): void {
