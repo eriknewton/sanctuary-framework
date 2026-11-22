@@ -48,6 +48,24 @@ function edges(source: string): Edge[] {
       const argument = node.arguments[0];
       found.push({ specifier: argument && ts.isStringLiteral(argument) ? argument.text : "<computed>", dynamic: true });
     }
+    // `import x = require("...")` is a static edge like an import declaration.
+    if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference) &&
+      ts.isStringLiteral(node.moduleReference.expression)) {
+      found.push({ specifier: node.moduleReference.expression.text, dynamic: false });
+    }
+    // A require built by createRequire can load any module. Only the form that resolves a path and
+    // loads nothing, createRequire(...).resolve(...), is not an edge.
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "createRequire") {
+      const parent = node.parent;
+      const resolvesOnly = ts.isPropertyAccessExpression(parent) && parent.expression === node && parent.name.text === "resolve" &&
+        ts.isCallExpression(parent.parent) && parent.parent.expression === parent;
+      if (!resolvesOnly) found.push({ specifier: "<createRequire>", dynamic: true });
+    }
+    // process.getBuiltinModule loads a module by a runtime name.
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "getBuiltinModule") {
+      const argument = node.arguments[0];
+      found.push({ specifier: argument && ts.isStringLiteral(argument) ? argument.text : "<computed>", dynamic: true });
+    }
     ts.forEachChild(node, visit);
   }
   visit(tree);
@@ -99,5 +117,20 @@ describe("local job worker import graph", () => {
         { specifier: "./c.js", dynamic: true },
         { specifier: "./d.js", dynamic: true },
       ]);
+  });
+
+  it("the parser sees createRequire loaders, getBuiltinModule and import-equals, and allows a resolve-only createRequire", () => {
+    expect(edges([
+      'import x = require("./f.js");',
+      "const load = createRequire(import.meta.url); load(name);",
+      'createRequire(import.meta.url)("./g.js");',
+      'process.getBuiltinModule("node:fs");',
+      'const path = createRequire(import.meta.url).resolve("tsx");',
+    ].join("\n"))).toEqual([
+      { specifier: "./f.js", dynamic: false },
+      { specifier: "<createRequire>", dynamic: true },
+      { specifier: "<createRequire>", dynamic: true },
+      { specifier: "node:fs", dynamic: true },
+    ]);
   });
 });

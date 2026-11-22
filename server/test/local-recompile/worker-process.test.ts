@@ -13,6 +13,7 @@ import {
   IPC_MESSAGE_MAX_BYTES,
   WORKER_ENV_NAMES,
   WORKER_HEAP_MAX_MB,
+  WORKER_READY_TIMEOUT_MS,
   WORKER_RESPAWN_INITIAL_MS,
   WORKER_RESPAWN_MAX_MS,
   assertSendable,
@@ -31,9 +32,18 @@ const WORKER_EVENT_TIMEOUT_MS = 30_000;
 const cleanups: Array<() => Promise<void> | void> = [];
 const children = new Set<ChildProcess>();
 afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-  for (const child of children) await reap(child);
+  // Children are reaped before their temp directories are removed, and every step runs even when one throws.
+  const failures: unknown[] = [];
+  const steps = [...[...children].map((child) => () => reap(child)), ...cleanups.splice(0).reverse()];
   children.clear();
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw failures[0];
 });
 
 async function reap(child: ChildProcess): Promise<void> {
@@ -67,8 +77,9 @@ async function fortress() {
 }
 
 /** Real fork that records every child and every message the client sends it. */
-function recordingSpawn(sent: unknown[][]) {
+function recordingSpawn(sent: unknown[][], spawnOptions: ForkOptions[] = []) {
   return (modulePath: string, args: string[], options: ForkOptions): ChildProcess => {
+    spawnOptions.push(options);
     const child = fork(modulePath, args, options);
     children.add(child);
     const messages: unknown[] = [];
@@ -95,13 +106,13 @@ function nextEvent(events: EventEmitter, predicate: (event: WorkerClientEvent) =
   });
 }
 
-function startClient(storageRoot: string, keys: { oplogKey: Uint8Array; resultsKey: Uint8Array }, extra: { timers?: WorkerTimers; sent?: unknown[][] } = {}) {
+function startClient(storageRoot: string, keys: { oplogKey: Uint8Array; resultsKey: Uint8Array }, extra: { timers?: WorkerTimers; sent?: unknown[][]; spawnOptions?: ForkOptions[] } = {}) {
   const events = new EventEmitter();
   const client = new LocalWorkerClient({
     storageRoot,
     oplogKey: keys.oplogKey,
     resultsKey: keys.resultsKey,
-    spawn: recordingSpawn(extra.sent ?? []),
+    spawn: recordingSpawn(extra.sent ?? [], extra.spawnOptions),
     onEvent: (event) => events.emit("event", event),
     ...(extra.timers ? { timers: extra.timers } : {}),
   });
@@ -124,11 +135,22 @@ describe("local job worker process", () => {
     process.env.HTTPS_PROXY = "http://127.0.0.1:9";
     process.env.NODE_USE_ENV_PROXY = "1";
     try {
-      const { client, events } = startClient(storageRoot, keys);
+      const spawnOptions: ForkOptions[] = [];
+      const { client, events } = startClient(storageRoot, keys, { spawnOptions });
       const status = nextEvent(events, (event) => event.type === "status");
       client.start();
       const event = (await status) as Extract<WorkerClientEvent, { type: "status" }>;
-      expect(event.status.env_names.filter((name) => !(WORKER_ENV_NAMES as readonly string[]).includes(name))).toEqual([]);
+      // The allowlist is pinned here as a literal, so widening it cannot pass by moving the constant.
+      const allowed = ["PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL"];
+      expect([...WORKER_ENV_NAMES]).toEqual(allowed);
+      // The environment the client hands to fork holds only allowlisted names.
+      expect(Object.keys(spawnOptions[0]!.env ?? {}).filter((name) => !allowed.includes(name))).toEqual([]);
+      // macOS adds its text-encoding variable to every new process itself; it is not inherited from the server.
+      const osAdded = process.platform === "darwin" ? ["__CF_USER_TEXT_ENCODING"] : [];
+      expect(event.status.env_names.filter((name) => !allowed.includes(name) && !osAdded.includes(name))).toEqual([]);
+      for (const injected of ["SANCTUARY_AGENT_ID", "HTTP_PROXY", "HTTPS_PROXY", "NODE_USE_ENV_PROXY"]) {
+        expect(event.status.env_names).not.toContain(injected);
+      }
       expect(event.status.exec_argv).toContain(`--max-old-space-size=${WORKER_HEAP_MAX_MB}`);
       expect(event.status.state).toBe("state_READY");
     } finally {
@@ -165,7 +187,8 @@ describe("local job worker process", () => {
   it("a malformed message is ignored and counted", async () => {
     const { keys } = await fortress();
     const fake = new FakeChild();
-    const client = new LocalWorkerClient({ storageRoot: "/fixture", ...keys, spawn: () => fake as unknown as ChildProcess, timers: manualTimers().timers });
+    const clock = manualTimers();
+    const client = new LocalWorkerClient({ storageRoot: "/fixture", ...keys, spawn: () => fake as unknown as ChildProcess, timers: clock.timers });
     client.start();
     fake.emit("message", { type: "ready", extra: true });
     fake.emit("message", "not an object");
@@ -174,7 +197,10 @@ describe("local job worker process", () => {
     fake.emit("message", { type: "ready" });
     expect(client.state).toBe("state_READY");
     expect(() => client.send({ type: "bogus" } as never)).toThrow(WorkerProtocolError);
-    await client.close();
+    // The fake ignores shutdown, so close ends through its injected SIGKILL deadline.
+    const closed = client.close();
+    clock.fire(WORKER_READY_TIMEOUT_MS);
+    await closed;
   });
 
   it("the real worker ignores a malformed message and still initialises", async () => {
@@ -291,28 +317,211 @@ describe("local job worker process", () => {
     const { modulePath, execArgv } = resolveWorkerModule();
     const child = fork(modulePath, [], { execArgv, stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
     children.add(child);
+    // The worker exits right after its fault, so the exit wait is attached before anything is sent.
+    const exited = once(child, "exit");
     const reply = once(child, "message");
     child.send({ type: "init", storage_root: join(notADirectory, "state"), oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     const [message] = await reply;
     expect(message).toEqual({ type: "fault", kind: "store_open" });
     expect(keyBuffers(message)).toEqual([]);
-    await once(child, "exit");
+    await exited;
   }, 60_000);
+
+  it("a second init to a running worker faults and the worker exits", async () => {
+    const { keys, storageRoot } = await fortress();
+    const { modulePath, execArgv } = resolveWorkerModule();
+    const child = fork(modulePath, [], { execArgv, stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
+    children.add(child);
+    const exited = once(child, "exit");
+    const reply = once(child, "message");
+    child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    expect((await reply)[0]).toEqual({ type: "fault", kind: "init_invalid" });
+    await exited;
+  }, 60_000);
+});
+
+describe("local job worker client protocol states", () => {
+  async function fakeClient(options: { storageRoot?: string; child?: () => FakeChild } = {}) {
+    const { keys } = await fortress();
+    const fakes: FakeChild[] = [];
+    const clock = manualTimers();
+    const events: WorkerClientEvent[] = [];
+    const client = new LocalWorkerClient({
+      storageRoot: options.storageRoot ?? "/fixture",
+      ...keys,
+      timers: clock.timers,
+      spawn: () => { const child = options.child?.() ?? new FakeChild(); fakes.push(child); return child as unknown as ChildProcess; },
+      onEvent: (event) => events.push(event),
+    });
+    return { client, fakes, clock, events };
+  }
+
+  it("a message over the size cap is refused on receive and counted", async () => {
+    const { client, fakes, events } = await fakeClient();
+    client.start();
+    fakes[0]!.emit("message", { type: "ready" });
+    // Every list item is within the schema's per-item bound; only the serialized total exceeds the cap.
+    const ITEMS = 32;
+    const ITEM_CHARS = 4_000;
+    expect(ITEMS * ITEM_CHARS).toBeGreaterThan(IPC_MESSAGE_MAX_BYTES);
+    fakes[0]!.emit("message", { type: "status", state: "state_READY", env_names: [], exec_argv: Array.from({ length: ITEMS }, () => "x".repeat(ITEM_CHARS)), queue_depth: 0 });
+    expect(client.malformedMessages).toBe(1);
+    expect(events.filter((event) => event.type === "status")).toEqual([]);
+    fakes[0]!.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("a duplicate ready is refused and counted and leaves one backoff-reset timer", async () => {
+    const { client, fakes, clock, events } = await fakeClient();
+    client.start();
+    fakes[0]!.emit("message", { type: "ready" });
+    fakes[0]!.emit("message", { type: "ready" });
+    expect(client.malformedMessages).toBe(1);
+    expect(events.filter((event) => event.type === "state" && event.state === "state_READY")).toHaveLength(1);
+    expect(clock.count(WORKER_RESPAWN_MAX_MS)).toBe(1);
+    fakes[0]!.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("a ready that arrives after close began is ignored and nothing is sent during close", async () => {
+    const { client, fakes, clock } = await fakeClient();
+    client.start();
+    const closing = client.close();
+    fakes[0]!.emit("message", { type: "ready" });
+    expect(client.state).toBe("state_SPAWNING");
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    clock.fire(WORKER_READY_TIMEOUT_MS);
+    await closing;
+    expect(client.state).toBe("state_CLOSED");
+    expect(clock.count(WORKER_RESPAWN_MAX_MS)).toBe(0);
+  });
+
+  it("send refuses while a ready worker is being closed", async () => {
+    const { client, fakes, clock } = await fakeClient();
+    client.start();
+    fakes[0]!.emit("message", { type: "ready" });
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    const closing = client.close();
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    clock.fire(WORKER_READY_TIMEOUT_MS);
+    await closing;
+  });
+
+  it("a faulted worker receives nothing more and is killed so it respawns", async () => {
+    const { client, fakes, events } = await fakeClient();
+    client.start();
+    fakes[0]!.emit("message", { type: "ready" });
+    fakes[0]!.emit("message", { type: "fault", kind: "housekeeping" });
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    expect(fakes[0]!.signalCode).toBe("SIGKILL");
+    expect(events.some((event) => event.type === "respawn_scheduled")).toBe(true);
+    await client.close();
+  });
+
+  it("a storage root the worker would refuse is refused at construction", async () => {
+    const { keys } = await fortress();
+    expect(() => new LocalWorkerClient({ storageRoot: "relative/state", ...keys, spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow(WorkerProtocolError);
+  });
+
+  it("a backlogged channel refuses sends until that write is delivered, and an error never clears it", async () => {
+    const { client, fakes } = await fakeClient();
+    client.start();
+    const fake = fakes[0]!;
+    fake.emit("message", { type: "ready" });
+    fake.hold = true;
+    fake.sendResult = false;
+    // Node queued this write behind a backlog: it was taken, and the next send refuses.
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    fake.flush(new Error("fixture channel error"));
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    fake.sendResult = true;
+    fake.hold = false;
+    fake.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("a backlog clears when the write that raised it is delivered", async () => {
+    const { client, fakes } = await fakeClient();
+    client.start();
+    const fake = fakes[0]!;
+    fake.emit("message", { type: "ready" });
+    fake.hold = true;
+    fake.sendResult = false;
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    expect(client.send({ type: "shutdown" })).toBe(false);
+    fake.sendResult = true;
+    fake.flush(null);
+    expect(client.send({ type: "shutdown" })).toBe(true);
+    fake.hold = false;
+    fake.kill("SIGKILL");
+    await client.close();
+  });
+
+  it("a worker that never becomes ready is killed at the deadline and a late ready from it is ignored", async () => {
+    const { client, fakes, clock } = await fakeClient();
+    client.start();
+    clock.fire(WORKER_READY_TIMEOUT_MS);
+    expect(fakes[0]!.signalCode).toBe("SIGKILL");
+    expect(client.state).toBe("state_BACKOFF");
+    fakes[0]!.emit("message", { type: "ready" });
+    expect(client.state).toBe("state_BACKOFF");
+    await client.close();
+  });
+
+  it("close resolves for a spawn that failed and never emits exit", async () => {
+    const { client } = await fakeClient({ child: () => new FakeChild({ pid: undefined }) });
+    client.start();
+    const SETTLE_MS = 1_000; // far longer than an immediate resolution, far shorter than the kill deadline
+    const outcome = await Promise.race([client.close().then(() => "closed"), new Promise((resolve) => setTimeout(() => resolve("pending"), SETTLE_MS))]);
+    expect(outcome).toBe("closed");
+  });
+
+  it("close force-kills an unresponsive worker through the injected deadline", async () => {
+    const { client, fakes, clock } = await fakeClient();
+    client.start();
+    fakes[0]!.emit("message", { type: "ready" });
+    let closed = false;
+    const closing = client.close().then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    clock.fire(WORKER_READY_TIMEOUT_MS);
+    const SETTLE_MS = 1_000; // far longer than the fake's synchronous exit, far shorter than the kill deadline
+    await Promise.race([closing, new Promise((resolve) => setTimeout(resolve, SETTLE_MS))]);
+    expect(fakes[0]!.signalCode).toBe("SIGKILL");
+    expect(closed).toBe(true);
+  });
 });
 
 class FakeChild extends EventEmitter {
   static nextPid = 1_000_000;
-  readonly pid = FakeChild.nextPid++;
+  readonly pid: number | undefined;
   connected = true;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   readonly sent: unknown[] = [];
   readonly channel = { unref: () => undefined };
-  send(message: unknown, callback?: () => void): boolean {
+  /** What send returns; false models Node queueing behind a backlog. */
+  sendResult = true;
+  /** When set, delivery callbacks wait for flush instead of running at once. */
+  hold = false;
+  private readonly held: Array<(error: Error | null) => void> = [];
+  constructor(options: { pid?: number | undefined } = { pid: FakeChild.nextPid }) {
+    super();
+    this.pid = "pid" in options ? options.pid : FakeChild.nextPid;
+    FakeChild.nextPid += 1;
+  }
+  send(message: unknown, callback?: (error: Error | null) => void): boolean {
     // The IPC channel serializes at send time, so the fake records a copy.
     this.sent.push(structuredClone(message));
-    callback?.();
-    return true;
+    if (callback && this.hold) this.held.push(callback);
+    else callback?.(null);
+    return this.sendResult;
+  }
+  /** Deliver every held write with this outcome. */
+  flush(error: Error | null): void {
+    for (const callback of this.held.splice(0)) callback(error);
   }
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
     if (this.exitCode !== null || this.signalCode !== null) return false;
@@ -338,6 +547,9 @@ function manualTimers() {
   };
   return {
     timers,
+    count(ms: number): number {
+      return [...pending.values()].filter((timer) => timer.ms === ms).length;
+    },
     fire(ms: number) {
       for (const [id, timer] of [...pending]) {
         if (timer.ms !== ms) continue;

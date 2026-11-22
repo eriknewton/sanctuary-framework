@@ -144,9 +144,29 @@ export function ipcMessageBytes(message: unknown): number {
   return serialize(message).length;
 }
 
-/** Validate an outgoing message against the shared schema and the size cap; throws before anything is sent. */
+/**
+ * The one gate for both directions, on send and on receive: the shared schema
+ * and the serialized size cap. Null for anything outside either. Must match
+ * the receive handling in worker-client.ts and worker-entry.ts, which call
+ * this rather than the parse functions directly.
+ */
+export function acceptMessage(direction: "to_worker", value: unknown): ParentMessage | null;
+export function acceptMessage(direction: "to_parent", value: unknown): WorkerMessage | null;
+export function acceptMessage(direction: "to_worker" | "to_parent", value: unknown): ParentMessage | WorkerMessage | null {
+  const parsed = direction === "to_worker" ? parseParentMessage(value) : parseWorkerMessage(value);
+  if (parsed === null) return null;
+  let bytes: number;
+  try {
+    bytes = ipcMessageBytes(value);
+  } catch {
+    return null;
+  }
+  // The cap is measured on the serialized bytes, the same measure on both sides, so neither side accepts more than the other sends.
+  return bytes <= IPC_MESSAGE_MAX_BYTES ? parsed : null;
+}
+
+/** Validate an outgoing message through acceptMessage; throws before anything is sent. */
 export function assertSendable(direction: "to_worker" | "to_parent", message: unknown): void {
-  const parsed = direction === "to_worker" ? parseParentMessage(message) : parseWorkerMessage(message);
-  // The cap is measured on the serialized bytes, so no message can grow the channel past it.
-  if (parsed === null || ipcMessageBytes(message) > IPC_MESSAGE_MAX_BYTES) throw new WorkerProtocolError();
+  const accepted = direction === "to_worker" ? acceptMessage(direction, message) : acceptMessage(direction, message);
+  if (accepted === null) throw new WorkerProtocolError();
 }

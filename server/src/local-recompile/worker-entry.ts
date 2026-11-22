@@ -12,8 +12,8 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { LocalOplog } from "./oplog.js";
 import { HOUSEKEEPING_INTERVAL_MS, LocalResultsStore } from "./results-store.js";
 import {
+  acceptMessage,
   assertSendable,
-  parseParentMessage,
   type WorkerFaultKind,
   type WorkerMessage,
   type WorkerState,
@@ -23,6 +23,7 @@ let state: WorkerState = "state_SPAWNING";
 let oplog: LocalOplog | undefined;
 let results: LocalResultsStore | undefined;
 let housekeeping: ReturnType<typeof setInterval> | undefined;
+let sweeping = false;
 let malformed = 0;
 
 function send(message: WorkerMessage): void {
@@ -62,16 +63,24 @@ function fault(kind: WorkerFaultKind): void {
 }
 
 async function sweep(): Promise<void> {
+  // One sweep at a time: a tick that finds one running skips rather than queueing behind its lock.
+  if (sweeping) return;
+  sweeping = true;
   try {
     await results?.sweep();
     send(status());
   } catch {
     fault("housekeeping");
+  } finally {
+    sweeping = false;
   }
 }
 
 async function init(storageRoot: string, oplogKey: Uint8Array, resultsKey: Uint8Array): Promise<void> {
   if (oplog !== undefined) {
+    // A second init's key bytes are zeroed before the fault, the same as the first's.
+    oplogKey.fill(0);
+    resultsKey.fill(0);
     fault("init_invalid");
     return;
   }
@@ -98,8 +107,8 @@ async function init(storageRoot: string, oplogKey: Uint8Array, resultsKey: Uint8
 }
 
 process.on("message", (raw: unknown) => {
-  const message = parseParentMessage(raw);
-  // A message outside the schema is ignored and counted, never interpreted.
+  const message = acceptMessage("to_worker", raw);
+  // A message outside the schema or the size cap is ignored and counted, never interpreted.
   if (message === null) {
     malformed += 1;
     return;

@@ -17,8 +17,8 @@ import {
   WORKER_READY_TIMEOUT_MS,
   WORKER_RESPAWN_INITIAL_MS,
   WORKER_RESPAWN_MAX_MS,
+  acceptMessage,
   assertSendable,
-  parseWorkerMessage,
   type ParentMessage,
   type WorkerFaultKind,
   type WorkerMessage,
@@ -83,7 +83,12 @@ export class LocalWorkerClient {
   private readyTimer: unknown;
   private stableTimer: unknown;
   private respawnTimer: unknown;
+  /** The child that sent an accepted `ready` and has not faulted, exited or been closed; the only one `send` writes to. */
+  private readyChild: ChildProcess | undefined;
   private backlogged = false;
+  /** Identifies the write whose queued delivery clears the backlog; earlier deliveries never do. */
+  private backlogWrite = 0;
+  private writes = 0;
   private closing = false;
   malformedMessages = 0;
 
@@ -95,6 +100,9 @@ export class LocalWorkerClient {
     // Required, exactly 32 bytes each, copied so the caller can zero its own.
     this.oplogKey = copyStoreKey(options.oplogKey);
     this.resultsKey = copyStoreKey(options.resultsKey);
+    // The init every spawn sends is checked against the shared schema once here, so a root the
+    // worker would refuse fails at construction instead of driving a respawn loop.
+    assertSendable("to_worker", this.initMessage(this.oplogKey, this.resultsKey));
     this.timers = options.timers ?? realTimers;
     this.spawnWorker = options.spawn ?? fork;
     this.onEvent = options.onEvent ?? (() => undefined);
@@ -121,41 +129,61 @@ export class LocalWorkerClient {
   send(message: ParentMessage): boolean {
     assertSendable("to_worker", message);
     const child = this.child;
-    if (this.currentState !== "state_READY" || child === undefined || !child.connected || this.backlogged) return false;
+    // Only the ready child that has not faulted receives work, and nothing is sent once close begins.
+    if (this.closing || this.currentState !== "state_READY" || child === undefined || child !== this.readyChild) return false;
+    if (!child.connected || this.backlogged) return false;
     return this.write(child, message);
   }
 
   /** Ask the worker to stop, then SIGKILL after WORKER_READY_TIMEOUT_MS; resolves once it has exited. */
   async close(): Promise<void> {
     this.closing = true;
+    this.readyChild = undefined;
     for (const timer of [this.readyTimer, this.stableTimer, this.respawnTimer]) {
       if (timer !== undefined) this.timers.clearTimeout(timer);
     }
     this.readyTimer = this.stableTimer = this.respawnTimer = undefined;
     const child = this.child;
-    if (child !== undefined && child.exitCode === null && child.signalCode === null) {
+    // A spawn that failed has no pid and may never emit exit; there is no process to wait for.
+    if (child !== undefined && child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
       const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
       if (child.connected) this.write(child, { type: "shutdown" });
-      const kill = setTimeout(() => child.kill("SIGKILL"), WORKER_READY_TIMEOUT_MS);
+      // SIGKILL guarantees the exit this waits for; the injected timers bound it like every other deadline here.
+      const kill = this.timers.setTimeout(() => child.kill("SIGKILL"), WORKER_READY_TIMEOUT_MS);
       await exited;
-      clearTimeout(kill);
+      this.timers.clearTimeout(kill);
     }
     this.oplogKey.fill(0);
     this.resultsKey.fill(0);
     this.setState("state_CLOSED");
   }
 
+  /**
+   * True when Node took the message: it was written or queued. A closed
+   * channel queues nothing and reads false. When Node queues behind a backlog,
+   * further sends refuse until this write is delivered to the same child.
+   */
   private write(child: ChildProcess, message: ParentMessage): boolean {
+    if (!child.connected) return false;
+    const id = (this.writes += 1);
     let accepted = false;
     try {
-      accepted = child.send(message, () => {
-        this.backlogged = false;
+      accepted = child.send(message, (error: Error | null) => {
+        // Only a delivered write, to the current child, that raised the backlog clears it.
+        if (error == null && child === this.child && id === this.backlogWrite) this.backlogged = false;
       });
     } catch {
       return false;
     }
-    if (!accepted) this.backlogged = true;
+    if (!accepted) {
+      this.backlogged = true;
+      this.backlogWrite = id;
+    }
     return true;
+  }
+
+  private initMessage(oplogKey: Uint8Array, resultsKey: Uint8Array): ParentMessage {
+    return { type: "init", storage_root: this.storageRoot, oplog_key: oplogKey, results_key: resultsKey };
   }
 
   private setState(state: WorkerState | "state_CLOSED"): void {
@@ -179,6 +207,7 @@ export class LocalWorkerClient {
       serialization: "advanced",
     });
     this.child = child;
+    this.readyChild = undefined;
     this.backlogged = false;
     this.setState("state_SPAWNING");
     // The worker never keeps the server alive.
@@ -199,7 +228,9 @@ export class LocalWorkerClient {
     const resultsKey = Uint8Array.from(this.resultsKey);
     try {
       // Keys are re-sent on every spawn, then the transient copies are zeroed.
-      this.write(child, { type: "init", storage_root: this.storageRoot, oplog_key: oplogKey, results_key: resultsKey });
+      const init = this.initMessage(oplogKey, resultsKey);
+      assertSendable("to_worker", init);
+      this.write(child, init);
     } finally {
       oplogKey.fill(0);
       resultsKey.fill(0);
@@ -207,15 +238,23 @@ export class LocalWorkerClient {
   }
 
   private onMessage(child: ChildProcess, raw: unknown): void {
-    if (child !== this.child) return;
-    const message = parseWorkerMessage(raw);
+    // A superseded child, or any child once close has begun, is not listened to.
+    if (child !== this.child || this.closing) return;
+    // Received messages pass the same schema and size cap as sent ones.
+    const message = acceptMessage("to_parent", raw);
     if (message === null) {
       this.malformedMessages += 1;
       return;
     }
     if (message.type === "ready") {
+      // state_SPAWNING is the only state a ready moves on from; a duplicate is refused and counted.
+      if (this.currentState !== "state_SPAWNING") {
+        this.malformedMessages += 1;
+        return;
+      }
       if (this.readyTimer !== undefined) this.timers.clearTimeout(this.readyTimer);
       this.readyTimer = undefined;
+      this.readyChild = child;
       this.setState("state_READY");
       this.stableTimer = this.timers.setTimeout(() => {
         this.backoffMs = WORKER_RESPAWN_INITIAL_MS;
@@ -223,12 +262,16 @@ export class LocalWorkerClient {
     } else if (message.type === "status") {
       this.onEvent({ type: "status", status: message });
     } else {
+      // A faulted worker gets no more work and is killed, so its exit drives the usual respawn.
+      this.readyChild = undefined;
       this.onEvent({ type: "fault", kind: message.kind });
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
   }
 
   private onExit(child: ChildProcess): void {
     if (child !== this.child) return;
+    this.readyChild = undefined;
     for (const timer of [this.readyTimer, this.stableTimer]) {
       if (timer !== undefined) this.timers.clearTimeout(timer);
     }
