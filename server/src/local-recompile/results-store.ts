@@ -5,6 +5,15 @@
  * inside the results lock before its effect.
  *
  * Records: `obj/<request_id>` and `index`.
+ *
+ * Crash consistency, under a crash at any single write:
+ * - Reachability: every stored object has an index entry. A new entry is
+ *   published before its object, an object is deleted before its entry, and an
+ *   object being replaced keeps its entry in every intermediate index.
+ * - Size: an entry's byte count is never below its object's stored size. A
+ *   replacement that grows the object raises the entry's count first.
+ * - State: the object decides. Housekeeping rewrites an entry that a crash
+ *   left behind its object, and drops an entry whose object is gone.
  */
 import {
   DAY_MS,
@@ -186,7 +195,7 @@ export class LocalResultsStore {
     });
   }
 
-  /** Commit a pending object with its body; an indeterminate or committed object refuses. */
+  /** Commit a pending object with its body; an indeterminate, committed or overdue object refuses. */
   async markCommitted(requestId: string, body: LocalResultBody): Promise<LocalResultObject> {
     const checkedBody = validateBody(body);
     return this.locked(async () => {
@@ -195,6 +204,8 @@ export class LocalResultsStore {
       // A completion that arrives after the object left pending is discarded, never resurrected.
       if (current.state !== "pending") throw new LocalStoreError("conflict");
       const now = this.clock();
+      // Past its deadline plus grace a pending object is indeterminate by rule, whether or not a sweep has run yet.
+      if (now >= current.expires_at) throw new LocalStoreError("conflict");
       const next = validateObject({
         ...current,
         state: "committed",
@@ -203,12 +214,10 @@ export class LocalResultsStore {
         body: checkedBody,
       });
       const bytes = objectBytes(next);
-      const others = entries.filter((entry) => entry.request_id !== requestId);
-      const kept = await this.evictFor(others, bytes, 0);
+      // The committing entry stays in every index evictFor publishes, so its object is never unreachable.
+      const kept = await this.evictFor(entries, bytes, 0, requestId);
       await this.log("result_committed", requestId);
-      await this.writeObject(next, false);
-      kept.push(indexEntry(next, bytes));
-      await this.writeIndex(kept);
+      await this.replaceObject(kept, next, bytes);
       return next;
     });
   }
@@ -280,6 +289,13 @@ export class LocalResultsStore {
           summary.repaired += 1;
           continue;
         }
+        // An entry a crash left behind its object (a raised size, or the old state) is rewritten from the object.
+        const actual = indexEntry(object, objectBytes(object));
+        if (!sameEntry(entry, actual)) {
+          entries = entries.map((candidate) => (candidate.request_id === actual.request_id ? actual : candidate));
+          await this.writeIndex(entries);
+          summary.repaired += 1;
+        }
         if (now < object.expires_at) continue;
         if (object.state === "pending") {
           entries = await this.toIndeterminateEntries(entries, object, now);
@@ -318,27 +334,43 @@ export class LocalResultsStore {
   private async toIndeterminateEntries(entries: IndexEntry[], object: LocalResultObject, now: number): Promise<IndexEntry[]> {
     const next = indeterminateOf(object, now);
     await this.log("result_indeterminate", object.request_id);
+    return this.replaceObject(entries, next, objectBytes(next));
+  }
+
+  /**
+   * Replace one stored object in place: raise its entry's size first when the
+   * object grows, then write the object, then publish the exact entry. A crash
+   * at any of the three writes leaves an index that still reaches the object
+   * and never undercounts it; sweep reconciles the entry from the object.
+   */
+  private async replaceObject(entries: IndexEntry[], next: LocalResultObject, bytes: number): Promise<IndexEntry[]> {
+    const id = next.request_id;
+    const current = entries.find((entry) => entry.request_id === id);
+    if (current === undefined) throw new LocalStoreError("not_found");
+    if (bytes > current.bytes) {
+      await this.writeIndex(entries.map((entry) => (entry.request_id === id ? { ...entry, bytes } : entry)));
+    }
     await this.writeObject(next, false);
-    const updated = entries.map((entry) =>
-      entry.request_id === object.request_id ? indexEntry(next, objectBytes(next)) : entry,
-    );
+    const updated = entries.map((entry) => (entry.request_id === id ? indexEntry(next, bytes) : entry));
     await this.writeIndex(updated);
     return updated;
   }
 
   /**
-   * Make room for one more object of `bytes` (adding `slots` entries).
+   * Make room for one more object of `bytes` (adding `slots` entries). When
+   * `replacing` names an entry, that object is being rewritten at `bytes`: it
+   * keeps its slot, is never a victim, and its old size does not count.
    * Eviction order: pending and indeterminate oldest first, then committed
    * oldest first; each eviction is logged before its delete.
    */
-  private async evictFor(entries: IndexEntry[], bytes: number, slots: number): Promise<IndexEntry[]> {
+  private async evictFor(entries: IndexEntry[], bytes: number, slots: number, replacing?: string): Promise<IndexEntry[]> {
     if (bytes > this.maxTotalBytes) throw new LocalStoreError("capacity");
-    const order = [...entries].sort((left, right) => {
+    const order = entries.filter((entry) => entry.request_id !== replacing).sort((left, right) => {
       const rank = Number(left.state === "committed") - Number(right.state === "committed");
       return rank !== 0 ? rank : left.created_at - right.created_at;
     });
     const kept = [...entries];
-    let total = kept.reduce((sum, entry) => sum + entry.bytes, 0);
+    let total = kept.reduce((sum, entry) => sum + (entry.request_id === replacing ? 0 : entry.bytes), 0);
     for (const victim of order) {
       if (kept.length + slots <= this.maxObjects && total + bytes <= this.maxTotalBytes) break;
       await this.log("result_evicted", victim.request_id);
@@ -422,6 +454,17 @@ function visible(item: { state: LocalResultState }, includeUncommitted: boolean)
 
 function indeterminateOf(object: LocalResultObject, now: number): LocalResultObject {
   return { ...object, state: "indeterminate", state_changed_at: now, expires_at: now + INDETERMINATE_TTL_MS };
+}
+
+function sameEntry(left: IndexEntry, right: IndexEntry): boolean {
+  return (
+    left.request_id === right.request_id &&
+    left.state === right.state &&
+    left.bytes === right.bytes &&
+    left.created_at === right.created_at &&
+    left.state_changed_at === right.state_changed_at &&
+    left.expires_at === right.expires_at
+  );
 }
 
 function indexEntry(object: LocalResultObject, bytes: number): IndexEntry {
