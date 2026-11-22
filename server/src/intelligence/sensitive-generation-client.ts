@@ -102,7 +102,10 @@ export class SensitiveGenerationClient {
     const body = JSON.stringify({ model: input.model, prompt: input.prompt, stream: true,
       options: { num_predict: input.numPredict, num_ctx: input.numCtx } });
     return this.perform("/api/generate", body, input.signal, async (response) => {
-      let pending = Buffer.alloc(0);
+      // The unfinished line is kept as its received pieces and joined once, when its newline arrives
+      // or the stream ends, so buffering costs work linear in the bytes received.
+      const pending: Buffer[] = [];
+      let pendingLength = 0;
       let total = 0;
       let visible = 0;
       let text = "";
@@ -133,20 +136,27 @@ export class SensitiveGenerationClient {
         total += bytes.length;
         // Bound the entire response before buffering or parsing any new frame.
         if (total > STREAM_TOTAL_MAX_BYTES) fail("total_cap");
-        pending = Buffer.concat([pending, bytes]);
+        let start = 0;
         let newline: number;
-        while ((newline = pending.indexOf(10)) !== -1) { // LF is byte 10 in NDJSON.
-          const line = pending.subarray(0, newline);
-          pending = pending.subarray(newline + 1);
+        while ((newline = bytes.indexOf(10, start)) !== -1) { // LF is byte 10 in NDJSON.
+          pending.push(bytes.subarray(start, newline));
+          const line = Buffer.concat(pending, pendingLength + newline - start);
+          pending.length = 0;
+          pendingLength = 0;
+          start = newline + 1;
           if (previous) consume(previous, false);
           previous = line;
           if (line.length > STREAM_FINAL_LINE_MAX_BYTES) fail("final_line_cap");
         }
+        if (start < bytes.length) {
+          pending.push(bytes.subarray(start));
+          pendingLength += bytes.length - start;
+        }
         // An unfinished line is bounded before more bytes can be buffered or parsed.
-        if (pending.length > STREAM_FINAL_LINE_MAX_BYTES) fail("final_line_cap");
-        if (pending.length && previous) { consume(previous, false); previous = undefined; }
+        if (pendingLength > STREAM_FINAL_LINE_MAX_BYTES) fail("final_line_cap");
+        if (pendingLength && previous) { consume(previous, false); previous = undefined; }
       }
-      if (pending.length) previous = pending;
+      if (pendingLength) previous = Buffer.concat(pending, pendingLength);
       if (!previous) fail("invalid_response");
       consume(previous, true);
       return { ok: true, text, done_reason: finalReason! } as const;
@@ -172,7 +182,9 @@ export class SensitiveGenerationClient {
     read: (response: IncomingMessage) => Promise<T>): Promise<T | Refusal> {
     const host = this.target.family === 6 ? `[${this.target.address}]` : this.target.address;
     const resolved = resolveLoopbackConnectTarget(`http://${host}:${this.target.port}/`);
-    if (!resolved.ok || resolved.target.address !== this.target.address || resolved.target.family !== this.target.family)
+    // The re-resolved target must equal the stored one in every field the connection uses.
+    if (!resolved.ok || resolved.target.address !== this.target.address || resolved.target.family !== this.target.family ||
+      resolved.target.port !== this.target.port)
       return { ok: false, reason: "not_loopback" };
     if (signal?.aborted) return { ok: false, reason: "cancelled" };
     return new Promise((resolve) => {

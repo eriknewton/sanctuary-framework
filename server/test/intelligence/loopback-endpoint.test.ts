@@ -14,8 +14,13 @@ describe("loopback targets", () => {
   ])("accepts %s", (endpoint, address, family) => {
     expect(resolveLoopbackConnectTarget(String(endpoint))).toEqual({ ok: true, target: { address, family, port: 1234 } });
   });
-  it.each(["http://10.0.0.1", "http://example.com", "http://user:pass@localhost", "https://localhost", "http://localhost/path", "http://0.0.0.0", "http://localhost/?a=b", "http://localhost/#hash"])("refuses %s", (endpoint) => {
+  it.each(["http://10.0.0.1", "http://example.com", "http://user:pass@localhost", "https://localhost", "http://localhost/path", "http://0.0.0.0", "http://localhost/?a=b", "http://localhost/#hash",
+    "http://[::ffff:127.0.0.1]/", "http://[::ffff:10.0.0.1]/", "http://[::ffff:169.254.169.254]/", "http://localhost./", "http://a.localhost/", "http://127.0.0.1:0/"])("refuses %s", (endpoint) => {
     expect(resolveLoopbackConnectTarget(endpoint)).toEqual({ ok: false, reason: "not_loopback" });
+  });
+  it("a target with no port resolves to the HTTP default port", () => {
+    const HTTP_DEFAULT_PORT = 80; // the http: scheme's default
+    expect(resolveLoopbackConnectTarget("http://127.0.0.1/")).toEqual({ ok: true, target: { address: "127.0.0.1", family: 4, port: HTTP_DEFAULT_PORT } });
   });
   it("localhost resolves without a DNS lookup", () => {
     const lookup = vi.spyOn(dns, "lookup");
