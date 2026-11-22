@@ -5,7 +5,7 @@ import * as classifier from "../../src/agent-native/intent-classifier.js";
 const {
   classifyIntent, buildHelpVariants, HELP_NEEDLES, HELP_BENIGN_WORDS, HELP_MASK,
   HELP_WRITE_CUES, HELP_STRONG_READ_CUES, HELP_WEAK_READ_CUES,
-  HELP_MAX_VARIANTS, HELP_MAX_VARIANT_BYTES, HELP_INTENT_MAX_CHARS,
+  HELP_MAX_VARIANTS, HELP_MAX_VARIANT_BYTES, HELP_INTENT_MAX_CHARS, HELP_BAND_SCAN_CHARS,
 } = classifier;
 
 // A decode chain gets one quarter of the variant slots; the fallback also runs the prior-source witness.
@@ -282,6 +282,10 @@ describe("bounded intent screening", () => {
     ["save the note\uff05E2\uff0580\uff058B", "sensitive", null, "ambiguous", null],
     ["save bm90ZeKAiw==", "sensitive", null, "ambiguous", null],
     ["save aW1wb3J0wq1hbnQ=", "sensitive", null, "ambiguous", null],
+    ["%EF%BB%BF save the note", "sensitive", null, "ambiguous", null],
+    ["%25EF%25BB%25BF save the note", "sensitive", null, "ambiguous", null],
+    ["remember 77u/c2F2ZSB0aGUgbm90ZQ==", "sensitive", null, "ambiguous", null],
+    ["save 77u/bm90ZQ==", "sensitive", null, "ambiguous", null],
   ] as const;
   it.each(intentCases)("routes help intent: %s", (intent, safetyClass, tool, probeKey, example) => {
     const answer = classifyIntent(intent);
@@ -297,7 +301,7 @@ describe("bounded intent screening", () => {
   it("closes guidance for invisible insertions throughout ordinary tool intents", () => {
     const insertions = ["\u200b", "\u00ad", "\ufe0f", "\u2060", "%E2%80%8B", "%25E2%2580%258B", "\uff05E2\uff0580\uff058B"];
     const continuingCases = intentCases.filter(([, safetyClass, tool]) => tool !== null && safetyClass !== "gated");
-    // 45 of 139 rows carry an ungated tool: 1,384 code-point boundaries times 7 forms = 9,688 calls.
+    // 45 of 143 rows carry an ungated tool: 1,384 code-point boundaries times 7 forms = 9,688 calls.
     // Derive the count from the table so every continuing row and both end boundaries stay covered.
     const callCount = continuingCases.reduce((total, [intent]) => total + (Array.from(intent).length + 1) * insertions.length, 0);
     expect(continuingCases).toHaveLength(45);
@@ -319,7 +323,7 @@ describe("bounded intent screening", () => {
   it("closes guidance for decoded note tokens throughout ordinary tool intents", () => {
     const invisibles = ["\u200b", "\u00ad", "\ufe0f"];
     const continuingCases = intentCases.filter(([, safetyClass, tool]) => tool !== null && safetyClass !== "gated");
-    // 45 of 139 rows carry an ungated tool: 45 rows times 3 encoded note forms = 135 calls.
+    // 45 of 143 rows carry an ungated tool: 45 rows times 3 encoded note forms = 135 calls.
     const callCount = continuingCases.length * invisibles.length;
     expect(continuingCases).toHaveLength(45);
     expect(callCount).toBe(135);
@@ -333,6 +337,22 @@ describe("bounded intent screening", () => {
       }
     }
     expect(calls).toBe(callCount);
+  });
+  it("classifies a received leading BOM intent exactly as the same intent without it", () => {
+    // The entry exemption removes one received U+FEFF before banding, so band edges never depend on an invisible byte.
+    // 8 visible characters plus (band - 9) put the next character at the last prefix index; 600 more exceed the limit.
+    const bandPrefixEnd = "del-ete " + "x".repeat(HELP_BAND_SCAN_CHARS - 9);
+    const intents = [
+      bandPrefixEnd + "\u0416" + "x".repeat(600),
+      bandPrefixEnd + "x" + "\u0416" + "x".repeat(600),
+      "x".repeat(1500) + "export",
+    ];
+    for (const intent of intents) {
+      expect(Array.from(intent).length).toBeGreaterThan(HELP_INTENT_MAX_CHARS);
+      expect(classifyIntent(`\ufeff${intent}`), intent.slice(0, 16)).toEqual(classifyIntent(intent));
+    }
+    expect(classifyIntent(intents[1]!)).toMatchObject({ safety_class: "gated", tool: "sanctuary_forget" });
+    expect(classifyIntent(intents[2]!)).toMatchObject({ safety_class: "gated" });
   });
   it("counts received code points before normalization and scans each band edge", () => {
     expect("lorem ".repeat(170) + "ipsum").toHaveLength(1025);
