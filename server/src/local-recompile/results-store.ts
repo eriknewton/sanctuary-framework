@@ -393,7 +393,16 @@ export class LocalResultsStore {
     return object;
   }
 
+  /**
+   * A closed store's key is zeroed, so a call already in flight when close ran must not read or write:
+   * a record sealed under the zeroed key would make the store unreadable at the next boot.
+   */
+  private assertOpen(): void {
+    if (this.closed) throw new LocalStoreError("closed");
+  }
+
   private async readIndexOrNull(): Promise<IndexEntry[] | null> {
+    this.assertOpen();
     const found = await readRecord(this.storage, LOCAL_RESULTS_NAMESPACE, INDEX_KEY, this.key, INDEX_BOUNDS);
     return found === null ? null : validateIndex(found.value, this.maxObjects);
   }
@@ -406,6 +415,7 @@ export class LocalResultsStore {
   }
 
   private async writeIndex(entries: IndexEntry[]): Promise<void> {
+    this.assertOpen();
     const sealed = sealRecord({ entries }, this.key, INDEX_KEY, INDEX_BOUNDS);
     try {
       await this.storage.writeStrict(LOCAL_RESULTS_NAMESPACE, INDEX_KEY, sealed);
@@ -415,6 +425,7 @@ export class LocalResultsStore {
   }
 
   private async readObject(requestId: string): Promise<LocalResultObject | null> {
+    this.assertOpen();
     const key = objectKey(requestId);
     const found = await readRecord(this.storage, LOCAL_RESULTS_NAMESPACE, key, this.key, OBJECT_BOUNDS);
     if (found === null) return null;
@@ -425,6 +436,7 @@ export class LocalResultsStore {
 
   private async writeObject(object: LocalResultObject, exclusive: boolean): Promise<void> {
     const key = objectKey(object.request_id);
+    this.assertOpen();
     const sealed = sealRecord(object, this.key, key, OBJECT_BOUNDS);
     try {
       if (exclusive) {
@@ -440,6 +452,7 @@ export class LocalResultsStore {
   }
 
   private async deleteObject(requestId: string): Promise<void> {
+    this.assertOpen();
     try {
       await this.storage.delete(LOCAL_RESULTS_NAMESPACE, objectKey(requestId));
     } catch (error) {

@@ -2,8 +2,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { fork, type ChildProcess, type ForkOptions } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { LocalOplog } from "../../src/local-recompile/oplog.js";
 import { LocalResultsStore } from "../../src/local-recompile/results-store.js";
@@ -28,6 +29,7 @@ const STORE_KEY_BYTES = 32;
 const REAP_GRACE_MS = 2_000;
 // Upper bound for one real worker to start under tsx and open its stores.
 const WORKER_EVENT_TIMEOUT_MS = 30_000;
+const GATED_CHILD = fileURLToPath(new URL("./__fixtures__/worker-gated-child.ts", import.meta.url));
 
 const cleanups: Array<() => Promise<void> | void> = [];
 const children = new Set<ChildProcess>();
@@ -118,6 +120,26 @@ function startClient(storageRoot: string, keys: { oplogKey: Uint8Array; resultsK
   });
   cleanups.push(() => client.close());
   return { client, events };
+}
+
+/** The next message from a forked child that matches; rejects if the child exits first or the wait runs out. */
+function nextMessage(child: ChildProcess, predicate: (message: { type?: string }) => boolean): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error("child message timed out")), WORKER_EVENT_TIMEOUT_MS);
+    const onMessage = (message: { type?: string }) => {
+      if (predicate(message)) finish(undefined, message as Record<string, unknown>);
+    };
+    const onExit = () => finish(new Error("child exited before the message"));
+    function finish(error: Error | undefined, message?: Record<string, unknown>) {
+      clearTimeout(timer);
+      child.off("message", onMessage);
+      child.off("exit", onExit);
+      if (error) reject(error);
+      else resolve(message!);
+    }
+    child.on("message", onMessage);
+    child.once("exit", onExit);
+  });
 }
 
 function keyBuffers(value: unknown, out: Uint8Array[] = []): Uint8Array[] {
@@ -333,11 +355,110 @@ describe("local job worker process", () => {
     const child = fork(modulePath, [], { execArgv, stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
     children.add(child);
     const exited = once(child, "exit");
-    const reply = once(child, "message");
+    // The second init is sent only after the first has finished, so this is the running-worker case.
+    const ready = once(child, "message");
     child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    expect((await ready)[0]).toEqual({ type: "ready" });
+    const reply = nextMessage(child, (message) => message.type === "fault");
     child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
-    expect((await reply)[0]).toEqual({ type: "fault", kind: "init_invalid" });
+    expect(await reply).toEqual({ type: "fault", kind: "init_invalid" });
     await exited;
+  }, 60_000);
+});
+
+interface GatedRecord {
+  sent: Array<{ type: string; after: string[] }>;
+  triggers: string[];
+  duplicateInitKeysZeroed: boolean | null;
+  sweepCallsDuringTicks: number;
+}
+
+/** Fork the real worker under the gated fixture (`__fixtures__/worker-gated-child.ts`); its record is read after exit. */
+async function gatedWorker(mode: string) {
+  const { base, keys, storageRoot } = await fortress();
+  const { execArgv } = resolveWorkerModule();
+  const resultFile = join(base, "gated-record.json");
+  // The same environment the client hands its worker, so the status reply fits the shared schema.
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of WORKER_ENV_NAMES) if (process.env[name] !== undefined) env[name] = process.env[name];
+  const child = fork(GATED_CHILD, [resultFile, mode], { env, execArgv, stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
+  children.add(child);
+  const exited = once(child, "exit");
+  return {
+    child,
+    /** Open the worker's stores from the test with the real keys: both authenticate and verify. */
+    reopen: async () => {
+      const storage = new FilesystemStorage(storageRoot);
+      const log = new LocalOplog(storage, keys.oplogKey);
+      const store = new LocalResultsStore(storage, keys.resultsKey, log);
+      cleanups.push(() => { store.close(); log.close(); });
+      await log.ensure();
+      await store.ensure();
+      return (await log.verifyChain()).ok;
+    },
+    init: () => child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey }),
+    /** The fixture's record and the exit code, once the child has exited. */
+    record: async (): Promise<GatedRecord & { exitCode: number | null }> => {
+      const [exitCode] = (await exited) as [number | null];
+      return { ...(JSON.parse(await readFile(resultFile, "utf8")) as GatedRecord), exitCode };
+    },
+  };
+}
+
+describe("local job worker terminal states", () => {
+  it("a shutdown taken while init is opening the stores ends the worker with nothing sent", async () => {
+    const worker = await gatedWorker("shutdown-during-init");
+    const gated = nextMessage(worker.child, (message) => message.type === "fixture_gated");
+    worker.init();
+    await gated;
+    worker.child.send({ type: "shutdown" });
+    const record = await worker.record();
+    expect(record.triggers).toEqual(["shutdown"]);
+    expect(record.sent).toEqual([]);
+    expect(record.exitCode).toBe(0);
+    // The init cut short wrote nothing under the closed log's zeroed key, so the store still opens.
+    expect(await worker.reopen()).toBe(true);
+  }, 60_000);
+
+  it("a duplicate init while the first is opening the stores faults once, and the first init sends nothing after", async () => {
+    const worker = await gatedWorker("init-during-init");
+    const gated = nextMessage(worker.child, (message) => message.type === "fixture_gated");
+    worker.init();
+    await gated;
+    worker.init();
+    const record = await worker.record();
+    expect(record.triggers).toEqual(["second_init"]);
+    expect(record.sent).toEqual([{ type: "fault", after: [] }]);
+    // The duplicate's key bytes are zeroed by the time the worker has handled it.
+    expect(record.duplicateInitKeysZeroed).toBe(true);
+    expect(record.exitCode).toBe(1);
+    expect(await worker.reopen()).toBe(true);
+  }, 60_000);
+
+  it("a shutdown taken while a sweep is awaiting the store ends the worker with no status after it", async () => {
+    const worker = await gatedWorker("shutdown-during-sweep");
+    const gated = nextMessage(worker.child, (message) => message.type === "fixture_gated");
+    worker.init();
+    await gated;
+    worker.child.send({ type: "shutdown" });
+    const record = await worker.record();
+    expect(record.sent).toEqual([{ type: "ready", after: [] }]);
+    expect(record.exitCode).toBe(0);
+    expect(await worker.reopen()).toBe(true);
+  }, 60_000);
+
+  it("a housekeeping tick that finds a sweep running skips instead of starting a second", async () => {
+    const worker = await gatedWorker("overlapping-sweep");
+    const swept = nextMessage(worker.child, (message) => message.type === "status");
+    worker.init();
+    await swept;
+    const ticked = nextMessage(worker.child, (message) => message.type === "fixture_ticked");
+    worker.child.send({ type: "fixture_tick_overlap" });
+    expect(await ticked).toEqual({ type: "fixture_ticked", ticks: 1 });
+    worker.child.send({ type: "shutdown" });
+    const record = await worker.record();
+    expect(record.sweepCallsDuringTicks).toBe(1);
+    expect(record.exitCode).toBe(0);
   }, 60_000);
 });
 

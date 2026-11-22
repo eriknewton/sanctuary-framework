@@ -425,12 +425,22 @@ export class LocalOplog {
     return now;
   }
 
+  /**
+   * A closed log's key is zeroed, so a call already in flight when close ran must not read or write:
+   * a record sealed under the zeroed key would make the log unreadable at the next boot.
+   */
+  private assertOpen(): void {
+    if (this.closed) throw new LocalStoreError("closed");
+  }
+
   private async readControl(key: string): Promise<unknown | null> {
+    this.assertOpen();
     const found = await readRecord(this.storage, LOCAL_OPLOG_NAMESPACE, key, this.key, RECORD_BOUNDS);
     return found === null ? null : found.value;
   }
 
   private async writeControl(key: string, value: unknown): Promise<void> {
+    this.assertOpen();
     const sealed = sealRecord(value, this.key, key, RECORD_BOUNDS);
     try {
       await this.storage.writeStrict(LOCAL_OPLOG_NAMESPACE, key, sealed);
@@ -440,6 +450,7 @@ export class LocalOplog {
   }
 
   private async deleteKey(key: string): Promise<void> {
+    this.assertOpen();
     try {
       await this.storage.delete(LOCAL_OPLOG_NAMESPACE, key);
     } catch (error) {
@@ -455,6 +466,7 @@ export class LocalOplog {
   }
 
   private async readRow(seq: number): Promise<{ row: OplogRow; bytes: number } | null> {
+    this.assertOpen();
     const found = await readRecord(this.storage, LOCAL_OPLOG_NAMESPACE, oplogRowKey(seq), this.key, RECORD_BOUNDS);
     if (found === null) return null;
     const row = validateOplogRow(found.value);
@@ -465,6 +477,7 @@ export class LocalOplog {
   /** Exclusive publish then byte-exact read-back; returns the sealed size. */
   private async publishRow(row: OplogRow): Promise<number> {
     const key = oplogRowKey(row.seq);
+    this.assertOpen();
     const sealed = sealRecord(row, this.key, key, RECORD_BOUNDS);
     let created: boolean;
     try {
