@@ -67,7 +67,7 @@ import {
 // STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
 import { assertAdmissibleIdentityLabel } from "../signing/reserved-label.js";
-import type { SessionBindingBootState } from "../agent-native/session-binding-state.js";
+import type { SessionBindingBootState, SessionBindingState } from "../agent-native/session-binding-state.js";
 import { isSessionNotBoundError } from "../agent-native/session-not-bound.js";
 import { OriginUnresolvedError } from "./origin-unresolved.js";
 
@@ -1030,7 +1030,9 @@ function takeStateExportApprovalBinding(
 /**
  * A session binding and its frozen boot decision are supplied together or not
  * at all, so a caller that hands these tools a binding cannot omit the
- * decision that stamping a write reads.
+ * decision that stamping a write reads. The field pairing must match
+ * StateWriteOriginBinding below; createCognitiveTools checks it again at
+ * runtime through pairStateWriteOriginBinding.
  */
 export type CognitiveSessionBindingOptions =
   | { currentSessionBinding?: undefined; sessionBindingBootState?: undefined }
@@ -1041,39 +1043,95 @@ export type CognitiveSessionBindingOptions =
     };
 
 /**
- * Decide a state write's origin from the frozen boot decision and the per-call
- * binding. No arm reaches operator through a catch; only an explicitly
- * non-bound primitive session stamps operator. A failed arm throws
- * OriginUnresolvedError (must match cognitive/origin-unresolved.ts), so the
- * write fails and stores nothing.
+ * The resolver's binding inputs: both accessors or neither. Must match the
+ * pairing in CognitiveSessionBindingOptions above.
  */
-export function resolveStateWriteOrigin(input: {
-  bootState: SessionBindingBootState | undefined;
-  binding: (() => SessionBinding | undefined) | undefined;
-  identityId: string;
-}): OriginActor {
-  let bootState: ReturnType<SessionBindingBootState> | undefined;
+export type StateWriteOriginBinding =
+  | { bootState?: undefined; binding?: undefined }
+  | { bootState: SessionBindingBootState; binding: () => SessionBinding | undefined };
+
+/**
+ * Whether each boot decision lets a write whose per-call binding is undefined
+ * stamp operator. A Record over SessionBindingState, so a new state does not
+ * compile until it is classified here. Only the explicitly not-bound decisions
+ * read true: with no launch variable and no sole proof (or an empty launch
+ * variable, which is treated as not bound), the primitive view is undefined by
+ * design. A named or sole decision always carries a binding, so an undefined
+ * one there means the binding was lost, never that the session is unbound.
+ * The keys must match SessionBindingState in agent-native/session-binding-state.ts;
+ * the true set must match NOT_BOUND_STATES in test/cognitive/state-write-origin.test.ts.
+ */
+const UNBOUND_BINDING_STAMPS_OPERATOR: Readonly<Record<SessionBindingState, boolean>> = Object.freeze({
+  state_BOUND_NAMED: false,
+  state_BOUND_SOLE_IDENTITY: false,
+  state_UNBOUND_FLAG_OFF: true,
+  state_UNBOUND_NO_IDENTITY: true,
+  state_UNBOUND_SEVERAL_IDENTITIES: true,
+  state_UNBOUND_UNPROVEN: true,
+  state_NAMED_EMPTY: true,
+  state_NAMED_UNRESOLVED: false,
+});
+
+/**
+ * Check, at runtime, that the boot decision and the binding are paired: both
+ * callable, or both absent. A JS caller or a cast can bypass the type, and a
+ * binding without its boot decision cannot prove which arm applies, so an
+ * unpaired or non-callable input throws OriginUnresolvedError.
+ */
+export function pairStateWriteOriginBinding(bootState: unknown, binding: unknown): StateWriteOriginBinding {
+  if (bootState === undefined && binding === undefined) return {};
+  if (typeof bootState === "function" && typeof binding === "function") {
+    return { bootState: bootState as SessionBindingBootState, binding: binding as () => SessionBinding | undefined };
+  }
+  throw new OriginUnresolvedError();
+}
+
+/**
+ * Decide a state write's origin from the frozen boot decision and the per-call
+ * binding. No arm reaches operator through a catch. Exactly two input
+ * combinations stamp operator without a named binding: no binding accessors at
+ * all (arm_NO_BINDING_CONFIGURED), and a readable, explicitly not-bound boot
+ * decision whose binding reads undefined (arm_UNBOUND_OPERATOR). A failed arm
+ * throws OriginUnresolvedError (must match cognitive/origin-unresolved.ts), so
+ * the write fails and stores nothing.
+ */
+export function resolveStateWriteOrigin(input: StateWriteOriginBinding & { identityId: string }): OriginActor {
+  // arm_UNPAIRED: a binding without its boot decision (or the reverse) cannot prove which arm applies, so the write refuses.
+  const paired = pairStateWriteOriginBinding(input.bootState, input.binding);
+  if (paired.bootState === undefined) {
+    // arm_NO_BINDING_CONFIGURED: a primitive call path built with no session binding at all stamps operator.
+    // DEBT(AGENT-SEAT-UNBOUND-ORIGIN): a write in a session with no bound identity is stamped operator, as before
+    // default binding existed; a later slice scopes it behind the binding flag.
+    return "operator";
+  }
+  let bootState: unknown;
   try {
-    bootState = input.bootState?.();
+    bootState = paired.bootState();
   } catch (cause) {
     // arm_BOOT_UNREADABLE: without the boot decision no origin can be claimed.
     throw new OriginUnresolvedError({ cause });
   }
+  // arm_BOOT_UNRECOGNIZED: a boot value outside SessionBindingState names no arm, so no origin is claimed for it.
+  if (typeof bootState !== "string" || !Object.hasOwn(UNBOUND_BINDING_STAMPS_OPERATOR, bootState)) {
+    throw new OriginUnresolvedError();
+  }
+  const boot = bootState as SessionBindingState;
   // arm_SOLE_UNATTRIBUTED: a sole binding names no author, so its writes are unattributed; this arm reads only the
   // frozen boot decision, which must match bootState in createSessionBindingAccessors (agent-native/session-binding.ts).
-  if (bootState === "state_BOUND_SOLE_IDENTITY") return "unattributed";
+  if (boot === "state_BOUND_SOLE_IDENTITY") return "unattributed";
   let binding: SessionBinding | undefined;
   try {
-    binding = input.binding?.();
+    binding = paired.binding();
   } catch (cause) {
     // arm_BINDING_UNREADABLE: an unreadable binding is never read as non-bound.
     throw new OriginUnresolvedError({ cause });
   }
   if (binding === undefined) {
-    // arm_UNBOUND_OPERATOR: the primitive view returns undefined only for a non-bound session.
-    // DEBT(AGENT-SEAT-UNBOUND-ORIGIN): a write in a session with no bound identity is stamped operator, as before
-    // default binding existed; a later slice scopes it behind the binding flag.
-    return "operator";
+    // arm_UNBOUND_OPERATOR: only an explicitly not-bound boot decision has an undefined primitive binding by design;
+    // under a named decision an undefined binding means it was lost, so the write refuses rather than claim operator.
+    // The unbound-origin debt marked at arm_NO_BINDING_CONFIGURED covers this arm too.
+    if (UNBOUND_BINDING_STAMPS_OPERATOR[boot]) return "operator";
+    throw new OriginUnresolvedError();
   }
   let activeIdentityId: string;
   try {
@@ -1082,6 +1140,9 @@ export function resolveStateWriteOrigin(input: {
     // arm_NAMED_UNRESOLVED: a binding without valid identity evidence names no one, so no origin is claimed for it.
     throw new OriginUnresolvedError({ cause });
   }
+  // arm_SOLE_SOURCE_MISMATCH: the boot decision here is not the sole state, so a binding that claims a sole source
+  // contradicts it; a sole binding must never reach agent or operator, so the write refuses.
+  if (binding.binding_source === "sole_identity") throw new OriginUnresolvedError();
   // arm_NAMED_OWN_AGENT: the launch-variable session's own write is the agent's.
   if (activeIdentityId === input.identityId) return "agent";
   // arm_NAMED_OTHER_OPERATOR: a write signed by an identity other than the bound one stays the operator's.
@@ -1104,6 +1165,9 @@ export function createCognitiveTools(
   internalSigning: InternalIdentitySigningHelpers;
   namespaceRegistry: OpaqueNamespaceRegistry;
 } {
+  // A binding supplied without its boot decision (or the reverse) cannot stamp any write correctly, so construction
+  // refuses and a misconfigured server never boots; the accessors are only checked here, never called.
+  const stateWriteOriginBinding = pairStateWriteOriginBinding(options?.sessionBindingBootState, options?.currentSessionBinding);
   const identityMgr = new IdentityManager(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const parseMemoryHandleRecord = (
@@ -1370,7 +1434,7 @@ export function createCognitiveTools(
   }
 
   function stateWriteOriginActor(identityId: string): OriginActor {
-    return resolveStateWriteOrigin({ bootState: options?.sessionBindingBootState, binding: options?.currentSessionBinding, identityId });
+    return resolveStateWriteOrigin({ ...stateWriteOriginBinding, identityId });
   }
 
   const tools: ToolDefinition[] = [

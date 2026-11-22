@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createSanctuaryServer } from "../../src/index.js";
 import * as cooperative from "../../src/agent-native/cooperative-surface.js";
 import * as distress from "../../src/distress/tools.js";
+import * as sessionBinding from "../../src/agent-native/session-binding.js";
 import { DenialLedger } from "../../src/agent-native/denial-ledger.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
@@ -65,6 +66,53 @@ it("a named own write stays agent and a named other write stays operator", async
   vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", id);
   const saved = JSON.parse((await b.call("sanctuary_remember", { key: "own", value: "mine" })).content[0].text);
   expect(await stampAt(b.storage, saved.namespace_handle, "own")).toMatchObject({ origin_actor: "agent", memory_class: "agent_owned" });
+});
+
+it("a session started with the launch variable set stamps its own remember write agent", async () => {
+  const first = await boot();
+  const id = await first.create();
+  await first.app.cleanup();
+  cleanups.pop();
+  // The launch variable is set before the second boot, so the frozen boot decision is the named state.
+  vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", id);
+  const b = await boot(first.storage);
+  const rows = (await b.app.auditLog.query({})).entries.filter(row => row.operation === "session_binding_resolved");
+  expect(rows.at(-1)).toMatchObject({ details: { state: "state_BOUND_NAMED", binding_source: "launch_variable", identity_id: id } });
+  const saved = JSON.parse((await b.call("sanctuary_remember", { key: "launched", value: "mine" })).content[0].text);
+  expect(await stampAt(b.storage, saved.namespace_handle, "launched")).toMatchObject({ origin_actor: "agent", memory_class: "agent_owned" });
+});
+
+it("a remember whose boot decision cannot be read is refused, stores nothing, and records a cause for the operator", async () => {
+  // Test-only composition: the real resolver, wrapped so its boot decision becomes unreadable once armed.
+  const realResolve = sessionBinding.resolveSessionBinding;
+  let armed = false;
+  vi.spyOn(sessionBinding, "resolveSessionBinding").mockImplementation(async (options) => {
+    const resolver = await realResolve(options);
+    return Object.freeze({
+      cooperative: () => resolver.cooperative(),
+      primitive: () => resolver.primitive(),
+      get bootState() {
+        if (armed) throw new Error("boot decision unreadable");
+        return resolver.bootState;
+      },
+    });
+  });
+  const b = await boot();
+  const id = await b.create();
+  vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", id);
+  const writes = async () => (await b.app.auditLog.query({ operation_type: "state_write", limit: Number.MAX_SAFE_INTEGER })).total;
+  const writesBefore = await writes();
+  const ledger = vi.spyOn(DenialLedger.prototype, "record");
+  armed = true;
+  const result = await b.call("sanctuary_remember", { key: "unreadable-boot", value: "v" });
+  armed = false;
+  expect(result).toEqual(expectedRefusal());
+  // Today the cause is handler_error; the deferred-causes debt marked in tool-outcome.ts gives it its own cause later.
+  expect(ledger.mock.calls.at(-1)).toEqual(["handler_error", expect.objectContaining({ tool: "sanctuary_remember" })]);
+  expect(await writes()).toBe(writesBefore);
+  for (const namespace of await b.storage.listNamespaces()) {
+    expect(await b.storage.read(namespace, "unreadable-boot"), namespace).toBeNull();
+  }
 });
 
 it("an unbound write stays operator", async () => {

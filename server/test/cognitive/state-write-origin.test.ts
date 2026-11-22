@@ -141,16 +141,30 @@ const STATES: SessionBindingState[] = [
   "state_NAMED_EMPTY",
   "state_NAMED_UNRESOLVED",
 ];
+// The explicitly not-bound boot decisions, whose primitive binding is undefined by design; must match
+// UNBOUND_BINDING_STAMPS_OPERATOR in src/cognitive/tools.ts.
+const NOT_BOUND_STATES = new Set<string>([
+  "state_UNBOUND_FLAG_OFF",
+  "state_UNBOUND_NO_IDENTITY",
+  "state_UNBOUND_SEVERAL_IDENTITIES",
+  "state_UNBOUND_UNPROVEN",
+  "state_NAMED_EMPTY",
+]);
+// A boot value outside SessionBindingState, as a JS caller or a cast could supply.
+const UNRECOGNIZED_STATE = "state_NOT_A_DECISION";
 const OWN = "identity-own";
 const OTHER = "identity-other";
 type Expected = "operator" | "agent" | "unresolved";
-// Each binding variant with the origin it yields outside a sole boot, for a write signed by OWN.
+// Each binding variant with the origin it yields under a recognized, non-sole boot decision, for a write signed by OWN;
+// "undefined" depends on the boot decision and is decided in expectedOrigin below.
 const BINDINGS: Array<[string, (() => SessionBinding | undefined) | undefined, Expected]> = [
-  ["absent", undefined, "operator"],
+  ["absent", undefined, "unresolved"],
   ["undefined", () => undefined, "operator"],
   ["UNBOUND_SESSION", () => UNBOUND_SESSION, "unresolved"],
   ["named own", () => boundTo(OWN, "launch_variable"), "agent"],
   ["named other", () => boundTo(OTHER, "launch_variable"), "operator"],
+  ["sole-sourced own", () => boundTo(OWN, "sole_identity"), "unresolved"],
+  ["sole-sourced other", () => boundTo(OTHER, "sole_identity"), "unresolved"],
   ["unresolved", () => ({ identity_id: OWN }), "unresolved"],
   ["expired", () => ({ ...boundTo(OWN, "launch_variable"), expires_at: new Date(Date.now() - 1000).toISOString() }), "unresolved"],
   ["throwing", () => { throw new Error("binding read failed"); }, "unresolved"],
@@ -158,26 +172,37 @@ const BINDINGS: Array<[string, (() => SessionBinding | undefined) | undefined, E
 const swapIdentity = (expected: Expected, name: string): Expected =>
   name === "named own" ? "operator" : name === "named other" ? "agent" : expected;
 
-const CASES = [undefined, ...STATES].flatMap((state) =>
+function expectedOrigin(state: string | undefined, name: string, expected: Expected, identityId: string): Expected | "unattributed" {
+  // Both accessors absent is the one unpaired-free path with no boot decision; one without the other never resolves.
+  if (state === undefined) return name === "absent" ? "operator" : "unresolved";
+  if (name === "absent" || state === UNRECOGNIZED_STATE) return "unresolved";
+  if (state === "state_BOUND_SOLE_IDENTITY") return "unattributed";
+  if (name === "undefined") return NOT_BOUND_STATES.has(state) ? "operator" : "unresolved";
+  return identityId === OWN ? expected : swapIdentity(expected, name);
+}
+
+const CASES = [undefined, ...STATES, UNRECOGNIZED_STATE].flatMap((state) =>
   BINDINGS.flatMap(([name, binding, expected]) =>
     [OWN, OTHER].map((identityId) => ({
       state: state ?? "no boot decision",
-      bootState: state === undefined ? undefined : () => state,
+      bootState: state === undefined ? undefined : () => state as SessionBindingState,
       name,
       binding,
       identityId,
-      expected: state === "state_BOUND_SOLE_IDENTITY"
-        ? "unattributed"
-        : identityId === OWN ? expected : swapIdentity(expected, name),
+      expected: expectedOrigin(state, name, expected, identityId),
     })),
   ),
 );
+
+/** The resolver's input built without the paired type, as a JS caller or a cast could pass it. */
+const unpaired = (input: { bootState: unknown; binding: unknown; identityId: string }) =>
+  input as unknown as Parameters<typeof resolveStateWriteOrigin>[0];
 
 describe("the state write origin table", () => {
   it.each(CASES)("no write under a sole binding stores operator: $state, binding $name, writer $identityId", ({ bootState, binding, identityId, expected }) => {
     let bindingReads = 0;
     const counted = binding === undefined ? undefined : () => { bindingReads += 1; return binding(); };
-    const resolve = () => resolveStateWriteOrigin({ bootState, binding: counted, identityId });
+    const resolve = () => resolveStateWriteOrigin(unpaired({ bootState, binding: counted, identityId }));
     if (expected === "unresolved") {
       expect(resolve).toThrow(OriginUnresolvedError);
     } else {
@@ -186,19 +211,79 @@ describe("the state write origin table", () => {
     if (expected === "unattributed") expect(bindingReads).toBe(0);
   });
 
-  it.each(BINDINGS)("an unreadable boot decision fails before the binding is read: binding %s", (_name, binding) => {
+  it.each(BINDINGS.filter(([name]) => name !== "absent"))("an unreadable boot decision fails before the binding is read: binding %s", (_name, binding) => {
     let bindingReads = 0;
     const counted = binding === undefined ? undefined : () => { bindingReads += 1; return binding(); };
     const cause = new Error("boot decision unreadable");
     let thrown: unknown;
     try {
-      resolveStateWriteOrigin({ bootState: () => { throw cause; }, binding: counted, identityId: OWN });
+      resolveStateWriteOrigin(unpaired({ bootState: () => { throw cause; }, binding: counted, identityId: OWN }));
     } catch (error) {
       thrown = error;
     }
     expect(isOriginUnresolvedError(thrown)).toBe(true);
     expect((thrown as Error).cause).toBe(cause);
     expect(bindingReads).toBe(0);
+  });
+});
+
+describe("a write whose binding cannot be paired with its boot decision refuses", () => {
+  it("a binding without its boot decision, or a boot decision without its binding, does not resolve", () => {
+    let reads = 0;
+    const binding = () => { reads += 1; return boundTo(OWN, "launch_variable"); };
+    const bootState = () => { reads += 1; return "state_BOUND_NAMED" as const; };
+    expect(() => resolveStateWriteOrigin(unpaired({ bootState: undefined, binding, identityId: OWN }))).toThrow(OriginUnresolvedError);
+    expect(() => resolveStateWriteOrigin(unpaired({ bootState, binding: undefined, identityId: OWN }))).toThrow(OriginUnresolvedError);
+    expect(() => resolveStateWriteOrigin(unpaired({ bootState: "state_UNBOUND_FLAG_OFF", binding, identityId: OWN }))).toThrow(OriginUnresolvedError);
+    // Neither accessor is read when the pair is incomplete.
+    expect(reads).toBe(0);
+    // The paired type is the compile-time half; these lines are checked by typecheck:tests, never run.
+    const typeOnly = () => {
+      // @ts-expect-error a binding supplied without its boot decision does not type-check
+      resolveStateWriteOrigin({ binding, identityId: OWN });
+      // @ts-expect-error a boot decision supplied without its binding does not type-check
+      resolveStateWriteOrigin({ bootState, identityId: OWN });
+    };
+    expect(typeof typeOnly).toBe("function");
+  });
+
+  it.each([
+    ["a binding without its boot decision", { currentSessionBinding: () => undefined }],
+    ["a boot decision without its binding", { sessionBindingBootState: () => "state_UNBOUND_FLAG_OFF" }],
+  ] as const)("cognitive tools refuse construction with %s", (_name, options) => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    expect(() => createL1Tools(new StateStore(storage, masterKey), storage, masterKey, "passphrase", undefined,
+      options as unknown as Parameters<typeof createL1Tools>[5])).toThrow(OriginUnresolvedError);
+  });
+});
+
+describe("a write under a lost or contradictory binding stores nothing", () => {
+  it("a named boot decision whose binding reads undefined fails the write", async () => {
+    const t = await buildTools(() => "state_BOUND_NAMED", () => undefined);
+    await expectFailedWrite(t, "named-lost");
+  });
+
+  it("an unrecognized boot decision whose binding reads undefined fails the write", async () => {
+    const t = await buildTools(() => UNRECOGNIZED_STATE as SessionBindingState, () => undefined);
+    await expectFailedWrite(t, "unrecognized");
+  });
+
+  it("an explicitly not-bound boot decision whose binding reads undefined stamps operator", async () => {
+    const t = await buildTools(() => "state_UNBOUND_FLAG_OFF", () => undefined);
+    await t.call("state_write", { namespace: "not-bound", key: "k", value: "v" });
+    expect(await t.rawStamp("not-bound", "k")).toMatchObject({ origin_actor: "operator", memory_class: "operator_owned" });
+  });
+
+  it.each([["own", true], ["other", false]] as const)("a sole-sourced binding under a named boot decision fails the write: %s identity", async (name, own) => {
+    // The sole-sourced binding is placed on the stamping read, so identity selection before it resolves normally.
+    const { k } = await calibrateReads();
+    const counter = countingBinding((read, id) =>
+      read === k ? boundTo(own ? id : "identity-elsewhere", "sole_identity") : boundTo(id, "launch_variable"));
+    const t = await buildTools(() => "state_BOUND_NAMED", counter.accessor);
+    counter.reset();
+    await expectFailedWrite(t, `sole-sourced-${name}`);
+    expect(counter.reads).toBe(k);
   });
 });
 

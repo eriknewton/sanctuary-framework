@@ -536,7 +536,11 @@ function decideOne(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function assertOriginActor(actor: unknown): asserts actor is OriginActor {
+/**
+ * The one origin refusal: the minter and StateStore.write's provenance check both throw this same typed
+ * MemoryClassError, so a missing or unknown origin is refused the same way at either site.
+ */
+export function assertOriginActor(actor: unknown): asserts actor is OriginActor {
   if (!isOriginActor(actor)) {
     throw new MemoryClassError("invalid_origin_actor", "origin_actor must be operator|agent|system|unattributed");
   }

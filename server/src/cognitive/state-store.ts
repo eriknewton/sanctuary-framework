@@ -70,6 +70,7 @@ import {
 // `errors/untrusted-diagnostic.ts`.
 import { describeUntrusted } from "../errors/index.js";
 import {
+  assertOriginActor,
   isOriginActor,
   mintProvenanceStamp,
   serializeStamp,
@@ -1940,6 +1941,10 @@ export class StateStore {
     identityEncryptionKey: Uint8Array,
     options: WriteOptions
   ): Promise<WriteResult> {
+    // A write must name its origin before anything is read or stored: a JS caller or a cast can omit options or
+    // provenance, and that is refused with the minter's own typed origin refusal (must match assertOriginActor in
+    // exit/memory-class.ts), never a raw TypeError from a later field read.
+    assertOriginActor((options as Partial<WriteOptions> | undefined)?.provenance?.origin_actor);
     return this.withStateMutationLock(async () => {
     // N4 (coordinator gate, 2026-08-22): while a durable exit-import
     // journal exists, refuse THIS write - F6 (coordinator gate,

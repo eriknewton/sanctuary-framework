@@ -3,7 +3,7 @@ export const ORIGIN_UNRESOLVED_BRAND: unique symbol = Symbol("origin-unresolved"
 
 /**
  * A state write whose origin cannot be determined fails, and stores nothing.
- * The producer must match resolveStateWriteOrigin in cognitive/tools.ts.
+ * The producers must match resolveStateWriteOrigin and pairStateWriteOriginBinding in cognitive/tools.ts.
  */
 export class OriginUnresolvedError extends Error {
   constructor(options?: { cause?: unknown }) {
