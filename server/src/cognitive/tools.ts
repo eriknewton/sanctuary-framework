@@ -60,7 +60,6 @@ import {
   normalizedArgsHash,
   OpaqueNamespaceRegistry,
   resolveActiveSessionIdentity,
-  SessionIdentityError,
   type SessionBinding,
 } from "../agent-native/safety-base.js";
 // a `StoredIdentity` is `JSON.parse`d off disk, so every field is attacker-
@@ -1042,17 +1041,6 @@ export type CognitiveSessionBindingOptions =
     };
 
 /**
- * Refuse a write made under a sole binding before the gate. Callers must match
- * the state_write argument builder below and holdSoleBoundCooperativeWrites in
- * agent-native/session-binding.ts.
- */
-// DEBT(AGENT-SEAT-SOLE-WRITE-HELD): the pre-gate hold remains until its cooperative wrapper retires.
-export function assertSoleBoundWriteNotHeld(bootState: SessionBindingBootState | undefined): void {
-  // A sole binding is the only boot decision this refuses; every other decision keeps today's write path.
-  if (bootState?.() === "state_BOUND_SOLE_IDENTITY") throw new SessionIdentityError();
-}
-
-/**
  * Decide a state write's origin from the frozen boot decision and the per-call
  * binding. No arm reaches operator through a catch; only an explicitly
  * non-bound primitive session stamps operator. A failed arm throws
@@ -1758,8 +1746,6 @@ export function createCognitiveTools(
         required: ["namespace", "key", "value"],
       },
       approvalTargetArgs: async (args) => {
-        // A held sole-bound write refuses here, before the gate can ask for approval or the handler can record success.
-        assertSoleBoundWriteNotHeld(options?.sessionBindingBootState);
         await assertToolNamespaceReady("state_write", args.namespace as string);
         assertIdentityMatchesSession(args.identity_id as string | undefined, "state_write");
         return args;

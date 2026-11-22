@@ -202,7 +202,7 @@ import { ResponseScreen } from "./proxy/response-screen.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { surfaceSourceFor } from "./castle-wall/liveness/surface-reader.js";
 import { productionHostClock, livenessFortressId } from "./cli/castle-wall-liveness-status.js";
-import { collectSoleProofInputs, createSessionBindingAccessors, holdSoleBoundCooperativeWrites, resolveSessionBinding } from "./agent-native/session-binding.js";
+import { collectSoleProofInputs, createSessionBindingAccessors, resolveSessionBinding } from "./agent-native/session-binding.js";
 
 export interface SanctuaryServer {
   /** Host-only exposure; absence/eviction remains tainted with unknown observation. */
@@ -2249,9 +2249,6 @@ export async function createSanctuaryServer(options?: {
       ?? Promise.resolve({ keyB64url: null, observation: "unknown" }),
     approvalProofStore,
   });
-  // Cooperative tools that reach the state_write handler refuse a held sole-bound write before the gate,
-  // as state_write's own argument builder does; must match holdSoleBoundCooperativeWrites in agent-native/session-binding.ts.
-  const agentNativeTools = holdSoleBoundCooperativeWrites(cooperativeTools, sessionBindingAccessors.bootState);
 
   // 16c. HABEAS PORT distress emission surface (agent-side sovereignty,
   // ratified 2026-06-12). The lane config is operator-owned and loaded once,
@@ -2328,7 +2325,7 @@ export async function createSanctuaryServer(options?: {
     ...complianceTools,
     ...erc8004Tools,
     ...erc8004ResolveTools,
-    ...agentNativeTools,
+    ...cooperativeTools,
     ...distressTools,
     manifestTool,
   ];

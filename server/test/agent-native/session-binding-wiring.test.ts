@@ -10,6 +10,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 import { expectedRefusal } from "../helpers/expected-refusal.js";
+import { COOPERATIVE_TOOL_NAMES } from "../../src/agent-native/tool-names.js";
 
 let home: Awaited<ReturnType<typeof createTempHome>>;
 let cleanups: Array<() => Promise<void>>;
@@ -137,36 +138,57 @@ it("a named binding resolves and behaves as before", async () => {
 
 it("a write under a sole binding is never stamped agent or operator", async () => {
   const b = await sole();
-  const ledger = vi.spyOn(DenialLedger.prototype, "record");
   expect(JSON.parse((await b.call("sanctuary_recall", { key: "seed" })).content[0].text)).toMatchObject({ value: "stored before restart" });
   expect((await b.call("monitor_audit_log", {})).isError).not.toBe(true);
   expect(b.sources.currentSessionBinding()).toMatchObject({ identity_id: b.id, binding_source: "sole_identity" });
-  expect(await b.call("state_write", { namespace: "notes", key: "held", value: "v" })).toEqual(expectedRefusal());
-  expect(await b.storage.list("notes")).toEqual([]);
-  // The hold refuses at the argument stage, before the gate, so the operator ledger records that stage.
-  expect(ledger.mock.calls.at(-1)?.[0]).toBe("pre_gate_argument_refused");
+  const written = await b.call("state_write", { namespace: "notes", key: "sole", value: "v" });
+  expect(written).not.toEqual(expectedRefusal());
+  expect(JSON.parse(written.content[0].text)).toMatchObject({ namespace: "notes", key: "sole" });
+  expect(await stampAt(b.storage, "notes", "sole")).toMatchObject({ origin_actor: "unattributed", memory_class: "shared_entangled", derived_from: [] });
   const rows = (await b.app.auditLog.query({})).entries.filter(row => row.operation === "session_binding_resolved");
   expect(rows.at(-1)).toMatchObject({ identity_id: "system", details: { state: "state_BOUND_SOLE_IDENTITY" } });
 });
 
-it.each([
-  ["state_write", "state_write", { namespace: "held-notes", key: "held", value: "v" }],
-  ["sanctuary_remember", "state_write", { key: "held", value: "v" }],
-  ["sanctuary_compound_execute", "sanctuary_compound_execute", { steps: [{ tool: "sanctuary_remember", args: { key: "held", value: "v" } }] }],
-] as const)("a sole-bound write through %s refuses before the gate and records no write", async (tool, gateOperation, args) => {
+/** The stamp stored under a key, wherever the write placed it (a remember write lands in an opaque handle namespace). */
+async function stampForKey(storage: MemoryStorage, key: string) {
+  const stamps = [];
+  for (const namespace of await storage.listNamespaces()) {
+    const stamp = await stampAt(storage, namespace, key);
+    if (stamp !== null) stamps.push(stamp);
+  }
+  expect(stamps).toHaveLength(1);
+  return stamps[0];
+}
+
+const SOLE_WRITES: Record<string, Record<string, unknown>> = {
+  state_write: { namespace: "sole-notes", key: "sole-write", value: "v" },
+  sanctuary_remember: { key: "sole-write", value: "v" },
+  sanctuary_compound_execute: { steps: [{ tool: "sanctuary_remember", args: { key: "sole-write", value: "v" } }] },
+};
+
+it("every tool that reaches the state_write handler stamps a sole-bound write unattributed", async () => {
   const b = await sole();
-  const count = async (operation: string) => (await b.app.auditLog.query({ operation_type: operation, limit: Number.MAX_SAFE_INTEGER })).total;
-  const writesBefore = await count("state_write");
-  const intentsBefore = await count("sanctuary_remember_intent");
-  const preGateBefore = await count(`gate_deny:${gateOperation}`);
-  const ledger = vi.spyOn(DenialLedger.prototype, "record");
-  b.approvals.mockClear();
-  expect(await b.call(tool, args)).toEqual(expectedRefusal());
-  expect(b.approvals).not.toHaveBeenCalled();
-  expect(await count("state_write")).toBe(writesBefore);
-  expect(await count("sanctuary_remember_intent")).toBe(intentsBefore);
-  expect(await count(`gate_deny:${gateOperation}`)).toBe(preGateBefore + 1);
-  expect(ledger.mock.calls.at(-1)).toEqual(["pre_gate_argument_refused", expect.objectContaining({ tool })]);
+  const listed = (await (b.app.server as unknown as { _requestHandlers: Map<string, Function> })._requestHandlers.get("tools/list")!({ method: "tools/list", params: {} }, {})) as { tools: Array<{ name: string }> };
+  const registered = new Set(listed.tools.map(tool => tool.name));
+  const cooperativeTools = compositions.mock.results.at(-1)!.value.tools as Array<{ name: string; approvalTargetToolName?: string }>;
+  // The state_write handler is reached by state_write itself, by every tool whose approval target is state_write,
+  // and by a compound plan's remember step (compoundStepPrimitive in agent-native/cooperative-surface.ts).
+  const reaching = [
+    "state_write",
+    ...cooperativeTools.filter(tool => tool.approvalTargetToolName === "state_write").map(tool => tool.name),
+    COOPERATIVE_TOOL_NAMES.compoundExecute,
+  ].filter(name => registered.has(name)).sort();
+  expect(reaching).toEqual(["sanctuary_compound_execute", "sanctuary_remember", "state_write"]);
+  for (const tool of reaching) {
+    const each = tool === reaching[0] ? b : await sole();
+    const count = async () => (await each.app.auditLog.query({ operation_type: "state_write", limit: Number.MAX_SAFE_INTEGER })).total;
+    const writesBefore = await count();
+    const result = await each.call(tool, SOLE_WRITES[tool]!);
+    expect(result, tool).not.toEqual(expectedRefusal());
+    expect(result.isError, tool).not.toBe(true);
+    expect(await count(), tool).toBe(writesBefore + 1);
+    expect(await stampForKey(each.storage, "sole-write"), tool).toMatchObject({ origin_actor: "unattributed", memory_class: "shared_entangled", derived_from: [] });
+  }
 });
 
 it("a sole-bound plan with no write still reaches the gate", async () => {
@@ -181,12 +203,13 @@ it("a sole-bound plan with no write still reaches the gate", async () => {
 it("setting the variable after a sole boot changes neither binding_source nor origin", async () => {
   const b = await sole();
   const binding = b.sources.currentSessionBinding();
-  for (const variable of ["", b.id, "another"]) {
+  for (const [index, variable] of ["", b.id, "another"].entries()) {
     vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", variable);
     expect(b.sources.currentSessionBinding()).toBe(binding);
     expect(binding).toMatchObject({ binding_source: "sole_identity" });
-    expect(await b.call("state_write", { namespace: "notes", key: "held", value: "v" })).toEqual(expectedRefusal());
-    expect(await b.storage.list("notes")).toEqual([]);
+    const written = await b.call("state_write", { namespace: "notes", key: `after-${index}`, value: "v" });
+    expect(written).not.toEqual(expectedRefusal());
+    expect(await stampAt(b.storage, "notes", `after-${index}`)).toMatchObject({ origin_actor: "unattributed", memory_class: "shared_entangled" });
   }
 });
 
