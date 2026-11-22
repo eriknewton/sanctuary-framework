@@ -397,12 +397,13 @@ function state_MAIN_VERB(fold: string, cues: Cue[]): IntentClassification | unde
 }
 export function classifyIntent(intent: string): IntentClassification {
   const points = Array.from(intent);
-  const oversize = points.length > HELP_INTENT_MAX_CHARS;
   // Only one BOM at the received entry is exempt; decoded and internal BOMs remain variant evidence.
+  // The exempt BOM is removed before the size and band decisions, so it changes neither which path runs nor where a band ends.
   if (intent.startsWith("\ufeff")) {
     intent = intent.slice(1);
     points.shift();
   }
+  const oversize = points.length > HELP_INTENT_MAX_CHARS;
   if (oversize) {
     const prefix = screen(points.slice(0, HELP_BAND_SCAN_CHARS).join(""));
     const suffix = screen(points.slice(-HELP_BAND_SCAN_CHARS).join(""));

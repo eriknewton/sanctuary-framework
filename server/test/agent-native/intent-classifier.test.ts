@@ -351,6 +351,12 @@ describe("bounded intent screening", () => {
       expect(Array.from(intent).length).toBeGreaterThan(HELP_INTENT_MAX_CHARS);
       expect(classifyIntent(`\ufeff${intent}`), intent.slice(0, 16)).toEqual(classifyIntent(intent));
     }
+    // At exactly the limit, a received BOM must not move the intent onto the oversize path:
+    // 7 + (band - 9) + 6 + (band - 4) = 2 * band = the limit, and the encoded letter straddles the band edge.
+    const atLimit = "delete " + " ".repeat(HELP_BAND_SCAN_CHARS - 9) + "%D0%96" + " ".repeat(HELP_BAND_SCAN_CHARS - 4);
+    expect(Array.from(atLimit)).toHaveLength(HELP_INTENT_MAX_CHARS);
+    expect(classifyIntent(`\ufeff${atLimit}`)).toEqual(classifyIntent(atLimit));
+    expect(classifyIntent(atLimit)).toMatchObject({ tool: null, example: null });
     expect(classifyIntent(intents[1]!)).toMatchObject({ safety_class: "gated", tool: "sanctuary_forget" });
     expect(classifyIntent(intents[2]!)).toMatchObject({ safety_class: "gated" });
   });
