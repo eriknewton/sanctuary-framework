@@ -1,4 +1,4 @@
-import { cp, mkdir, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -54,7 +54,14 @@ it("health and export bytes agree across fortresses with different local stores 
     const seed = await boot(a);
     try {
       await call(seed, "identity_create", { label: "ordinary" });
+      // One ordinary record, so the continuing path carries real agent-visible bytes and an export entry.
+      await call(seed, "state_write", { namespace: "notes", key: "one", value: "ordinary fixture" });
     } finally { await seed.close(); }
+    // The ordinary namespace's on-disk bytes, measured directly rather than through the method under test.
+    const notesDir = join(a, "state", "notes");
+    let ordinaryBytes = 0;
+    for (const file of await readdir(notesDir)) ordinaryBytes += (await stat(join(notesDir, file))).size;
+    expect(ordinaryBytes).toBeGreaterThan(0);
     // The custody envelope and identity ciphertext are identical before either measured boot.
     await cp(a, b, { recursive: true });
     async function observe(root: string, localRows: boolean) {
@@ -84,10 +91,12 @@ it("health and export bytes agree across fortresses with different local stores 
     const after = await observe(b, true);
     expect(after.storageBytes).toBe(before.storageBytes);
     expect(after.health).toBe(before.health);
-    // Both fixtures contain only reserved namespaces; this literal is independent of new source exports.
-    const expectedStorageBytes = 0;
+    // Both fixtures hold the same ordinary record beside their reserved namespaces; the expected
+    // value is the ordinary directory's measured size, independent of new source exports.
+    const expectedStorageBytes = ordinaryBytes;
     expect(before.storageBytes).toBe(expectedStorageBytes);
     expect(after.storageBytes).toBe(expectedStorageBytes);
+    expect(JSON.parse(before.exported).content[0].text).toContain("notes");
     expect(after.exported).toBe(before.exported);
     expect(before.missingSizeError).toBe(true);
     expect(after.missingSizeError).toBe(true);
