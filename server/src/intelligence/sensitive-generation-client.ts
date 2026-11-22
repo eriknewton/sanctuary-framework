@@ -189,6 +189,8 @@ export class SensitiveGenerationClient {
     if (signal?.aborted) return { ok: false, reason: "cancelled" };
     return new Promise((resolve) => {
       let settled = false;
+      // Assigned once below, after the handlers that clear it are defined; those handlers read it first.
+      // eslint-disable-next-line prefer-const
       let timer: unknown;
       let response: IncomingMessage | undefined;
       let req: ClientRequest | undefined;

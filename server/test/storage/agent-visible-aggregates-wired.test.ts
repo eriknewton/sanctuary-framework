@@ -3,12 +3,16 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { expect, it, vi } from "vitest";
-import { createSanctuaryServer } from "../../dist/index.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
 import { createTempFortress, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 
 it("health and export bytes agree across fortresses with different local stores and operator audit rows", async () => {
+  // The wired path is the built server (npm test builds dist first); it is loaded by URL so the
+  // tests typecheck does not need a dist that exists only after a build. Types come from src.
+  const { createSanctuaryServer } = (await import(
+    new URL("../../dist/index.js", import.meta.url).href
+  )) as typeof import("../../src/index.js");
   const fortress = await createTempFortress("aggregate-wired");
   const oldAgent = process.env.SANCTUARY_AGENT_ID;
   const oldIdentity = process.env.SANCTUARY_SESSION_IDENTITY_ID;

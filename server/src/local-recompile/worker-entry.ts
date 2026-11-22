@@ -27,7 +27,6 @@ let oplog: LocalOplog | undefined;
 let results: LocalResultsStore | undefined;
 let housekeeping: ReturnType<typeof setInterval> | undefined;
 let sweeping = false;
-let malformed = 0;
 
 function terminal(): boolean {
   return state === "state_DEAD";
@@ -133,11 +132,8 @@ async function init(storageRoot: string, oplogKey: Uint8Array, resultsKey: Uint8
 
 process.on("message", (raw: unknown) => {
   const message = acceptMessage("to_worker", raw);
-  // A message outside the schema or the size cap is ignored and counted, never interpreted.
-  if (message === null) {
-    malformed += 1;
-    return;
-  }
+  // A message outside the schema or the size cap is ignored, never interpreted.
+  if (message === null) return;
   // A terminal worker acts on nothing more; key bytes that still arrive are zeroed unused.
   if (terminal()) {
     if (message.type === "init") {

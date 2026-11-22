@@ -177,7 +177,7 @@ export class LocalWorkerClient {
   private write(child: ChildProcess, message: ParentMessage): boolean {
     if (!child.connected) return false;
     const id = (this.writes += 1);
-    let accepted = false;
+    let accepted: boolean;
     let delivered = false;
     try {
       accepted = child.send(message, (error: Error | null) => {
