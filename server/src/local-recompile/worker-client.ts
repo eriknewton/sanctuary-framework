@@ -19,6 +19,7 @@ import {
   WORKER_RESPAWN_MAX_MS,
   acceptMessage,
   assertSendable,
+  type AuthorityReply,
   type ParentMessage,
   type WorkerFaultKind,
   type WorkerMessage,
@@ -48,6 +49,20 @@ export interface LocalWorkerClientOptions {
   timers?: WorkerTimers;
   spawn?: WorkerSpawn;
   onEvent?: (event: WorkerClientEvent) => void;
+  /**
+   * Answers a worker's authority request from memory. Absent, every request is
+   * refused as unknown, so a client built without it can never grant a job.
+   */
+  answerAuthority?: (requestId: string) => AuthorityReply;
+}
+
+function refuseUnknown(requestId: string): AuthorityReply {
+  return { type: "authority_reply", request_id: requestId, outcome: "refused", cause: "request_unknown" };
+}
+
+/** Zero the key bytes a granted reply carried, once it has been written or refused. */
+function zeroAuthorityReply(reply: AuthorityReply): void {
+  if (reply.outcome === "granted") for (const key of reply.keys) key.fill(0);
 }
 
 const realTimers: WorkerTimers = {
@@ -77,6 +92,7 @@ export class LocalWorkerClient {
   private readonly timers: WorkerTimers;
   private readonly spawnWorker: WorkerSpawn;
   private readonly onEvent: (event: WorkerClientEvent) => void;
+  private readonly answerAuthority: (requestId: string) => AuthorityReply;
   private child: ChildProcess | undefined;
   private currentState: WorkerState | "state_CLOSED" = "state_DEAD";
   private backoffMs = WORKER_RESPAWN_INITIAL_MS;
@@ -117,6 +133,7 @@ export class LocalWorkerClient {
     this.timers = options.timers ?? realTimers;
     this.spawnWorker = options.spawn ?? fork;
     this.onEvent = options.onEvent ?? (() => undefined);
+    this.answerAuthority = options.answerAuthority ?? refuseUnknown;
   }
 
   get state(): WorkerState | "state_CLOSED" {
@@ -278,6 +295,9 @@ export class LocalWorkerClient {
       }, WORKER_RESPAWN_MAX_MS);
     } else if (message.type === "status") {
       this.onEvent({ type: "status", status: message });
+    } else if (message.type === "authority_request") {
+      // Answered on a later turn of the event loop, so it never shares a turn with an agent call.
+      setImmediate(() => this.replyAuthority(child, message.request_id));
     } else {
       // A fault ends the child's turn at once, before its exit arrives: it gets no more work, leaves
       // state_SPAWNING or state_READY for state_DEAD, and its ready and stable timers stop, so it can
@@ -290,6 +310,27 @@ export class LocalWorkerClient {
       this.setState("state_DEAD");
       this.onEvent({ type: "fault", kind: message.kind });
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  }
+
+  private replyAuthority(child: ChildProcess, requestId: string): void {
+    // Only the ready child that asked receives the answer; a reply computed for anyone else is never built.
+    if (child !== this.readyChild || this.closing || this.currentState !== "state_READY") return;
+    let reply: AuthorityReply;
+    try {
+      reply = this.answerAuthority(requestId);
+    } catch {
+      reply = refuseUnknown(requestId);
+    }
+    try {
+      assertSendable("to_worker", reply);
+      this.write(child, reply);
+    } catch {
+      // A reply that fails the schema is replaced by a refusal, so the job ends rather than waits.
+      this.write(child, refuseUnknown(requestId));
+    } finally {
+      // Advanced serialization copied the bytes when send returned; the server keeps no key copy.
+      zeroAuthorityReply(reply);
     }
   }
 

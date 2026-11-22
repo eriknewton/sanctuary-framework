@@ -140,10 +140,16 @@ process.on("message", (raw: unknown) => {
       message.oplog_key.fill(0);
       message.results_key.fill(0);
     }
+    if (message.type === "authority_reply" && message.outcome === "granted") for (const key of message.keys) key.fill(0);
     return;
   }
   if (message.type === "shutdown") {
     stop();
+    return;
+  }
+  if (message.type === "authority_reply") {
+    // No job is waiting on an authority reply yet; its key bytes are zeroed unused.
+    if (message.outcome === "granted") for (const key of message.keys) key.fill(0);
     return;
   }
   init(message.storage_root, message.oplog_key, message.results_key).catch(() => fault("uncaught"));
