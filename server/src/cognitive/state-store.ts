@@ -479,6 +479,7 @@ export const RESERVED_NAMESPACE_PREFIXES = [
  * want a precise label (see `getReservedNamespaceViolation` directly below)
  * something to match against; it is never the boundary itself.
  */
+// Must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts, which mirrors this rule because storage cannot import its consumers.
 export function isReservedNamespace(namespace: string): boolean {
   return namespace.startsWith("_");
 }

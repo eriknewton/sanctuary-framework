@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -67,6 +67,25 @@ it("memory agent discovery skips local namespaces before charging its namespace 
   for (const namespace of [...ordinary, "_local_oplog", "_local_results"]) await storage.write(namespace, "one", new Uint8Array([1]));
   await expect(storage.listNamespaces()).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
   await expect(discover(storage)).resolves.toEqual(ordinary);
+});
+
+it("filesystem health size refuses when an ordinary entry cannot be read, and reads 0 for a missing state root", async () => {
+  const { storage, root } = await filesystem();
+  await storage.write("notes", "one", new Uint8Array([1, 2, 3]));
+  // A self-referencing link fails stat with ELOOP for every user, root included, unlike a permission fixture.
+  await symlink(join(root, "looping"), join(root, "looping"));
+  await expect(size(storage)).rejects.toMatchObject({ code: "ELOOP" });
+  await expect(new FilesystemStorage(join(root, "never-created")).totalSizeOfNonReservedNamespaces!()).resolves.toBe(0);
+});
+
+it("filesystem health size skips a reserved namespace before reading its directory", async () => {
+  const { storage, root } = await filesystem();
+  const ordinary = new Uint8Array([1, 2, 3]);
+  await storage.write("notes", "one", ordinary);
+  await storage.write("_local_oplog", "one", ordinary);
+  // Reading this directory's entries would hit the ELOOP link and refuse; skipping the name first never sees it.
+  await symlink(join(root, "_local_oplog", "looping.enc"), join(root, "_local_oplog", "looping.enc"));
+  await expect(size(storage)).resolves.toBe(ordinary.length);
 });
 
 it("pins aggregate reserved-name parity and the complete local skip set", () => {

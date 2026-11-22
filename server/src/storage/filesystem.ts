@@ -1743,36 +1743,55 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // Must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
     const capability = this.darwinCapability();
     if (capability) return capability.client.call("totalSizeOfNonReservedNamespaces");
-    let total = 0;
-
+    let namespaces: string[];
     try {
-      const namespaces = await readdir(this.activeBasePath());
-      for (const ns of namespaces) {
-        let decoded: string | undefined;
-        try { decoded = decodeRawFilesystemStorageName(ns, "namespace"); }
-        catch { /* Undecodable names retain totalSize's path for that entry. */ }
-        // Reserved names are skipped before stat or directory reads so internal bytes never enter this aggregate.
-        if (decoded !== undefined && isAgentAggregateReservedNamespace(decoded)) continue;
-        const rootEntryPath = join(this.activeBasePath(), ns);
-        const rootEntryStat = await stat(rootEntryPath);
-        if (!rootEntryStat.isDirectory()) continue;
-        // totalSize measures bytes already under the state root for emptiness
-        // gates; resolving root entries as namespaces would turn stray
-        // directories into false-empty or partial-size answers.
-        const nsPath = rootEntryPath;
-
-        const files = await readdir(nsPath);
-        for (const file of files) {
-          const filePath = join(nsPath, file);
-          const fileStat = await stat(filePath);
-          total += fileStat.size;
-        }
-      }
-    } catch {
-      // If base path doesn't exist yet, total is 0
+      namespaces = await readdir(this.activeBasePath());
+    } catch (error) {
+      // Only a state root that does not exist yet reads as empty; any other failure refuses rather than undercount.
+      if (isMissingEntryError(error)) return 0;
+      throw error;
     }
-
+    let total = 0;
+    for (const ns of namespaces) {
+      let decoded: string | undefined;
+      try { decoded = decodeRawFilesystemStorageName(ns, "namespace"); }
+      catch { /* Undecodable names retain totalSize's path for that entry. */ }
+      // Reserved names are skipped before stat or directory reads so internal bytes never enter this aggregate.
+      if (decoded !== undefined && isAgentAggregateReservedNamespace(decoded)) continue;
+      const rootEntryPath = join(this.activeBasePath(), ns);
+      // An entry removed while the scan runs holds no bytes; every other stat or read error propagates.
+      const rootEntryStat = await statOrMissing(rootEntryPath);
+      if (rootEntryStat === null || !rootEntryStat.isDirectory()) continue;
+      // totalSize measures bytes already under the state root for emptiness
+      // gates; resolving root entries as namespaces would turn stray
+      // directories into false-empty or partial-size answers.
+      let files: string[];
+      try {
+        files = await readdir(rootEntryPath);
+      } catch (error) {
+        if (isMissingEntryError(error)) continue;
+        throw error;
+      }
+      for (const file of files) {
+        const fileStat = await statOrMissing(join(rootEntryPath, file));
+        if (fileStat !== null) total += fileStat.size;
+      }
+    }
     return total;
+  }
+}
+
+function isMissingEntryError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/** stat that reads a concurrently removed entry as absent and propagates every other error. */
+async function statOrMissing(path: string): Promise<Stats | null> {
+  try {
+    return await stat(path);
+  } catch (error) {
+    if (isMissingEntryError(error)) return null;
+    throw error;
   }
 }
 

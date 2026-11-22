@@ -212,8 +212,9 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     // Must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
     let total = 0;
     for (const [key, entry] of this.store) {
-      // Composite keys begin with their namespace, so the reserved prefix excludes internal bytes before counting.
-      if (!isAgentAggregateReservedNamespace(key)) total += entry.data.length;
+      // The predicate sees the namespace component of the composite key (see storageKey), never the key itself.
+      const namespace = key.slice(0, key.indexOf("/"));
+      if (!isAgentAggregateReservedNamespace(namespace)) total += entry.data.length;
     }
     return total;
   }
