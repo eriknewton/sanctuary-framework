@@ -31,6 +31,7 @@ import {
   type Persistable,
   type Taint,
 } from "./write-gate.js";
+import { SdwValidationError } from "./errors.js";
 import { decodeSdwRecord } from "./store-codec.js";
 import { readReplayAnchor } from "./replay-anchor.js";
 
@@ -348,18 +349,24 @@ export class SdwDocumentCorpusStore {
     documentId: string,
     txn?: SdwCorpusTxn,
   ): Promise<{ readonly raw: Uint8Array; readonly record: SdwDocumentRecord } | null> {
-    const storageKey = documentKey(documentId);
-    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId));
     if (raw === null) return null;
-    const record = decodeSdwRecord<SdwDocumentRecord>(raw, {
-      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
-      storageKey,
-      fortressId: this.fortressId,
-      encryptionKey: this.encryptionKey,
-      expectedKind: "document",
+    // Must match decodeDocument below: this read and recall's read-ahead decode with one set of options.
+    return { raw, record: this.decodeDocument(documentId, raw) };
+  }
+
+  /**
+   * Decodes document bytes the caller already read from this document's key, with exactly the options
+   * {@link getDocumentRaw} applies (namespace, storage key, fortress id, encryption key, expected kind and the
+   * document identity check), so recall's read-ahead, which reads the bytes itself, authenticates them the same way.
+   * Must match getDocumentRaw above.
+   */
+  decodeDocument(documentId: string, raw: Uint8Array): SdwDocumentRecord {
+    return decodeSdwRecord<SdwDocumentRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey: documentKey(documentId), fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey, expectedKind: "document",
       verifyIdentity: (record) => record.document_id === documentId,
     });
-    return { raw, record };
   }
 
   async getChunk(documentId: string, chunkOrdinal: number, chunkId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentChunkRecord | null> {
@@ -376,9 +383,29 @@ export class SdwDocumentCorpusStore {
     const storageKey = documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId);
     const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
     if (raw === null) return null;
-    const record = decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
+    return { raw, record: this.decodeChunk(documentId, chunkOrdinal, chunkId, raw) };
+  }
+
+  /**
+   * {@link getChunk} with the stored record refused, before its bytes are read into memory or decoded, when it is
+   * longer than maxBytes. A storage backend without StorageBackend.readBounded is refused too: a read that cannot
+   * be bounded is never substituted for one that can. Must match readBounded in storage/interface.ts; recall's
+   * read-ahead in adapters/sdw-memory-backend.ts is the consumer and derives maxBytes.
+   */
+  async getChunkBounded(documentId: string, chunkOrdinal: number, chunkId: string, maxBytes: number): Promise<SdwDocumentChunkRecord | null> {
+    if (typeof this.storage.readBounded !== "function") {
+      throw new SdwValidationError("operation_refused", "SDW memory storage offers no bounded read");
+    }
+    const raw = await this.storage.readBounded(
+      SDW_DOCUMENT_CORPUS_NAMESPACE, documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId), maxBytes);
+    return raw === null ? null : this.decodeChunk(documentId, chunkOrdinal, chunkId, raw);
+  }
+
+  /** The one set of chunk decode options; getChunkRaw and getChunkBounded both decode through it. */
+  private decodeChunk(documentId: string, chunkOrdinal: number, chunkId: string, raw: Uint8Array): SdwDocumentChunkRecord {
+    return decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
-      storageKey,
+      storageKey: documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId),
       fortressId: this.fortressId,
       encryptionKey: this.encryptionKey,
       expectedKind: "document_chunk",
@@ -387,19 +414,27 @@ export class SdwDocumentCorpusStore {
         record.chunk_id === chunkId &&
         record.chunk_ordinal === chunkOrdinal,
     });
-    return { raw, record };
   }
 
   async getProvenanceRaw(documentId: string, txn?: SdwCorpusTxn): Promise<{ readonly raw: Uint8Array; readonly record: SdwMemoryProvenanceRecord } | null> {
     const storageKey = documentProvenanceKey(documentId);
     const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
     if (raw === null) return null;
-    const record = decodeSdwRecord<SdwMemoryProvenanceRecord>(raw, {
+    return { raw, record: this.decodeProvenance(documentId, raw) };
+  }
+
+  /**
+   * Decodes provenance bytes the caller already read from this document's provenance key, with exactly the
+   * options {@link getProvenanceRaw} applies (namespace, storage key, fortress id, encryption key, expected kind
+   * and the document identity check), so a caller that hashed those bytes decodes the same version it hashed.
+   */
+  decodeProvenance(documentId: string, raw: Uint8Array): SdwMemoryProvenanceRecord {
+    const storageKey = documentProvenanceKey(documentId);
+    return decodeSdwRecord<SdwMemoryProvenanceRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, fortressId: this.fortressId,
       encryptionKey: this.encryptionKey, expectedKind: "memory_provenance",
       verifyIdentity: (candidate) => candidate.document_id === documentId,
     });
-    return { raw, record };
   }
 
   async getProvenanceStatusRaw(documentId: string, txn?: SdwCorpusTxn): Promise<{ readonly raw: Uint8Array; readonly record: SdwMemoryProvenanceStatusRecord } | null> {

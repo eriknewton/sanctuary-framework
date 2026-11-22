@@ -22,7 +22,9 @@ import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { normalizedArgsHash, OpaqueNamespaceRegistry, fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
+import type { DenialCause, DenialRecorder, DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../../src/storage/interface.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -66,6 +68,8 @@ async function fixture(sessionScoped = false, ambiguousOwner = false, restart = 
     approvedHash = request.args_binding;
     return { decision: "approve", decided_at: new Date().toISOString(), decided_by: "human" };
   });
+  const denials: Array<[DenialCause, DenialRecordInput]> = [];
+  const denialLedger: DenialRecorder = { record: (cause, input) => { denials.push([cause, input]); } };
   const server = createServer([{
     ...tool,
     tool_class: "write",
@@ -73,14 +77,14 @@ async function fixture(sessionScoped = false, ambiguousOwner = false, restart = 
       projection = await tool.approvalTargetArgs!(args);
       return projection;
     },
-  }], { gate: new ApprovalGate(DEFAULT_POLICY, baseline, channel, audit), auditLog: audit });
+  }], { gate: new ApprovalGate(DEFAULT_POLICY, baseline, channel, audit), auditLog: audit, denialLedger });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   cleanup.push(() => server.close());
   const client = new Client({ name: "cold-export-test", version: "1.0.0" });
   await client.connect(clientTransport);
   cleanup.push(() => client.close());
-  return { cold, reopened, client, owned, foreign, projection: () => projection, approvedHash: () => approvedHash };
+  return { cold, reopened, client, owned, foreign, denials, projection: () => projection, approvedHash: () => approvedHash };
 }
 
 describe("durable namespace export", () => {
@@ -112,18 +116,19 @@ describe("durable namespace export", () => {
     await expect(f.cold.export()).rejects.toThrow("cannot enumerate");
   });
 
-  it.each([false, true])("surfaces fixed discovery remediation before approval (session=%s)", async (sessionScoped) => {
+  it.each([false, true])("records the fixed discovery remediation operator-side before approval (session=%s)", async (sessionScoped) => {
     const f = await fixture(sessionScoped);
     vi.spyOn(f.reopened, "listNamespaces").mockResolvedValue(
       Array.from({ length: MAX_DISCOVERED_NAMESPACES + 1 }, (_, i) => `ns-${i}`),
     );
     const exportState = vi.spyOn(f.cold, "exportNamespaces");
     const result = await f.client.callTool({ name: "state_export", arguments: {} });
-    expect(result.isError).toBe(true);
-    const payload = JSON.parse((result.content as Array<{ text: string }>)[0]!.text);
-    expect(payload.remediation).toBe(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
-    expect(payload.remediation).toContain("1024 namespaces or 65536 scanned directory entries");
-    expect(payload.remediation).toContain("Remedy:");
+    // The agent receives the one refusal; the capacity guidance is the ledger's.
+    expect(result).toEqual(expectedRefusal());
+    expect(f.denials).toHaveLength(1);
+    expect(f.denials[0]![0]).toBe("export_capacity");
+    expect(f.denials[0]![1].error_message).toBe(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+    expect(f.denials[0]![1].error_message).toContain("1024 namespaces or 65536 scanned directory entries");
     expect(f.approvedHash()).toBeUndefined();
     expect(exportState).not.toHaveBeenCalled();
     await expect(f.cold.export()).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);

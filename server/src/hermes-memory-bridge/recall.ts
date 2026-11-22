@@ -17,6 +17,28 @@ export const RECALL_MAX_CANDIDATES_SCANNED = MEMORY_CORPUS_SCAN_CAP;
 export const RECALL_MAX_PASSAGE_SCAN_UNITS = MAX_RESULT_FRAME_BYTES;
 export const RECALL_MAX_SCANNED_UNITS_PER_CALL = 32 * RECALL_MAX_PASSAGE_SCAN_UNITS; // Thirty-two maximum passage scans per call.
 export const RECALL_MAX_RETAINED_CANDIDATES = RECALL_MAX_PASSAGES;
+// Five is the number of verification failures among the top-ranked candidates that can be absorbed before the
+// answer may differ from verifying every passage; bridge saves are always signed by the bridge, so failures come
+// only from tamper or owner imports. Eight entries bound the unverified candidates one recall holds and verifies.
+export const RECALL_VERIFY_CANDIDATES = RECALL_MAX_PASSAGES + 5;
+// Twenty-five milliseconds is about twice the full per-passage verification cost of 12.3 ms estimated on one 4-CPU
+// Linux build machine, rounded up; the scan stops this long before the wall so the candidates it ranked can still be
+// verified inside it.
+export const RECALL_VERIFY_RESERVE_MS = RECALL_VERIFY_CANDIDATES * 25;
+// Four equals Node's default thread-pool size (UV_THREADPOOL_SIZE unset), the pool every asynchronous file read
+// runs on. It is a bounded observation, not a proof: on one 4-CPU Linux build machine (2000 passages) windows of 2
+// to 16 measured within session drift of each other, and the smaller window bounds the reads and retained state one
+// call holds.
+export const RECALL_READ_AHEAD_PASSAGES = 4;
+// Two: a read-ahead slot issues its document and provenance reads together, then one status, provenance or chunk
+// read at a time, so at most two of its reads are ever in flight at once.
+export const RECALL_READS_PER_SLOT = 2;
+// The passage text one call's read-ahead retains, at most: each slot drops its text once its passage passes
+// RECALL_MAX_PASSAGE_SCAN_UNITS, so it holds at most that many units, and at most RECALL_READ_AHEAD_PASSAGES slots
+// exist. This bounds retained text; the one chunk record each slot reads and decodes at a time is bounded apart, by
+// the read-side maximum recallChunkRecordMaxBytes. Must match the release and the bounded chunk read in
+// readRecallSlot in sdw/adapters/sdw-memory-backend.ts.
+export const RECALL_READ_AHEAD_RETAINED_TEXT_UNITS = RECALL_READ_AHEAD_PASSAGES * RECALL_MAX_PASSAGE_SCAN_UNITS;
 // Must match SHIM_CONNECT_HELLO_TIMEOUT_MS in hermes-memory-client/protocol.ts.
 export const RECALL_PREFETCH_BUDGET_MS = 5000; // Five seconds is the local prefetch window.
 export const RECALL_REPLY_RESERVE_MS = 1000; // One second is reserved for audit and response delivery.
@@ -68,10 +90,16 @@ export interface HermesRecallLimits {
   readonly scannedUnits: number;
   readonly retained: number;
   readonly wallMs: number;
+  readonly verifyCandidates: number;
+  readonly verifyReserveMs: number;
+  /** Passages read ahead of the ordered commit; 1 keeps the one-passage-at-a-time order of reads. */
+  readonly readAhead: number;
 }
 const limits: HermesRecallLimits = Object.freeze({ candidates: RECALL_MAX_CANDIDATES_SCANNED,
   passageUnits: RECALL_MAX_PASSAGE_SCAN_UNITS, scannedUnits: RECALL_MAX_SCANNED_UNITS_PER_CALL,
-  retained: RECALL_MAX_RETAINED_CANDIDATES, wallMs: RECALL_WALL_BUDGET_MS });
+  retained: RECALL_MAX_RETAINED_CANDIDATES, wallMs: RECALL_WALL_BUDGET_MS,
+  verifyCandidates: RECALL_VERIFY_CANDIDATES, verifyReserveMs: RECALL_VERIFY_RESERVE_MS,
+  readAhead: RECALL_READ_AHEAD_PASSAGES });
 
 /** One call owns all counters and retained excerpts; overrides can only tighten production bounds. */
 export class HermesRecallBudget {
@@ -81,6 +109,7 @@ export class HermesRecallBudget {
   candidatesScanned = 0;
   unitsScanned = 0;
   maximumRetained = 0;
+  maximumHeld = 0;
   private readonly startedAt: number;
   private readonly best: HermesRecallCandidate[] = [];
   constructor(query: string, readonly nowMs: () => number, readonly signal: AbortSignal, tighten: Partial<HermesRecallLimits> = {}) {
@@ -101,8 +130,35 @@ export class HermesRecallBudget {
     }
     return true;
   }
-  candidate(): boolean {
+  /** The scan phase ends the verification reserve before the wall, so ranked candidates are still verified inside it. */
+  scanning(): boolean {
     if (!this.active()) return false;
+    // The reserve is carved out of the wall, never added to it: verification spends only time the wall already allows.
+    if (this.nowMs() - this.startedAt >= this.limits.wallMs - this.limits.verifyReserveMs) {
+      this.truncated = true;
+      return false;
+    }
+    return true;
+  }
+  /**
+   * The scan's stop conditions (abort, the wall minus the verification reserve, the scanned-unit cap) as a pure
+   * question. It changes no state: scanning() sets truncated as a side effect, so the read-ahead, which runs ahead
+   * of the commit and must leave every budget decision to the commit in listing order, asks only this.
+   */
+  scanOpen(): boolean {
+    return !this.signal.aborted && this.nowMs() - this.startedAt < this.limits.wallMs - this.limits.verifyReserveMs &&
+      this.unitsScanned < this.limits.scannedUnits;
+  }
+  /** The verification phase stops only for abort and the wall; the scan caps bound scanning, not verifying ranked candidates. */
+  verifying(): boolean {
+    if (this.signal.aborted || this.nowMs() - this.startedAt >= this.limits.wallMs) {
+      this.truncated = true;
+      return false;
+    }
+    return true;
+  }
+  candidate(): boolean {
+    if (!this.scanning()) return false;
     if (this.candidatesScanned === this.limits.candidates) { this.truncated = true; return false; }
     this.candidatesScanned++;
     return true;
@@ -113,9 +169,17 @@ export class HermesRecallBudget {
     if (units > remaining) { this.truncated = true; return false; }
     return true;
   }
+  get retainedCount(): number {
+    return this.best.length;
+  }
   retain(passage: Pick<MemoryPassage, "passage_id" | "created_at" | "text">): void {
+    const candidate = this.score(passage);
+    if (candidate !== null) this.admit(candidate);
+  }
+  /** Score without retaining: a score carries no credibility and only orders candidates for verification. */
+  score(passage: Pick<MemoryPassage, "passage_id" | "created_at" | "text">): HermesRecallCandidate | null {
     const projected = recallTimestamp(passage.created_at);
-    if (projected === null) return;
+    if (projected === null) return null;
     const text = passage.text.toLowerCase().normalize("NFC");
     let distinct = 0;
     let occurrences = 0;
@@ -125,9 +189,12 @@ export class HermesRecallBudget {
       if (count > 0) distinct++;
       occurrences += count;
     }
-    if (distinct === 0) return;
-    const candidate = { passage_id: passage.passage_id, created_at: projected.created_at, instant: projected.instant,
+    if (distinct === 0) return null;
+    return { passage_id: passage.passage_id, created_at: projected.created_at, instant: projected.instant,
       excerpt: recallPrefix(passage.text, RECALL_PASSAGE_MAX_UNITS), distinct, occurrences };
+  }
+  /** Retain a candidate whose passage has already passed verification. */
+  admit(candidate: HermesRecallCandidate): void {
     const index = this.best.findIndex(other => compareRecallCandidates(candidate, other) < 0);
     const position = index < 0 ? this.best.length : index;
     if (position >= this.limits.retained) return;
@@ -138,6 +205,31 @@ export class HermesRecallBudget {
   result(): HermesRecallResult {
     return { outcome: "recalled", context: this.best.map(p => `- (saved ${p.created_at.slice(0, RECALL_DATE_UNITS)}) ${p.excerpt}\n`).join(""),
       passages: this.best.map(p => ({ passage_id: p.passage_id, created_at: p.created_at })), truncated: this.truncated };
+  }
+}
+
+/** The best unverified candidates of one recall, each with the record its verification must bind to. */
+export class HermesRecallCandidateHeap<T> {
+  private readonly entries: { readonly candidate: HermesRecallCandidate; readonly bound: T }[] = [];
+  /** Set once a scored candidate was dropped for capacity; the answer may then miss a passage verify-everything returns. */
+  overflowed = false;
+  constructor(private readonly budget: HermesRecallBudget) {}
+  get size(): number {
+    return this.entries.length;
+  }
+  offer(candidate: HermesRecallCandidate, bound: T): void {
+    const index = this.entries.findIndex(other => compareRecallCandidates(candidate, other.candidate) < 0);
+    const position = index < 0 ? this.entries.length : index;
+    // Bounded state from untrusted input: at most verifyCandidates entries, each one excerpt prefix and one record,
+    // whatever the corpus size or scan order, so the verification work per call is bounded by the same number.
+    if (position >= this.budget.limits.verifyCandidates) { this.overflowed = true; return; }
+    if (this.entries.length === this.budget.limits.verifyCandidates) { this.entries.pop(); this.overflowed = true; }
+    this.entries.splice(position, 0, { candidate, bound });
+    this.budget.maximumHeld = Math.max(this.budget.maximumHeld, this.entries.length);
+  }
+  /** Remove and return the best remaining candidate, in compareRecallCandidates order. */
+  take(): { readonly candidate: HermesRecallCandidate; readonly bound: T } | undefined {
+    return this.entries.shift();
   }
 }
 

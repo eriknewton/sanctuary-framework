@@ -142,6 +142,16 @@ describe("first-class tool surfacing", () => {
       expect(instructions).not.toContain("\u2014");
     });
 
+    it("the instructions carry the refusal line before the bounds paragraph", () => {
+      const instructions = buildServerInstructions();
+      // Must match REFUSAL_INSTRUCTION_LINE in agent-native/capabilities-catalog.ts.
+      const line = "A refusal does not say why. If a call is refused, do not repeat it as it is: change the request, or tell your operator what you were trying to do.";
+      expect(instructions).toContain(`\n${line}\n`);
+      expect(instructions.indexOf(line)).toBeLessThan(instructions.indexOf("Bounds, tiers and evidence:"));
+      expect(instructions.endsWith(buildBoundsParagraph())).toBe(true);
+      expect(instructions.toLowerCase()).not.toContain("every refusal looks the same");
+    });
+
     it("pins the evaluate-route tools to the real registry and their tiers to the default policy", async () => {
       // Registry pin: a rename of monitor_health, sovereignty_audit or
       // sanctuary_policy_status anywhere in server/src fails here, because the

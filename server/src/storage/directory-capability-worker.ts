@@ -182,6 +182,12 @@ async function perform(
       const value = await storage.read(namespace, String(args[0]));
       return value === null ? null : Buffer.from(value).toString("base64");
     }
+    case "readBounded": {
+      // Must match FilesystemStorage.readBounded in filesystem.ts: the bound is applied here, before the bytes are encoded.
+      const { namespace, args } = requestNamespaceArg(request);
+      const value = await storage.readBounded(namespace, String(args[0]), Number(args[1]));
+      return value === null ? null : Buffer.from(value).toString("base64");
+    }
     case "delete": {
       const { namespace, args } = requestNamespaceArg(request);
       return storage.delete(namespace, String(args[0]), Boolean(args[1]));

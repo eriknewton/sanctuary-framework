@@ -42,11 +42,13 @@ import {
 import { SIEM_EXPORT_FORMATS, createSIEMTools } from "../../src/audit/siem-tools.js";
 import { createServer } from "../../src/router.js";
 import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
+import type { DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
 import type { ToolDefinition } from "../../src/router.js";
 import { Broker } from "../../src/disclosure/broker/broker.js";
 import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
 import type { Backend } from "../../src/disclosure/broker/backend-interface.js";
 import { SecretNotFoundError } from "../../src/disclosure/broker/backend-interface.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 const ALLOWED_VIEW_KEYS = [...AGENT_AUDIT_VIEW_FIELDS].sort();
 const ALLOWED_EVENT_KEYS = [
@@ -420,7 +422,7 @@ describe("agent-audit-allowlist: audit_export_siem (MED-1, MED-3)", () => {
 });
 
 describe("agent-audit-allowlist: router catch-all (MED-2 fail-closed errors)", () => {
-  it("(e) returns a generic error + audit_ref to the agent and logs the full error operator-side", async () => {
+  it("(e) returns the one refusal to the agent and logs the full error operator-side under a linked ref", async () => {
     const storage = new MemoryStorage();
     const auditLog = new AuditLog(storage, generateRandomKey());
     const SECRET = "SECRET_INTERNAL_/etc/sanctuary/policy.yaml not found";
@@ -435,9 +437,11 @@ describe("agent-audit-allowlist: router catch-all (MED-2 fail-closed errors)", (
         },
       },
     ];
+    const denials: Array<[string, DenialRecordInput]> = [];
     const server = createServer(tools, {
       auditLog,
       currentAgentId: () => "ag-err",
+      denialLedger: { record: (cause, input) => { denials.push([cause, input]); } },
     });
     const handler = (
       server as unknown as { _requestHandlers: Map<string, Function> }
@@ -446,22 +450,22 @@ describe("agent-audit-allowlist: router catch-all (MED-2 fail-closed errors)", (
       { method: "tools/call" as const, params: { name: "boom", arguments: {} } },
       {}
     );
-    const payload = JSON.parse(res.content[0].text);
-    // Agent sees ONLY the generic shape — never the raw message.
-    expect(payload.error).toBe("tool execution failed");
-    expect(typeof payload.audit_ref).toBe("string");
-    expect(payload.audit_ref).toMatch(/^audit:tool_error:/);
-    expect(JSON.stringify(payload)).not.toContain(SECRET);
-    expect(JSON.stringify(payload)).not.toContain("/etc/sanctuary");
-    expect(res.isError).toBe(true);
+    // Agent sees ONLY the one refusal — never the raw message or a ref.
+    expect(res).toEqual(expectedRefusal());
+    expect(JSON.stringify(res)).not.toContain(SECRET);
+    expect(JSON.stringify(res)).not.toContain("/etc/sanctuary");
 
-    // Operator-side: the full error IS in the audit log under the same ref.
-    await new Promise((r) => setTimeout(r, 50));
+    // Operator-side: the full error IS in the audit log, under the ref the
+    // ledger's handler-error record links to.
+    expect(denials).toHaveLength(1);
+    expect(denials[0]![0]).toBe("handler_error");
+    const linkedRef = denials[0]![1].linked_ref;
+    expect(linkedRef).toMatch(/^audit:tool_error:/);
     const q = await auditLog.query({ limit: 50 });
     const logged = q.entries.find((e) => e.operation === "tool_error:boom");
     expect(logged).toBeDefined();
     expect(logged?.details?.error).toBe(SECRET);
-    expect(logged?.details?.audit_ref).toBe(payload.audit_ref);
+    expect(logged?.details?.audit_ref).toBe(linkedRef);
     expect(logged?.result).toBe("failure");
   });
 });

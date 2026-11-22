@@ -117,7 +117,11 @@ export function documentProvenanceKey(documentId: string): string {
   return `prov.${documentId}`;
 }
 
-/** Replace-in-place quarantine status; never an attacker-growable event log. */
+/**
+ * Replace-in-place quarantine status; never an attacker-growable event log.
+ * Must match documentProvenanceStatusKeyPrefix in adapters/sdw-memory-backend.ts, whose listing prefix recall's
+ * status hint compares against these keys.
+ */
 export function documentProvenanceStatusKey(documentId: string): string {
   assertSdwIdentifier(documentId, "document_id");
   return `prov-status.${documentId}`;

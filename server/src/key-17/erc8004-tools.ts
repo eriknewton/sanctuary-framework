@@ -78,6 +78,8 @@ export class Erc8004PendingStore {
 
 export interface Erc8004ToolResponse {
   request_id: string;
+  // Must match erc8004_signing in tool-outcome.ts: a "denied" status is a
+  // policy verdict, which the MCP router returns as its one refusal.
   status: "pending_approval" | "auto_approved" | "signed" | "denied";
   signature?: string;
   signer_address?: string;

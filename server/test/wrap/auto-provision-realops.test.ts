@@ -1,3 +1,4 @@
+// fail-before-exempt: the fixture states its own file and directory modes so the result does not depend on the process umask; no server/src change.
 /**
  * Re-gate 1 (fix commit 636f6051) CHOKEPOINT (2026-07-07 fix-round 2), then
  * extended for re-gate 3 (fix-round 3): the `wrap/auto-provision.ts` real-ops
@@ -795,7 +796,8 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
       const sourcePath = join(operatorHome, ".hermes", "config.yaml");
       const destPath = join(accountHome, ".hermes", "config.yaml");
       await mkdir(dirname(sourcePath), { recursive: true });
-      await mkdir(dirname(destPath), { recursive: true });
+      // Destination custody must permit the overwrite and restore witness under either umask.
+      await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
       await writeFile(sourcePath, "stub: true\n");
       await writeFile(destPath, "REAL_CONFIG_WITH_SECRET=two");
 
@@ -925,7 +927,8 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
       const sourcePath = join(operatorHome, ".hermes", "config.yaml");
       const dataVaultPath = join(accountHome, "Library", "Caches", "com.apple.containermanagerd");
       await mkdir(dirname(sourcePath), { recursive: true });
-      await mkdir(dataVaultPath, { recursive: true });
+      // Destination custody must permit the data-vault exclusion witness under either umask.
+      await mkdir(dataVaultPath, { recursive: true, mode: 0o700 });
       await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=three");
       await writeFile(join(dataVaultPath, "blocked.db"), "tcc-vault");
 

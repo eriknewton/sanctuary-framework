@@ -134,10 +134,7 @@ impl ProducerSigner {
     ) -> Result<Self, ProducerSigError> {
         for path in [key_path, pub_path] {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| ProducerSigError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
+                create_key_parent(parent)?;
             }
         }
         validate_key_parent(key_path)?;
@@ -284,10 +281,7 @@ fn secure_zero(bytes: &mut [u8]) {
 
 fn write_private_key(path: &Path, key: &SigningKey) -> Result<(), ProducerSigError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ProducerSigError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        create_key_parent(parent)?;
     }
     validate_key_parent(path)?;
     // Create the file with 0600 BEFORE writing any bytes, so the private seed
@@ -386,6 +380,24 @@ fn write_public_key(path: &Path, key: &SigningKey) -> Result<(), ProducerSigErro
     Ok(())
 }
 
+fn create_key_parent(parent: &Path) -> Result<(), ProducerSigError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // 0755 reserves writes to the owner while allowing the public-key consumer to traverse.
+        // Must match validate_key_parent: new parents exclude group/world write; existing modes stay intact.
+        builder.mode(0o755);
+    }
+    builder
+        .create(parent)
+        .map_err(|source| ProducerSigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
 fn validate_key_parent(path: &Path) -> Result<(), ProducerSigError> {
     #[cfg(unix)]
     {
@@ -418,6 +430,7 @@ fn validate_key_parent(path: &Path) -> Result<(), ProducerSigError> {
             }
         }
         let mode = metadata.permissions().mode() & 0o777;
+        // Must match create_key_parent: only daemon-owned parents without shared write protect the seed and public pin.
         if !metadata.file_type().is_dir()
             || metadata.uid() != unsafe { libc::geteuid() }
             || mode & 0o022 != 0
@@ -433,8 +446,32 @@ fn validate_key_parent(path: &Path) -> Result<(), ProducerSigError> {
 
 #[cfg(test)]
 mod tests {
+    fn test_directory() -> TempDir {
+        let root = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // 0700 reserves traversal and mutation to the test owner; chmod removes umask dependence.
+            const OWNER_ONLY_DIRECTORY: u32 = 0o700;
+            // 0777 selects ordinary permission bits, excluding the metadata file type.
+            const PERMISSION_BITS: u32 = 0o777;
+            fs::set_permissions(
+                root.path(),
+                fs::Permissions::from_mode(OWNER_ONLY_DIRECTORY),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::metadata(root.path()).unwrap().permissions().mode() & PERMISSION_BITS,
+                OWNER_ONLY_DIRECTORY,
+                "profile anchors and key parents must have explicit fixture permissions",
+            );
+        }
+        root
+    }
+
     fn legacy_selection() -> crate::config::LegacyV1Selection {
-        let root = tempfile::TempDir::new().unwrap();
+        let root = test_directory();
         match crate::config::select_profile(
             &crate::config::SelectorRoots::isolated_under(root.path()),
             &[],
@@ -470,7 +507,7 @@ mod tests {
 
     #[test]
     fn sign_then_verify_round_trips_against_published_pub() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         let signer =
@@ -509,7 +546,7 @@ mod tests {
 
     #[test]
     fn generated_private_key_is_owner_only() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("nested/audit-producer.key");
         let pub_path = dir.path().join("nested/audit-producer.pub");
         ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path).unwrap();
@@ -528,7 +565,7 @@ mod tests {
 
     #[test]
     fn load_reuses_existing_private_key() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         let first =
@@ -547,7 +584,7 @@ mod tests {
     #[test]
     fn rejects_group_or_world_readable_private_key() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         // First boot generates a 0600 key.
@@ -565,7 +602,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_length_private_key() {
-        let dir = TempDir::new().unwrap();
+        let dir = test_directory();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         fs::write(&key_path, b"too short").unwrap();
@@ -582,6 +619,96 @@ mod tests {
             Err(ProducerSigError::KeyLength { .. }) => {}
             Err(other) => panic!("expected KeyLength error, got {other:?}"),
             Ok(_) => panic!("expected load to reject a wrong-length private key"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_parents_keep_owner_write_under_shared_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "SANCTUARY_PRODUCER_PARENT_MODE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A separate process confines the process-wide umask to this exact test.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ipc::producer_sig::tests::generated_key_parents_keep_owner_write_under_shared_umask",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated parent creation must succeed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let dir = test_directory();
+        let selection = legacy_selection();
+        let key_path = dir.path().join("private/keys/audit-producer.key");
+        let pub_path = dir.path().join("public/pins/audit-producer.pub");
+        // 0002 allows group write unless creation supplies an owner-only write policy.
+        let previous_umask = unsafe { libc::umask(0o002) };
+        let generated = ProducerSigner::load_or_generate(&selection, &key_path, &pub_path);
+        unsafe { libc::umask(previous_umask) };
+        generated.unwrap();
+
+        // 0755 permits consumer traversal but reserves directory mutation to the owner.
+        const DIRECTORY_MODE: u32 = 0o755;
+        // 0777 selects permission bits without the file type carried by Metadata.
+        const PERMISSION_BITS: u32 = 0o777;
+        for parent in ["private", "private/keys", "public", "public/pins"] {
+            assert_eq!(
+                fs::metadata(dir.path().join(parent))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & PERMISSION_BITS,
+                DIRECTORY_MODE,
+                "every newly created ancestor must preserve the directory policy",
+            );
+        }
+        // 0600 protects the seed; 0644 lets the consumer read the public pin.
+        for (path, mode) in [(&key_path, 0o600), (&pub_path, 0o644)] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS,
+                mode
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_group_writable_key_parents_remain_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 0775 gives the group write authority that parent validation must refuse.
+        const SHARED_WRITE_MODE: u32 = 0o775;
+        // 0777 excludes file-type bits when checking that existing permissions are untouched.
+        const PERMISSION_BITS: u32 = 0o777;
+        for unsafe_parent in ["private", "public"] {
+            let dir = test_directory();
+            let parent = dir.path().join(unsafe_parent);
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(SHARED_WRITE_MODE)).unwrap();
+            let key_path = dir.path().join("private/audit-producer.key");
+            let pub_path = dir.path().join("public/audit-producer.pub");
+            assert!(matches!(
+                ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path),
+                Err(ProducerSigError::UnsafePath { path, .. }) if path == parent
+            ));
+            assert_eq!(
+                fs::metadata(&parent).unwrap().permissions().mode() & PERMISSION_BITS,
+                SHARED_WRITE_MODE,
+                "existing operator permissions must be preserved",
+            );
+            assert!(!key_path.exists() && !pub_path.exists());
         }
     }
 }

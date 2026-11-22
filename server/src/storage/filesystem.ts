@@ -43,7 +43,7 @@
 
 import { constants as fsConstants, existsSync, lstatSync } from "node:fs";
 import { link, mkdir, open, opendir, unlink, readdir, stat, lstat } from "node:fs/promises";
-import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES } from "./interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES, StorageReadBoundError } from "./interface.js";
 import type { Stats } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
@@ -65,7 +65,7 @@ import type {
   StorageBackend,
   StorageEntryMeta,
 } from "./interface.js";
-import { readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict, syncDirectoryStrict, syncExistingDirectoryChainStrict } from "./custody-fs.js";
+import { CustodyFsError, readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict, syncDirectoryStrict, syncExistingDirectoryChainStrict } from "./custody-fs.js";
 import {
   assertStorageMasterWriteBarrierHeld,
   CrossProcessLockError,
@@ -183,11 +183,23 @@ export interface CapabilityError {
   rawNamespace?: string;
   errors?: CapabilityError[];
   cause?: CapabilityError;
+  /** Names a typed storage error the parent rebuilds as that class; absent for every other failure. */
+  type?: typeof CAPABILITY_ERROR_TYPE_READ_BOUND;
 }
+
+/**
+ * The wire discriminator for StorageReadBoundError. Must match on both sides of
+ * the worker IPC: serializeCapabilityError writes it in the worker and
+ * deserializeCapabilityError reads it in the parent.
+ */
+const CAPABILITY_ERROR_TYPE_READ_BOUND = "storage_read_bound";
 
 /** Preserve every strict failure across the private worker IPC boundary. */
 export function serializeCapabilityError(error: unknown): CapabilityError {
   const value: CapabilityError = { message: error instanceof Error ? error.message : String(error) };
+  // The class is carried by an explicit field because IPC keeps only plain data; a caller that
+  // classifies a bounded-read refusal with instanceof must see the same type on every backend path.
+  if (error instanceof StorageReadBoundError) value.type = CAPABILITY_ERROR_TYPE_READ_BOUND;
   if (error instanceof Error) {
     for (const key of ["code", "kind", "rawName", "rawNamespace"] as const) {
       const field = (error as unknown as Record<string, unknown>)[key];
@@ -202,6 +214,8 @@ export function serializeCapabilityError(error: unknown): CapabilityError {
 
 /** Reconstitute worker failures without discarding nested errno evidence. */
 export function deserializeCapabilityError(value: CapabilityError): Error {
+  // Rebuilt from the discriminator, never from the message text, so the type is chosen by the serializer.
+  if (value.type === CAPABILITY_ERROR_TYPE_READ_BOUND) return new StorageReadBoundError();
   const options = value.cause ? { cause: deserializeCapabilityError(value.cause) } : undefined;
   const error = value.errors
     ? new AggregateError(value.errors.map(deserializeCapabilityError), value.message, options)
@@ -1356,9 +1370,28 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     return this.readAtPath(legacy);
   }
 
-  private async readAtPath(filePath: string): Promise<Uint8Array | null> {
+  /** Must match StorageBackend.readBounded in interface.ts and the readBounded op in directory-capability-worker.ts. */
+  async readBounded(namespace: string, key: string, maxBytes: number): Promise<Uint8Array | null> {
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new StorageReadBoundError();
+    const capability = this.darwinCapability(namespace);
+    if (capability) {
+      // The worker applies the same bound to its own read, so an over-bound entry never crosses the IPC channel.
+      const encoded = await this.callDarwinNamespace<string | null>(capability, "readBounded", [key, maxBytes]);
+      return encoded === null ? null : new Uint8Array(Buffer.from(encoded, "base64"));
+    }
+    const buf = await this.readAtPath(this.entryPath(namespace, key), maxBytes);
+    if (buf !== null) return buf;
+    const legacy = this.legacyEntryPath(namespace, key);
+    if (legacy === this.entryPath(namespace, key)) return null;
+    return this.readAtPath(legacy, maxBytes);
+  }
+
+  private async readAtPath(filePath: string, maxBytes?: number): Promise<Uint8Array | null> {
     try {
-      const buf = await readFileCustody(filePath);
+      // With a bound, custody refuses on the descriptor's size before reading and reads at most maxBytes + 1.
+      const buf = await readFileCustody(filePath, maxBytes === undefined ? undefined : { maxBytes });
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     } catch (err: unknown) {
       if (
@@ -1368,6 +1401,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       ) {
         return null;
       }
+      if (err instanceof CustodyFsError && err.code === "read_size_rejected") throw new StorageReadBoundError();
       throw err;
     }
   }

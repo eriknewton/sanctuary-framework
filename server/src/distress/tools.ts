@@ -274,6 +274,8 @@ export function createDistressTools(options: CreateDistressToolsOptions): {
           },
           "failure",
         );
+        // Must match distress_signal in tool-outcome.ts: `ok: false` marks an
+        // admission verdict, which the router returns as its one refusal.
         return toolResult({
           ok: false,
           rate_limited: true,

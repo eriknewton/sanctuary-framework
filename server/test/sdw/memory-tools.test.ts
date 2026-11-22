@@ -607,7 +607,7 @@ describe("SDW memory tools: fail-closed multi-agent isolation guard", () => {
       message: "This action is not available in the current context.",
       remediation_class: "request_review",
       retry_after: null,
-      audit_ref: "audit:memory_get",
+      audit_ref: "audit:refusal",
       discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
     });
     const serialized = JSON.stringify(denied);

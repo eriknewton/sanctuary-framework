@@ -7,7 +7,9 @@
  * instead of the raw state primitives. safety-base.ts is the shared crypto
  * and approval-proof base (canonical JSON, sha256, approval envelopes,
  * session-identity resolution, opaque namespace handles) re-used across
- * distress, cognitive, principal-policy, router, and sdw.
+ * distress, cognitive, principal-policy, router, and sdw; it also holds the
+ * one boundary refusal every non-success tool outcome returns. denial-ledger.ts
+ * is the operator-side record of each refusal's cause.
  *
  * Re-exported here for external consumers; the facade calls primitive
  * tools through their public handlers only and holds no module state of
@@ -15,6 +17,7 @@
  */
 
 export * from "./safety-base.js";
+export * from "./denial-ledger.js";
 export * from "./cooperative-surface.js";
 export * from "./capabilities-catalog.js";
 export * from "./protection-layers.js";

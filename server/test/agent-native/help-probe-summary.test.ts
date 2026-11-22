@@ -9,6 +9,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { AuditLog, AUDIT_NAMESPACE, AUDIT_CHECKPOINT_NAMESPACE } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { fingerprintIdentityId, type SessionBinding } from "../../src/agent-native/safety-base.js";
+import { expectedRefusalBody } from "../helpers/expected-refusal.js";
 
 // A minute contains sixty thousand milliseconds, the audit summary interval.
 const interval = surface.HELP_PROBE_ROW_INTERVAL_MS ?? 60_000;
@@ -266,7 +267,8 @@ describe("help probe summaries", () => {
       if (entry.operation === OPERATION) { attempts += 1; throw new Error("append unavailable"); }
       return append(entry);
     });
-    expect(await env.call("export the note")).toMatchObject({ denied: true, remediation_class: "wait", audit_ref: "audit:sanctuary_help" });
+    // A rejected summary append reaches the agent as the one boundary refusal, the same body every cause returns.
+    expect(await env.call("export the note")).toEqual(expectedRefusalBody());
     for (let i = 0; i < 50; i += 1) expect(await env.call("export the note")).toHaveProperty("safety_class", "gated");
     expect(attempts).toBe(1);
     env.advance(interval);

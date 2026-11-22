@@ -8,11 +8,19 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     fs,
-    os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+    os::unix::fs::{symlink, DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
 use tempfile::TempDir;
+
+fn private_root() -> TempDir {
+    // TempDir uses mkdir semantics, so the selector anchor needs an explicit private mode.
+    tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
 
 // Must match profile_selector_vectors.json and the TS runner's complete element refusal set.
 fn exact(v: &Value, names: &[&str]) -> bool {
@@ -190,7 +198,12 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
 fn fixture(root: &Path, c: &Value) -> SelectorRoots {
     for n in c["layout"].as_array().unwrap() {
         let path = root.join(n["path"].as_str().unwrap());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Implicit parents must permit selection without changing explicit corpus modes.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path.parent().unwrap())
+            .unwrap();
         match n["type"].as_str().unwrap() {
             "file" => fs::write(&path, n["content"].as_str().unwrap()).unwrap(),
             "dir" => fs::create_dir_all(&path).unwrap(),
@@ -257,7 +270,7 @@ fn shared_vectors_are_complete_immutable_and_match_constants() {
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for case in corpus["cases"].as_array().unwrap() {
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let roots = fixture(root.path(), case);
         if case["id"] == "selector-two-links" {
             assert_eq!(
@@ -327,12 +340,17 @@ fn malformed_elements_refuse_before_execution() {
     assert!(!validate(&duplicate));
 }
 fn evidence(root: &Path) {
-    fs::create_dir_all(root.join(&BUSINESS_CUSTODY_ROOT[1..])).unwrap();
+    // Every evidence parent must remain trusted under either shell umask.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root.join(&BUSINESS_CUSTODY_ROOT[1..]))
+        .unwrap();
 }
 #[test]
 fn main_refuses_before_all_routes_and_paths_but_legacy_continues() {
     let _guard = isolation::guard();
-    let root = TempDir::new().unwrap();
+    let root = private_root();
     let corpus = checked_corpus::corpus("profile_selector_vectors.json");
     let case = corpus["cases"]
         .as_array()
@@ -341,7 +359,7 @@ fn main_refuses_before_all_routes_and_paths_but_legacy_continues() {
         .find(|c| c["id"] == "business-selector")
         .unwrap();
     fixture(root.path(), case);
-    let effects = TempDir::new().unwrap();
+    let effects = private_root();
     let binary = env!("CARGO_BIN_EXE_castle-wall-daemon");
     for route in [
         vec!["--preflight-manifest", "absent.json"],
@@ -367,7 +385,7 @@ fn main_refuses_before_all_routes_and_paths_but_legacy_continues() {
         assert!(output.stdout.is_empty());
         assert_eq!(fs::read_dir(effects.path()).unwrap().count(), 0);
     }
-    let empty = TempDir::new().unwrap();
+    let empty = private_root();
     let output = Command::new(binary)
         .arg("--test-profile-root")
         .arg(empty.path())
@@ -394,6 +412,12 @@ fn boot_config(root: &Path) -> DaemonConfig {
         SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes(),
     )
     .unwrap();
+    // Pin custody must permit the continuing legacy boot to reach raw key creation.
+    fs::set_permissions(
+        &config.pinned_public_key_path,
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     config.producer_key_path = root.join("key/producer.key");
     config.producer_pub_key_path = root.join("public/producer.pub");
     config.wal_path = root.join("events.wal");
@@ -406,7 +430,7 @@ fn boot_config(root: &Path) -> DaemonConfig {
 fn boot_reselects_before_pin_wal_and_key_and_includes_config_candidates() {
     use castle_wall_daemon::daemon::{boot, DaemonError};
     let _guard = isolation::guard();
-    let root = TempDir::new().unwrap();
+    let root = private_root();
     evidence(root.path());
     let config = boot_config(root.path());
     assert!(matches!(
@@ -415,7 +439,11 @@ fn boot_reselects_before_pin_wal_and_key_and_includes_config_candidates() {
     ));
     assert!(!config.wal_path.exists());
     assert!(!config.producer_key_path.parent().unwrap().exists());
-    fs::create_dir(config.producer_key_path.parent().unwrap()).unwrap();
+    // Candidate inventory must reach the existing raw key under either shell umask.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(config.producer_key_path.parent().unwrap())
+        .unwrap();
     fs::write(&config.producer_key_path, b"untouched").unwrap();
     assert!(matches!(
         boot(config.clone()),
@@ -424,7 +452,7 @@ fn boot_reselects_before_pin_wal_and_key_and_includes_config_candidates() {
         ))
     ));
     assert_eq!(fs::read(&config.producer_key_path).unwrap(), b"untouched");
-    let empty = TempDir::new().unwrap();
+    let empty = private_root();
     let config = boot_config(empty.path());
     let key = config.producer_key_path.clone();
     let result = boot(config);
@@ -440,7 +468,7 @@ fn boot_reselects_before_pin_wal_and_key_and_includes_config_candidates() {
 #[test]
 fn candidate_caps_and_descriptor_lifetime_are_bounded() {
     let _guard = isolation::guard();
-    let root = TempDir::new().unwrap();
+    let root = private_root();
     evidence(root.path());
     let roots = SelectorRoots::isolated_under(root.path());
     let before = fs::read_dir("/proc/self/fd").unwrap().count();
@@ -484,7 +512,7 @@ fn drain_config_only_selects_business() {
         .iter()
         .find(|c| c["id"] == "drain-config-only")
         .unwrap();
-    let root = TempDir::new().unwrap();
+    let root = private_root();
     let roots = fixture(root.path(), case);
     assert_eq!(project(select_profile(&roots, &[])), case["expect"]);
 }

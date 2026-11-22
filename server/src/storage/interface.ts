@@ -136,6 +136,26 @@ export interface StorageBackend {
    * and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
    */
   listKeys?(namespace: string, prefix?: string): Promise<string[]>;
+
+  /**
+   * OPTIONAL bounded read: the stored bytes, or null if not found, as read
+   * returns them, except that an entry longer than maxBytes is refused with
+   * StorageReadBoundError having read at most maxBytes + 1 of its bytes, so a
+   * caller can cap what one stored entry costs it before allocation or decode.
+   * Must match readBounded in filesystem.ts, memory.ts and
+   * directory-capability-worker.ts, READ_ONLY_STORAGE_DELEGATED_METHODS in
+   * read-only-guard.ts, and its consumer SdwDocumentCorpusStore.getChunkBounded
+   * in sdw/document-corpus-store.ts, which refuses when it is absent.
+   */
+  readBounded?(namespace: string, key: string, maxBytes: number): Promise<Uint8Array | null>;
+}
+
+/** A bounded read refused an entry longer than its maximum; see StorageBackend.readBounded. */
+export class StorageReadBoundError extends Error {
+  constructor() {
+    super("Stored entry exceeds the read size bound");
+    this.name = "StorageReadBoundError";
+  }
 }
 
 /** Optional filesystem capabilities used by code that must coordinate across processes. */

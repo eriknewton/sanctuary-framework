@@ -4,6 +4,8 @@ use super::{records, writer_protocol};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+// PRODUCER_ENVELOPE_MAX_BYTES must match BusinessSession::served's retained-memory bound
+// in business_delivery.rs; writer_protocol::decode_envelope enforces it before serving.
 include!("append_contract_constants.rs");
 // Must match BUSINESS_SAFE_INTEGER in server/src/signing/business-append-contract.ts.
 const SAFE_INTEGER: u64 = super::activation_anchor::SAFE_INTEGER;

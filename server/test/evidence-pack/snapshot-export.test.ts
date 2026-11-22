@@ -1,3 +1,4 @@
+// fail-before-exempt: the fixture states its own file and directory modes so the result does not depend on the process umask; no server/src change.
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtemp, mkdir, readFile, writeFile, readdir, chmod, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,7 +19,8 @@ async function transparencyStore() {
   const who = identity(), bundle = transparencyFixture(who);
   for (const record of bundle.checkpoints) await storage.write(TRANSPARENCY_CHECKPOINT_NAMESPACE, `enforcement-checkpoint-${String(record.counter).padStart(20, "0")}`, jsonBytes(record));
   const pin = join(root, "castle-pinned-pubkey.bin"), globalPinPath = join(root, "missing-global");
-  await writeFile(pin, C.publicKey(who.public_key));
+  // Pin custody must permit the transparency checks under either shell umask.
+  await writeFile(pin, C.publicKey(who.public_key), { mode: 0o600 });
   const input = { storage, masterKey: master, fortress: root, generatedAt: NOW, localSign: true, globalPinPath };
   return { input, who, pin, root, bundle };
 }

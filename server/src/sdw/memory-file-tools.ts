@@ -258,6 +258,30 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       details,
     });
 
+  /**
+   * The completion audit of a transcode or restore failed after the files were
+   * written. The call still succeeded, so the agent gets the success body with
+   * audit_outcome_recorded false and operator_review_required true.
+   *
+   * INVARIANT: the audit error's class goes to the operator only, in this
+   * follow-up audit row, and never into the agent's body: it is operational
+   * detail the agent does not need. The row is not awaited, so the success
+   * body is not delayed a second time. If the audit log refuses this write
+   * too, nothing more is tried: the operator still has the _started row with
+   * no completion row after it.
+   */
+  const reportCompletionAuditFailure = (
+    operation: "memory_transcode" | "memory_transcode_restore",
+    auditError: unknown,
+    details: Record<string, unknown>,
+  ): void => {
+    void auditFailure(`${operation}_audit_failed`, {
+      ...details,
+      owner_ref: adapter.ownerRef,
+      error_class: errorName(auditError),
+    }).catch(() => undefined);
+  };
+
   const deny = (operation: string) =>
     toolResult(fixedDenial(`audit:${operation}`, "request_review", null));
 
@@ -585,12 +609,15 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             projection_set_sha256: result.projection_set_sha256,
           });
         } catch (auditError) {
+          reportCompletionAuditFailure("memory_transcode", auditError, {
+            archive_id: result.archive_id,
+            output_dir: dir,
+          });
           return toolResult({
             transcoded: true,
             ...result,
             audit_outcome_recorded: false,
             operator_review_required: true,
-            audit_error_class: errorName(auditError),
           });
         }
         return toolResult({ transcoded: true, ...result, audit_outcome_recorded: true });
@@ -660,11 +687,14 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             source_set_sha256: result.source_set_sha256,
           });
         } catch (auditError) {
+          reportCompletionAuditFailure("memory_transcode_restore", auditError, {
+            archive_id: archiveId,
+            output_dir: dir,
+          });
           return toolResult({
             ...result,
             audit_outcome_recorded: false,
             operator_review_required: true,
-            audit_error_class: errorName(auditError),
           });
         }
         return toolResult({ ...result, audit_outcome_recorded: true });
