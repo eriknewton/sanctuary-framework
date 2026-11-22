@@ -6,7 +6,7 @@
 
 import { execSync as nodeExecSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, constants, readdir, readFile, stat } from "node:fs/promises";
+import { access, constants, open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -1198,13 +1198,17 @@ export async function checkSessionBinding(
   // The lock name must match FORTRESS_CONFIG_LOCK in config.ts.
   const lockPath = join(storagePath, FORTRESS_CONFIG_LOCK);
   try {
-    await stat(lockPath);
+    // One open decides presence and supplies the metadata, so the report never
+    // describes a different file than the one whose presence it checked.
+    const handle = await open(lockPath, "r");
     lockPresent = true;
     let holder = "holder metadata unavailable";
     try {
-      const record = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown; acquired_at?: unknown };
+      const record = JSON.parse(await handle.readFile("utf8")) as { pid?: unknown; acquired_at?: unknown };
       holder = `pid ${String(record.pid ?? "unknown")}, acquired_at ${String(record.acquired_at ?? "unknown")}`;
-    } catch { /* A present lock remains reportable without its metadata. */ }
+    } catch { /* A present lock remains reportable without its metadata. */ } finally {
+      await handle.close().catch(() => undefined);
+    }
     lines.push(`${FORTRESS_CONFIG_LOCK} present: ${holder}; remove only when no Sanctuary process is running`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
