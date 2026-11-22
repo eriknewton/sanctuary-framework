@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 // fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 /** Shared protection observations. */
 import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
@@ -33,7 +34,7 @@ async function fixture() {
   const auditLog = new AuditLog(storage, masterKey);
   let binding: SessionBinding | undefined;
   const currentSessionBinding = () => binding;
-  const primitives = createCognitiveTools(stateStore, storage, masterKey, "recovery-key", auditLog, { currentSessionBinding });
+  const primitives = createCognitiveTools(stateStore, storage, masterKey, "recovery-key", auditLog, { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding });
   await primitives.identityManager.load();
   const created = await primitives.tools.find(tool => tool.name === "identity_create")!.handler({ label: "observed-session" });
   const { identity_id } = JSON.parse(created.content[FIRST_CONTENT]!.text);

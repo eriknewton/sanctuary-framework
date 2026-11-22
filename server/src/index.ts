@@ -8,7 +8,7 @@
 import { ConstructionWork } from "./dashboard/construction-work.js";
 import { mkdir } from "node:fs/promises";
 import { tightenStoragePermissions } from "./storage/permissions.js";
-import { defaultConfig, loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
+import { defaultConfig, loadConfig, updateFortressConfig, type SanctuaryConfig } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
 import { StateStore } from "./cognitive/state-store.js";
@@ -83,8 +83,6 @@ import { DenialLedger } from "./agent-native/denial-ledger.js";
 import { toolResult } from "./router.js";
 import {
   ApprovalProofStore,
-  fingerprintIdentityId,
-  type SessionBinding,
 } from "./agent-native/safety-base.js";
 import { createAgentNativeCooperativeTools } from "./agent-native/cooperative-surface.js";
 import { buildServerInstructions } from "./agent-native/capabilities-catalog.js";
@@ -204,6 +202,7 @@ import { ResponseScreen } from "./proxy/response-screen.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { surfaceSourceFor } from "./castle-wall/liveness/surface-reader.js";
 import { productionHostClock, livenessFortressId } from "./cli/castle-wall-liveness-status.js";
+import { collectSoleProofInputs, createSessionBindingAccessors, holdSoleBoundCooperativeWrites, resolveSessionBinding } from "./agent-native/session-binding.js";
 
 export interface SanctuaryServer {
   /** Host-only exposure; absence/eviction remains tainted with unknown observation. */
@@ -798,14 +797,11 @@ export async function createSanctuaryServer(options?: {
 
   // 6. Initialize state store
   const stateStore = new StateStore(storage, masterKey);
-  const currentSessionBinding = (): SessionBinding | undefined => {
-    const identityId = process.env.SANCTUARY_SESSION_IDENTITY_ID;
-    if (!identityId) return undefined;
-    return {
-      identity_id: identityId,
-      requester_identity_fingerprint: fingerprintIdentityId(identityId),
-    };
-  };
+  const sessionBindingAccessors = createSessionBindingAccessors();
+  const currentSessionBinding = sessionBindingAccessors.primitive;
+  // The boot decision accessor must match stateWriteOriginActor in cognitive/tools.ts; the options type
+  // requires it whenever a session binding is supplied.
+  const cognitiveOptions = { currentSessionBinding, sessionBindingBootState: sessionBindingAccessors.bootState };
 
   // 7. Create L1 tools
   const { tools: l1Tools, identityManager, namespaceRegistry } = createCognitiveTools(
@@ -814,11 +810,15 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     keyProtection,
     auditLog,
-    { currentSessionBinding }
+    cognitiveOptions
   );
 
   // 8. Load existing identities
-  const loadResult = await identityManager.load();
+  // The complete-enumeration contract must match proveSoleIdentity in agent-native/session-binding.ts.
+  const proofInputs = config.session_binding?.sole_identity === true && process.env.SANCTUARY_SESSION_IDENTITY_ID === undefined
+    ? await collectSoleProofInputs(storage, identityManager)
+    : { before: null, evidence: await identityManager.load(), after: null };
+  const loadResult = proofInputs.evidence;
 
   // 8a. Warn loudly if encrypted identity files exist but none could be decrypted
   if (loadResult.total > 0 && loadResult.loaded === 0) {
@@ -843,6 +843,11 @@ export async function createSanctuaryServer(options?: {
       `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
     );
   }
+
+  sessionBindingAccessors.install(await resolveSessionBinding({ identityManager, storage,
+    // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the operator-facing boot channel for the session-binding decision line.
+    flag: config.session_binding?.sole_identity === true, auditLog, stderr: line => console.error(line),
+    env: () => process.env, proofInputs }));
 
   // 9. Create L2 monitoring tools
   const l2Tools: ToolDefinition[] = [
@@ -2229,11 +2234,11 @@ export async function createSanctuaryServer(options?: {
     egressGate: erc8004RegistryEgressGate,
   });
 
-  const { tools: agentNativeTools } = createAgentNativeCooperativeTools({
+  const { tools: cooperativeTools } = createAgentNativeCooperativeTools({
     identityManager,
     namespaceRegistry,
     auditLog,
-    currentSessionBinding,
+    currentSessionBinding: sessionBindingAccessors.cooperative,
     primitiveTools: l1Tools,
     storage,
     stateStore,
@@ -2242,6 +2247,9 @@ export async function createSanctuaryServer(options?: {
       ?? Promise.resolve({ keyB64url: null, observation: "unknown" }),
     approvalProofStore,
   });
+  // Cooperative tools that reach the state_write handler refuse a held sole-bound write before the gate,
+  // as state_write's own argument builder does; must match holdSoleBoundCooperativeWrites in agent-native/session-binding.ts.
+  const agentNativeTools = holdSoleBoundCooperativeWrites(cooperativeTools, sessionBindingAccessors.bootState);
 
   // 16c. HABEAS PORT distress emission surface (agent-side sovereignty,
   // ratified 2026-06-12). The lane config is operator-owned and loaded once,
@@ -2455,7 +2463,7 @@ export async function createSanctuaryServer(options?: {
     denialLedger,
     toolCallTrapRuntime,
     currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
-    currentSessionBinding,
+    currentSessionBinding: sessionBindingAccessors.cooperative,
     instructions: buildServerInstructions(),
   });
   if (proxyRouter) {
@@ -2466,7 +2474,7 @@ export async function createSanctuaryServer(options?: {
   }
 
   // 20. Save config if this is first run
-  await saveConfig(config);
+  await updateFortressConfig(joinPath(config.storage_path, "sanctuary.json"), "boot", () => config);
 
   // 21. Build the idempotent async cleanup function. Signal handlers are NOT
   // installed here: the CLI layer (cli.ts) owns that wiring so that an

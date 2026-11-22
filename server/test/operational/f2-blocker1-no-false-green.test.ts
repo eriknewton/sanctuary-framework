@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 /**
  * F2 BLOCKER-1 (adversarial re-gate round 3, 2026-07-14) REQUIRED REPRO.
  *
@@ -84,7 +85,7 @@ async function migratedFortressWithSurface() {
     masterKey,
     "recovery-key",
     auditLog,
-    { currentSessionBinding: () => active },
+    { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active },
   );
   await identityManager.load();
   const identity = await callTool(l1Tools, "identity_create", { label: "agent-a" });

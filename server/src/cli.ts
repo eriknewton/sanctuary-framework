@@ -133,6 +133,8 @@ async function main(): Promise<void> {
   }
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
 
+  // Launch-path alias precedence must match sessionBindingLaunchEntries in cli/doctor.ts.
+  //
   // v1.1.2 hotfix (Finding W): the MCP-server-boot path documents
   // SANCTUARY_FORTRESS_PATH as an operator-friendly alias for
   // SANCTUARY_STORAGE_PATH (see help text below) but pre-fix never
@@ -288,6 +290,12 @@ async function main(): Promise<void> {
   if (args[0] === "status") {
     const { runStatusCommand } = await import("./cli/status.js");
     const code = await runStatusCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "session-binding") {
+    const { runSessionBindingCommand } = await import("./cli/session-binding.js");
+    const code = await runSessionBindingCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -1042,6 +1050,7 @@ Usage:
   sanctuary dashboard [opts]              # Standalone dashboard
   sanctuary status [opts]                 # Daemon status over the /v1 API
   sanctuary doctor [opts]                 # Local environment diagnostic
+  sanctuary session-binding <cmd>         # Default binding for the next start
   sanctuary check-updates                 # Explicitly check for updates
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
@@ -1221,6 +1230,7 @@ Subcommands:
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
+  SANCTUARY_SESSION_IDENTITY_ID  Identity this server's session acts as; overrides default binding
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
   SANCTUARY_RECOVERY_OUT            Init recovery-key plaintext output path
@@ -1305,6 +1315,7 @@ Options:
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
+  SANCTUARY_SESSION_IDENTITY_ID  Identity this server's session acts as; overrides default binding
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase. Tried FIRST, and
                                     on its own: a credential you name here must

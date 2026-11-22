@@ -8,13 +8,13 @@ import { execSync as nodeExecSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, constants, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { getSanctuaryVersion } from "../version.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { isCustodyFsError, readFileCustody } from "../storage/custody-fs.js";
 import { IdentityManager } from "../cognitive/tools.js";
-import { MasterEstablishmentReleaseError, type CliMasterKeySession, withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
+import { MasterEstablishmentReleaseError, type CliMasterKeySession, withCliMasterKeySession, resolveCliMasterKey, unlockExistingMasterReadOnly } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { getPlatformPaths } from "../wrap/config-reader.js";
 import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
@@ -71,6 +71,8 @@ import { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js
 import type { LivenessProjection } from "../castle-wall/liveness/browser-contract.js";
 import { productionHostClock, livenessFortressId } from "./castle-wall-liveness-status.js";
 import { LIVENESS_DIRECTORY } from "../castle-wall/liveness/constants.js";
+import { readFortressConfig, FORTRESS_CONFIG_LOCK } from "../config.js";
+import { predictNextStartBinding } from "../agent-native/session-binding.js";
 
 // Canonical version source. A bare `require("../../package.json")` resolves to
 // the repo-root package.json (no `version`) when bundled to server/dist/; the
@@ -198,6 +200,7 @@ export async function runDoctorChecks(opts: {
   const masterKey = session?.masterKey ?? null;
   const check = async () => {
     checks.push(await checkIdentity(opts.storagePath, masterKey));
+    checks.push(await checkSessionBinding(opts.storagePath, opts.env, masterKey));
     checks.push(await checkPolicy(opts.storagePath));
     checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
     checks.push(await checkCustodyFactors(opts.storagePath));
@@ -864,13 +867,15 @@ async function checkSdwOwnerTransferLock(storagePath: string): Promise<DoctorChe
   );
 }
 
+/** Both entry checks consume the same harness config shapes. */
+function mcpServerMaps(parsed: Record<string, unknown>): unknown[] {
+  return [parsed.mcpServers, (parsed.mcp as Record<string, unknown> | undefined)?.servers, parsed.mcp_servers];
+}
+
 /** The `sanctuary` MCP entry in any of the harness config shapes wrap writes. */
 function sanctuaryMcpEntry(parsed: Record<string, unknown>): Record<string, unknown> | null {
-  const candidates = [
-    (parsed.mcpServers as Record<string, unknown> | undefined)?.sanctuary,
-    ((parsed.mcp as Record<string, unknown> | undefined)?.servers as Record<string, unknown> | undefined)?.sanctuary,
-    (parsed.mcp_servers as Record<string, unknown> | undefined)?.sanctuary,
-  ];
+  const candidates = mcpServerMaps(parsed).map(map =>
+    (map as Record<string, unknown> | undefined)?.sanctuary);
   for (const candidate of candidates) {
     if (candidate !== null && typeof candidate === "object") return candidate as Record<string, unknown>;
   }
@@ -1167,4 +1172,95 @@ export function livenessDoctorChecks(projection: LivenessProjection, platform: s
       message: verdict.state === "agent_UNMONITORED" ? "not monitored (no agent commissioning)" : `${verdict.state}: ${verdict.reasons.join(", ")}`,
       hint: "castle-wall liveness-status" };
   });
+}
+
+/** The same next-start report is consumed by doctor and session-binding status. */
+export async function checkSessionBinding(
+  storagePath: string,
+  env: NodeJS.ProcessEnv,
+  masterKey: Uint8Array | null,
+): Promise<DoctorCheck> {
+  const configFilePath = resolve(storagePath, "sanctuary.json");
+  let flag: boolean | undefined;
+  try {
+    const disk = await readFortressConfig(configFilePath);
+    flag = (disk.session_binding as { sole_identity?: boolean } | undefined)?.sole_identity;
+  } catch {
+    return fail("session binding", `Config: ${configFilePath}\nsession binding config cannot be read`, "repair the config file in place");
+  }
+  const lines = [
+    `Config: ${configFilePath}`,
+    `session_binding.sole_identity: ${flag === undefined ? "absent (off)" : String(flag)}`,
+    await predictNextStartBinding({ flag: flag === true, configFilePath,
+      storage: new FilesystemStorage(join(storagePath, "state")), masterKey, env }),
+  ];
+  let lockPresent = false;
+  // The lock name must match FORTRESS_CONFIG_LOCK in config.ts.
+  const lockPath = join(storagePath, FORTRESS_CONFIG_LOCK);
+  try {
+    await stat(lockPath);
+    lockPresent = true;
+    let holder = "holder metadata unavailable";
+    try {
+      const record = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown; acquired_at?: unknown };
+      holder = `pid ${String(record.pid ?? "unknown")}, acquired_at ${String(record.acquired_at ?? "unknown")}`;
+    } catch { /* A present lock remains reportable without its metadata. */ }
+    lines.push(`${FORTRESS_CONFIG_LOCK} present: ${holder}; remove only when no Sanctuary process is running`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      lockPresent = true;
+      lines.push(`${FORTRESS_CONFIG_LOCK} could not be inspected; remove only when no Sanctuary process is running`);
+    }
+  }
+  lines.push(...await sessionBindingLaunchEntries(storagePath));
+  return { name: "session binding", status: lockPresent || !masterKey ? "WARN" : "OK",
+    message: lines.join("\n"), hint: "This predicts the next start from this shell's environment; a running server keeps its boot decision until it exits." };
+}
+
+/** Resolve and scrub a read-only master around the shared next-start report. */
+export async function sessionBindingStatus(storagePath: string, env: NodeJS.ProcessEnv): Promise<DoctorCheck> {
+  let masterKey: Uint8Array | null = null;
+  if (env.SANCTUARY_RECOVERY_KEY || env.SANCTUARY_PASSPHRASE) {
+    try {
+      // Status uses the read-only unlock so prediction cannot create or migrate custody.
+      masterKey = await unlockExistingMasterReadOnly(new FilesystemStorage(join(storagePath, "state")), {
+        ...(env.SANCTUARY_RECOVERY_KEY !== undefined
+          ? { recoveryKey: env.SANCTUARY_RECOVERY_KEY }
+          : { passphrase: env.SANCTUARY_PASSPHRASE! }),
+        storagePathHint: storagePath,
+      });
+    } catch { /* An unavailable read-only master leaves prediction explicitly unavailable. */ }
+  }
+  try {
+    return await checkSessionBinding(storagePath, env, masterKey);
+  } finally {
+    masterKey?.fill(0);
+  }
+}
+
+async function sessionBindingLaunchEntries(storagePath: string): Promise<string[]> {
+  const lines: string[] = [];
+  for (const paths of Object.values(getPlatformPaths())) {
+    for (const path of paths) {
+      let parsed: Record<string, unknown>;
+      try { parsed = JSON.parse(await readFile(path, "utf8")); } catch { continue; }
+      if (!parsed || typeof parsed !== "object") continue;
+      const maps = mcpServerMaps(parsed);
+      for (const map of maps) {
+        if (!map || typeof map !== "object" || Array.isArray(map)) continue;
+        for (const [name, entry] of Object.entries(map)) {
+          const entryEnv = (entry as { env?: Record<string, unknown> } | null)?.env;
+          if (!entryEnv || typeof entryEnv !== "object") continue;
+          // Launch-path alias precedence must match main in cli.ts.
+          const target = entryEnv.SANCTUARY_STORAGE_PATH || entryEnv.SANCTUARY_FORTRESS_PATH;
+          if (typeof target !== "string" || resolve(target) !== resolve(storagePath)) continue;
+          const selection = Object.hasOwn(entryEnv, "SANCTUARY_SESSION_IDENTITY_ID")
+            ? entryEnv.SANCTUARY_SESSION_IDENTITY_ID === "" ? "set (empty)" : "set"
+            : "not set";
+          lines.push(`MCP entry ${name} (${resolve(path)}): SANCTUARY_SESSION_IDENTITY_ID ${selection}`);
+        }
+      }
+    }
+  }
+  return lines;
 }

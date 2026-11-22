@@ -13,6 +13,7 @@
 
 import { isNamespaceDiscoveryLimitError } from "./storage/interface.js";
 import type { DenialCause } from "./agent-native/denial-ledger.js";
+import { isSessionNotBoundError } from "./agent-native/session-not-bound.js";
 
 export type ToolOutcome = "success" | "refusal";
 
@@ -312,17 +313,16 @@ export function classifyToolOutcome(toolName: string, result: unknown, tool?: ob
 /**
  * The operator-side cause of a refusal decided while preparing a tool's
  * approval-target arguments, chosen by error type and never by message text.
+ * Missing identity evidence must match SessionNotBoundError in agent-native/safety-base.ts.
  * Must match the argument-stage cause entries of DENIAL_CAUSES in
  * agent-native/denial-ledger.ts; narrowing a cause here needs no router edit.
  */
-// DEBT(AGENT-SEAT-CI-DEFERRED-CAUSES): three operator-side ledger causes have no producer yet; the agent-facing refusal is unaffected.
-// They are an unbound-session cause at this stage (recorded as pre_gate_argument_refused, since the
-// session-identity error is also raised for a handle that is not the caller's), an unresolved-origin
-// cause for a write whose origin cannot be determined, and pre-gate refusals for the events, audit
-// search and compound tools in a session with no identity (they reach the gate first today). Only
-// the operator ledger is less specific; the agent sees the same refusal either way.
-export function argumentStageCause(error: unknown): Extract<DenialCause, "export_capacity" | "pre_gate_argument_refused"> {
-  return isNamespaceDiscoveryLimitError(error) ? "export_capacity" : "pre_gate_argument_refused";
+// DEBT(AGENT-SEAT-CI-DEFERRED-CAUSES): two causes await producers: unresolved origin for a write,
+// and pre-gate events, audit search and compound refusals in a session with no identity.
+// A session with no bound identity is recorded as session_not_bound; a handle the session does not own stays pre_gate_argument_refused.
+export function argumentStageCause(error: unknown): Extract<DenialCause, "export_capacity" | "pre_gate_argument_refused" | "session_not_bound"> {
+  return isSessionNotBoundError(error) ? "session_not_bound"
+    : isNamespaceDiscoveryLimitError(error) ? "export_capacity" : "pre_gate_argument_refused";
 }
 
 /**

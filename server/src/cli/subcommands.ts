@@ -57,6 +57,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "sdw-owner",
   "secrets",
   "sentinel",
+  "session-binding",
   "state_disclose_unattributed",
   "status",
   "task",

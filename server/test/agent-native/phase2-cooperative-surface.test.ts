@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 // fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool (e.g. state_export) is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -109,7 +110,7 @@ async function setup() {
     masterKey,
     "recovery-key",
     auditLog,
-    { currentSessionBinding: () => active }
+    { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
   );
   await identityManager.load();
   const identity = await callTool(l1Tools, "identity_create", { label: "agent-a" });
@@ -246,7 +247,7 @@ async function setupFilesystemSurface() {
       masterKey,
       "recovery-key",
       auditLog,
-      { currentSessionBinding: () => active }
+      { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
     );
     await identityManager.load();
     const approvalProofStore = new ApprovalProofStore();
@@ -361,7 +362,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       masterKey,
       "recovery-key",
       auditLog,
-      { currentSessionBinding: () => active }
+      { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
     );
     await identityManager.load();
     const identity = await callTool(l1Tools, "identity_create", { label: "agent-a" });
@@ -411,7 +412,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
         masterKey,
         "recovery-key",
         auditLog,
-        { currentSessionBinding: () => active }
+        { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
       );
       await identityManager.load();
       const firstCreated = await callTool(l1Tools, "identity_create", { label: labels[0] });

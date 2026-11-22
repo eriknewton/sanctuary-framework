@@ -1,3 +1,4 @@
+// fail-before-exempt: stored identity signing remains compatible with additive load evidence.
 import { describe, expect, it, vi } from "vitest";
 import { ed25519, ED25519_TORSION_SUBGROUP } from "@noble/curves/ed25519";
 import { sha512 } from "@noble/hashes/sha2";
@@ -398,7 +399,7 @@ it("loads a previously stored reserved label as an ordinary identity", async () 
     await rig.storage.write("_identities", storedIdentity.identity_id,
       stringToBytes(JSON.stringify(encrypt(stringToBytes(JSON.stringify(storedIdentity)), key))));
     const manager = new IdentityManager(rig.storage, rig.masterKey);
-    expect(await manager.load()).toEqual({total: 1, loaded: 1, failed: 0});
+    expect(await manager.load()).toMatchObject({total: 1, loaded: 1, failed: 0});
     expect(manager.get(storedIdentity.identity_id)?.label).toBe("k1-role:my-persona");
   } finally { key.fill(0); rig.masterKey.fill(0); }
 });

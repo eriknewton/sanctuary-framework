@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 // fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool (e.g. state_export) is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
 import { describe, expect, it } from "vitest";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
@@ -172,6 +173,7 @@ describe("agent-native Phase 1 safety base", () => {
       auditLog,
       {
         namespaceRegistry,
+        sessionBindingBootState: () => "state_BOUND_NAMED",
         currentSessionBinding: () => active,
       }
     );
@@ -234,6 +236,7 @@ describe("agent-native Phase 1 safety base", () => {
       auditLog,
       {
         namespaceRegistry,
+        sessionBindingBootState: () => "state_BOUND_NAMED",
         currentSessionBinding: () => active,
       }
     );
@@ -273,6 +276,7 @@ describe("agent-native Phase 1 safety base", () => {
       auditLog,
       {
         namespaceRegistry,
+        sessionBindingBootState: () => "state_BOUND_NAMED",
         currentSessionBinding: () => active,
       }
     );
@@ -329,6 +333,7 @@ describe("agent-native Phase 1 safety base", () => {
       auditLog,
       {
         namespaceRegistry,
+        sessionBindingBootState: () => "state_BOUND_NAMED",
         currentSessionBinding: () => active,
       }
     );
@@ -388,6 +393,7 @@ describe("agent-native Phase 1 safety base", () => {
       auditLog,
       {
         namespaceRegistry,
+        sessionBindingBootState: () => "state_BOUND_NAMED",
         currentSessionBinding: () => active,
       }
     );
@@ -440,7 +446,7 @@ describe("agent-native Phase 1 safety base", () => {
       masterKey,
       "recovery-key",
       auditLog,
-      { currentSessionBinding: () => active }
+      { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
     );
     await identityManager.load();
     const alice = await callTool(tools, "identity_create", { label: "alice-default" });
@@ -480,7 +486,7 @@ describe("agent-native Phase 1 safety base", () => {
       masterKey,
       "recovery-key",
       auditLog,
-      { currentSessionBinding: () => active }
+      { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
     );
     await identityManager.load();
     const alice = await callTool(tools, "identity_create", { label: "alice" });
@@ -626,6 +632,7 @@ describe("agent-native Phase 1 safety base", () => {
       auditLog,
       {
         namespaceRegistry,
+        sessionBindingBootState: () => "state_BOUND_NAMED",
         currentSessionBinding: () => active,
       }
     );

@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as custodyLocks from "../../src/storage/cross-process-lock.js";
 import * as harnessPaths from "../../src/wrap/config-reader.js";
 import { CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME } from "../../src/core/master-custody.js";
-import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -252,6 +252,121 @@ approval_channel:
     }
     forgedIdentityKey.fill(0);
   }
+
+  function emptyHarnessPaths(): ReturnType<typeof harnessPaths.getPlatformPaths> {
+    const paths = harnessPaths.getPlatformPaths();
+    for (const platform of Object.keys(paths) as Array<keyof typeof paths>) paths[platform] = [];
+    return paths;
+  }
+
+  it("reports the flag and a next-start prediction and never a live state", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    const configPath = join(fortress, "sanctuary.json");
+    try {
+      await writeFile(configPath, JSON.stringify({ session_binding: { sole_identity: true } }));
+      const check = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check).toBeDefined();
+      expect(check!.message).toContain(`Config: ${configPath}`);
+      expect(check!.message).toContain("session_binding.sole_identity: true");
+      expect(check!.message).toContain("A server started now would be: bound by default to ");
+      expect(check!.message).not.toMatch(/currently bound|live session/i);
+      await writeFile(configPath, JSON.stringify({ session_binding: { sole_identity: false } }));
+      const next = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(next!.message).toContain("A server started now would be: not bound: default binding is off");
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("predicts no binding while the config lock is held", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    try {
+      await writeFile(join(fortress, "sanctuary.json"), JSON.stringify({ session_binding: { sole_identity: true } }));
+      await writeFile(join(fortress, "sanctuary.json.lock"), "holder");
+      const check = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check!.message).toContain("A server started now would be: not bound: the config lock is held");
+      expect(check!.message).not.toContain("bound by default to");
+      expect(check!.hint).toContain("from this shell's environment");
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it.each(["unreadable metadata", "inspection error"])("reports a config lock with %s", async arm => {
+    const fortress = await makeFortress();
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    const lock = join(fortress, "sanctuary.json.lock");
+    try {
+      if (arm === "unreadable metadata") await mkdir(lock);
+      else await symlink(lock, lock);
+      const check = (await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check).toMatchObject({ status: "WARN" });
+      expect(check!.message).toContain(arm === "unreadable metadata"
+        ? "sanctuary.json.lock present: holder metadata unavailable"
+        : "sanctuary.json.lock could not be inspected");
+      expect(check!.message).toContain("remove only when no Sanctuary process is running");
+      expect(await readdir(fortress)).toContain("sanctuary.json.lock");
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("finds an entry under a key other than sanctuary by its storage path", async () => {
+    const fortress = await makeFortress();
+    vi.stubEnv("HOME", fortress);
+    const harness = join(fortress, "harness.json");
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue({ ...emptyHarnessPaths(), "claude-code": [harness] });
+    try {
+      await writeFile(harness, JSON.stringify({ mcpServers: {
+        "sanctuary-coordinator": { env: { SANCTUARY_STORAGE_PATH: fortress, SANCTUARY_SESSION_IDENTITY_ID: "selected" } },
+        "another-fortress": { env: { SANCTUARY_STORAGE_PATH: join(fortress, "other"), SANCTUARY_FORTRESS_PATH: fortress } },
+      }, mcp: { servers: { "alias-entry": { env: { SANCTUARY_FORTRESS_PATH: fortress } } } },
+        mcp_servers: { "empty-selection": { env: { SANCTUARY_STORAGE_PATH: "", SANCTUARY_FORTRESS_PATH: fortress, SANCTUARY_SESSION_IDENTITY_ID: "" } } } }));
+      const check = (await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check).toBeDefined();
+      expect(check!.message).toContain(`MCP entry sanctuary-coordinator (${harness}): SANCTUARY_SESSION_IDENTITY_ID set`);
+      expect(check!.message).toContain(`MCP entry alias-entry (${harness}): SANCTUARY_SESSION_IDENTITY_ID not set`);
+      expect(check!.message).toContain(`MCP entry empty-selection (${harness}): SANCTUARY_SESSION_IDENTITY_ID set (empty)`);
+      expect(check!.message).not.toContain("another-fortress");
+      expect(check!.message).toContain("cannot predict: identities are encrypted and no key is available");
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("reports a present config lock and its holder without removing it", async () => {
+    const fortress = await makeFortress();
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    const lock = join(fortress, "sanctuary.json.lock");
+    const holder = JSON.stringify({ pid: process.pid, acquired_at: "2020-01-01T00:00:00.000Z" });
+    try {
+      await writeFile(lock, holder);
+      const check = (await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check).toMatchObject({ status: "WARN" });
+      expect(check!.message).toContain(`pid ${process.pid}`);
+      expect(check!.message).toContain("remove only when no Sanctuary process is running");
+      expect(await readFile(lock, "utf8")).toBe(holder);
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("a second stored identity changes the next-start prediction to several identities", async () => {
+    const fortress = await makeFortress({ identity: true });
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    try {
+      await writeFile(join(fortress, "sanctuary.json"), JSON.stringify({ session_binding: { sole_identity: true } }));
+      const first = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(first!.message).toContain("bound by default to ");
+      const storage = new FilesystemStorage(join(fortress, "state"));
+      const params = JSON.parse(bytesToString((await storage.read("_meta", "key-params"))!));
+      const derived = await deriveMasterKey(passphrase, params);
+      const identityKey = derivePurposeKey(derived.key, "identity-encryption");
+      try {
+        const { storedIdentity } = createIdentity("second", identityKey, "passphrase");
+        await persistStoredIdentity(storage, derived.key, storedIdentity);
+      } finally { identityKey.fill(0); derived.key.fill(0); }
+      const next = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(next!.message).toContain("A server started now would be: not bound: this fortress has several identities");
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
 
   it.each(["complete", "later check rejects"])("doctor releases its session when %s", async (outcome) => {
     const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });

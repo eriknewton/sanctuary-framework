@@ -1,4 +1,4 @@
-// fail-before-exempt: credential surrogacy slice 1a made surrogateBoundSecrets a required Broker constructor option (AGENTS.md rule 3); this file only passes an empty set to the existing constructions, asserts no new behavior, and so passes against pre-fix source by construction. The refusal behavior is pinned by the new surrogate-refusal, broker-server-surrogate-refusal and surrogate-policy tests, which fail on pre-fix source.
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision, so this file supplies a named boot decision beside its existing binding; it also passes an empty surrogateBoundSecrets set to its Broker constructions. Neither edit asserts new behavior.
 /**
  * Agent-facing audit redaction ALLOWLIST — acceptance + structure tripwire.
  *
@@ -575,7 +575,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
       masterKey,
       "recovery-key",
       auditLog,
-      { currentSessionBinding: () => active }
+      { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
     );
     await identityManager.load();
     const id = JSON.parse(
@@ -785,7 +785,7 @@ describe("agent-audit-allowlist: HIGH — decision-granularity search oracle (al
       masterKey,
       "recovery-key",
       auditLog,
-      { currentSessionBinding: () => active }
+      { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
     );
     await identityManager.load();
     const id = JSON.parse(

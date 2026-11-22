@@ -417,6 +417,7 @@ export function createAgentNativeCooperativeTools(
           primitive: await deletePrimitiveArgs(stepArgs),
           riskTier: 1,
         };
+      // A remember step reaches the state_write handler; must match holdSoleBoundCooperativeWrites in agent-native/session-binding.ts.
       case COOPERATIVE_TOOL_NAMES.remember:
         return {
           primitiveTool: "state_write",
@@ -566,6 +567,7 @@ export function createAgentNativeCooperativeTools(
       name: COOPERATIVE_TOOL_NAMES.remember,
       description: "Store a key/value into encrypted sovereign memory for this session. Wraps state_write with an approval-binding and audit record. Use this (not raw state_write) for agent working memory you want auditable. Returns { key, namespace_handle, audit_ref }; the namespace is an opaque handle, never the raw path.",
       tool_class: "write",
+      // The state_write approval target must match holdSoleBoundCooperativeWrites in agent-native/session-binding.ts.
       approvalTargetToolName: "state_write",
       approvalTargetArgs: rememberPrimitiveArgs,
       inputSchema: {

@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 /**
  * Full exports discover durable state and bind its scope before approval.
  * LEGACY-BUG-001
@@ -56,6 +57,7 @@ async function fixture(sessionScoped = false, ambiguousOwner = false, restart = 
   await baseline.load();
   const { tools } = createCognitiveTools(cold, reopened, masterKey, "recovery-key", audit, {
     namespaceRegistry: restart ? OpaqueNamespaceRegistry.testOnlyInMemory() : registry,
+    sessionBindingBootState: () => "state_BOUND_NAMED",
     currentSessionBinding: () => sessionScoped ? {
       identity_id: identity.identity_id,
       requester_identity_fingerprint: fingerprintIdentityId(identity.identity_id),

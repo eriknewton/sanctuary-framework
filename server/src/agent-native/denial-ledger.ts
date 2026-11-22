@@ -41,6 +41,7 @@ export const DENIAL_CAUSES = [
   "handler_error",
   "post_allow_refusal",
   "proxy_upstream_error",
+  // This cause must match argumentStageCause in tool-outcome.ts.
   "session_not_bound",
   "origin_unresolved",
   "other",

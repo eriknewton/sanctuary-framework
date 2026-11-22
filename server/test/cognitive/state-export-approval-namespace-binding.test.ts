@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 /**
  * State export executes exactly the namespace set bound to each Tier-1 approval.
  * LEGACY-BUG-001
@@ -465,7 +466,7 @@ describe("state_export approval namespace binding", () => {
       masterKey,
       "passphrase",
       auditLog,
-      { currentSessionBinding: () => activeSession }
+      { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => activeSession }
     );
     const rawStateExportTool = tools.find((t) => t.name === "state_export");
     const rawStateListTool = tools.find((t) => t.name === "state_list");

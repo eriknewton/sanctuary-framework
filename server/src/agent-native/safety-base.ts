@@ -7,6 +7,7 @@ import {
   ToolArgumentValidationError,
 } from "../tool-args.js";
 import { COOPERATIVE_TOOL_NAMES } from "./tool-names.js";
+import { SESSION_NOT_BOUND_BRAND } from "./session-not-bound.js";
 
 export type RiskTier = 1 | 2 | 3;
 export type RemediationClass =
@@ -211,11 +212,15 @@ export class ApprovalProofStore {
 }
 
 export interface SessionBinding {
+  binding_source?: "launch_variable" | "sole_identity";
   identity_id?: string;
   requester_identity_fingerprint?: `sha256:${string}`;
   expires_at?: string;
   delegated_scopes?: string[];
 }
+
+/** Every cooperative non-bound state shares this immutable empty binding. */
+export const UNBOUND_SESSION: SessionBinding = Object.freeze({});
 
 export interface ActiveSessionIdentity {
   identity_id: string;
@@ -229,6 +234,16 @@ export class SessionIdentityError extends Error {
   }
 }
 
+/** Missing session identity evidence must match argumentStageCause in tool-outcome.ts. */
+export class SessionNotBoundError extends SessionIdentityError {
+  constructor() {
+    super(FIXED_DENIAL_MESSAGE);
+    this.name = "SessionNotBoundError";
+    // The type brand must match isSessionNotBoundError in session-not-bound.ts.
+    Object.defineProperty(this, SESSION_NOT_BOUND_BRAND, { value: true });
+  }
+}
+
 export function fingerprintIdentityId(identityId: string): `sha256:${string}` {
   return sha256(`identity:${identityId}`);
 }
@@ -237,7 +252,7 @@ export function resolveActiveSessionIdentity(
   binding: SessionBinding | undefined
 ): ActiveSessionIdentity {
   if (!binding?.identity_id || !binding.requester_identity_fingerprint) {
-    throw new SessionIdentityError();
+    throw new SessionNotBoundError();
   }
   if (binding.expires_at && Date.parse(binding.expires_at) <= Date.now()) {
     throw new SessionIdentityError();
