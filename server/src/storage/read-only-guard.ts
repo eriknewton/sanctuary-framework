@@ -98,6 +98,9 @@ export const READ_ONLY_STORAGE_DELEGATED_METHODS = [
   "exists",
   "totalSize",
   "listNamespaces",
+  // Must match StorageBackend in interface.ts and the implementations in filesystem.ts and memory.ts.
+  "listNamespacesForAgentDiscovery",
+  "totalSizeOfNonReservedNamespaces",
   "listKeys",
   "readBounded",
   "namespacePath",
@@ -130,6 +133,8 @@ export class ReadOnlyStorageGuard
    * refusal into a runtime error, changing the meaning of the probe.
    */
   listNamespaces?: () => Promise<string[]>;
+  listNamespacesForAgentDiscovery?: () => Promise<string[]>;
+  totalSizeOfNonReservedNamespaces?: () => Promise<number>;
 
   /** Mirror presence so AuditLog's absent-capability fallback remains truthful. */
   listKeys?: (namespace: string, prefix?: string) => Promise<string[]>;
@@ -139,6 +144,14 @@ export class ReadOnlyStorageGuard
 
   constructor(inner: StorageBackend) {
     this.inner = inner;
+    if (typeof inner.listNamespacesForAgentDiscovery === "function") {
+      // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+      this.listNamespacesForAgentDiscovery = () => inner.listNamespacesForAgentDiscovery!();
+    }
+    if (typeof inner.totalSizeOfNonReservedNamespaces === "function") {
+      // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+      this.totalSizeOfNonReservedNamespaces = () => inner.totalSizeOfNonReservedNamespaces!();
+    }
     // Must match StorageBackend.listKeys in interface.ts and STORAGE_READ_ONLY
     // in test/structure/read-tool-mutation-reachability.ts.
     if (typeof inner.listKeys === "function") {

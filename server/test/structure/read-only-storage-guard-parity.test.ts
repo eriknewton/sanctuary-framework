@@ -144,3 +144,21 @@ it("classifies names-only enumeration and preserves its optional capability", as
 it("refuses a missing guarded interface", () => {
   expect(() => interfaceMethodNames("", "MissingInterface")).toThrow(/interface not found/);
 });
+
+
+it("delegates agent aggregates and mirrors their absence", async () => {
+  const inner = new MemoryStorage();
+  await inner.write("notes", "one", new Uint8Array([1]));
+  await inner.write("_local_results", "one", new Uint8Array([1]));
+  const guard = new ReadOnlyStorageGuard(inner);
+  expect(READ_ONLY_STORAGE_DELEGATED_METHODS).toEqual(expect.arrayContaining([
+    "totalSizeOfNonReservedNamespaces", "listNamespacesForAgentDiscovery",
+  ]));
+  expect(await guard.totalSizeOfNonReservedNamespaces!()).toBe(1);
+  expect(await guard.listNamespacesForAgentDiscovery!()).toEqual(["notes"]);
+  Object.defineProperty(inner, "totalSizeOfNonReservedNamespaces", { value: undefined });
+  Object.defineProperty(inner, "listNamespacesForAgentDiscovery", { value: undefined });
+  const absent = new ReadOnlyStorageGuard(inner);
+  expect(absent.totalSizeOfNonReservedNamespaces).toBeUndefined();
+  expect(absent.listNamespacesForAgentDiscovery).toBeUndefined();
+});

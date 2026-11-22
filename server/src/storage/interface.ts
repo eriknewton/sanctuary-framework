@@ -85,6 +85,25 @@ export interface StorageBackend {
   totalSize(): Promise<number>;
 
   /**
+   * Bytes in namespaces for which isReservedNamespace in cognitive/state-store.ts is false.
+   * Reserved root names are skipped before stat or directory reads; undecodable names
+   * retain totalSize's handling. Optional: agent consumers refuse when absent.
+   * Must match totalSizeOfNonReservedNamespaces in filesystem.ts, memory.ts,
+   * directory-capability-worker.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
+   * The namespace policy must match storage/agent-discovery.ts.
+   */
+  totalSizeOfNonReservedNamespaces?(): Promise<number>;
+
+  /**
+   * Same complete-or-throw bounds as listNamespaces, with the local-store predicate
+   * applied before charging, stat or opendir. Optional: agent export refuses when absent.
+   * Must match listNamespacesForAgentDiscovery in filesystem.ts, memory.ts,
+   * directory-capability-worker.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
+   * The skip predicate must match isAgentDiscoverySkippedNamespace in agent-discovery.ts.
+   */
+  listNamespacesForAgentDiscovery?(): Promise<string[]>;
+
+  /**
    * OPTIONAL atomic create. Returns true only when this call created the
    * entry; false means an entry already existed and nothing changed.
    * Security-sensitive callers must fail closed when the capability is

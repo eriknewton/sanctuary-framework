@@ -105,7 +105,7 @@ describe("durable namespace export", () => {
 
   it("refuses before approval when enumeration fails", async () => {
     const f = await fixture();
-    vi.spyOn(f.reopened, "listNamespaces").mockRejectedValue(new Error("enumeration unavailable"));
+    vi.spyOn(f.reopened, "listNamespacesForAgentDiscovery").mockRejectedValue(new Error("enumeration unavailable"));
     const result = await f.client.callTool({ name: "state_export", arguments: {} });
     expect(result.isError).toBe(true);
     expect(f.approvedHash()).toBeUndefined();
@@ -114,13 +114,13 @@ describe("durable namespace export", () => {
 
   it("fails closed when the backend cannot enumerate", async () => {
     const f = await fixture();
-    Object.defineProperty(f.reopened, "listNamespaces", { value: undefined });
+    Object.defineProperty(f.reopened, "listNamespacesForAgentDiscovery", { value: undefined });
     await expect(f.cold.export()).rejects.toThrow("cannot enumerate");
   });
 
   it.each([false, true])("records the fixed discovery remediation operator-side before approval (session=%s)", async (sessionScoped) => {
     const f = await fixture(sessionScoped);
-    vi.spyOn(f.reopened, "listNamespaces").mockResolvedValue(
+    vi.spyOn(f.reopened, "listNamespacesForAgentDiscovery").mockResolvedValue(
       Array.from({ length: MAX_DISCOVERED_NAMESPACES + 1 }, (_, i) => `ns-${i}`),
     );
     const exportState = vi.spyOn(f.cold, "exportNamespaces");
@@ -138,7 +138,7 @@ describe("durable namespace export", () => {
 
   it("retains explicit namespace and empty-scope semantics without re-enumerating", async () => {
     const f = await fixture();
-    const discovery = vi.spyOn(f.reopened, "listNamespaces").mockRejectedValue(new Error("must not discover"));
+    const discovery = vi.spyOn(f.reopened, "listNamespacesForAgentDiscovery").mockRejectedValue(new Error("must not discover"));
     expect((await f.cold.export("alpha")).namespaces).toEqual(["alpha"]);
     expect((await f.cold.exportNamespaces([])).namespaces).toEqual([]);
     expect(discovery).not.toHaveBeenCalled();

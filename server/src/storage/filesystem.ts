@@ -41,6 +41,7 @@
  *   pairs; they are forward-only by design.
  */
 
+import { isAgentDiscoverySkippedNamespace, isAgentAggregateReservedNamespace } from "./agent-discovery.js";
 import { constants as fsConstants, existsSync, lstatSync } from "node:fs";
 import { link, mkdir, open, opendir, unlink, readdir, stat, lstat } from "node:fs/promises";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES, StorageReadBoundError } from "./interface.js";
@@ -1623,6 +1624,18 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   async listNamespaces(): Promise<string[]> {
     const capability = this.darwinCapability();
     if (capability) return capability.client.call("listNamespaces");
+    return this.discoverNamespaces(false);
+  }
+
+  async listNamespacesForAgentDiscovery(): Promise<string[]> {
+    // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+    // Must match isAgentDiscoverySkippedNamespace in storage/agent-discovery.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
+    const capability = this.darwinCapability();
+    if (capability) return capability.client.call("listNamespacesForAgentDiscovery");
+    return this.discoverNamespaces(true);
+  }
+
+  private async discoverNamespaces(agentDiscovery: boolean): Promise<string[]> {
     let root;
     try {
       root = await opendir(this.activeBasePath());
@@ -1642,6 +1655,13 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       }
     };
     for await (const dir of root) {
+      if (agentDiscovery) {
+        let decoded: string | undefined;
+        try { decoded = decodeRawFilesystemStorageName(dir.name, "namespace"); }
+        catch { /* Undecodable root noise retains operator discovery's validation path. */ }
+        // Local stores are skipped before charge, stat and open so their contents consume no agent discovery budget.
+        if (decoded !== undefined && isAgentDiscoverySkippedNamespace(decoded)) continue;
+      }
       chargeEntry();
       const rootEntryPath = join(this.activeBasePath(), dir.name);
       const rootEntryStat = await stat(rootEntryPath);
@@ -1697,6 +1717,42 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     try {
       const namespaces = await readdir(this.activeBasePath());
       for (const ns of namespaces) {
+        const rootEntryPath = join(this.activeBasePath(), ns);
+        const rootEntryStat = await stat(rootEntryPath);
+        if (!rootEntryStat.isDirectory()) continue;
+        // totalSize measures bytes already under the state root for emptiness
+        // gates; resolving root entries as namespaces would turn stray
+        // directories into false-empty or partial-size answers.
+        const nsPath = rootEntryPath;
+
+        const files = await readdir(nsPath);
+        for (const file of files) {
+          const filePath = join(nsPath, file);
+          const fileStat = await stat(filePath);
+          total += fileStat.size;
+        }
+      }
+    } catch {
+      // If base path doesn't exist yet, total is 0
+    }
+
+    return total;
+  }
+  async totalSizeOfNonReservedNamespaces(): Promise<number> {
+    // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+    // Must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
+    const capability = this.darwinCapability();
+    if (capability) return capability.client.call("totalSizeOfNonReservedNamespaces");
+    let total = 0;
+
+    try {
+      const namespaces = await readdir(this.activeBasePath());
+      for (const ns of namespaces) {
+        let decoded: string | undefined;
+        try { decoded = decodeRawFilesystemStorageName(ns, "namespace"); }
+        catch { /* Undecodable names retain totalSize's path for that entry. */ }
+        // Reserved names are skipped before stat or directory reads so internal bytes never enter this aggregate.
+        if (decoded !== undefined && isAgentAggregateReservedNamespace(decoded)) continue;
         const rootEntryPath = join(this.activeBasePath(), ns);
         const rootEntryStat = await stat(rootEntryPath);
         if (!rootEntryStat.isDirectory()) continue;

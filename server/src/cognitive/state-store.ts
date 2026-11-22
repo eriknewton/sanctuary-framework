@@ -3143,10 +3143,12 @@ export class StateStore {
     // Must match sessionOwnedExportNamespaces in tools.ts: approval and full
     // export share durable discovery; an absent capability never falls back
     // to the warm cache, which cannot prove completeness after a restart.
-    if (!this.storage.listNamespaces) {
+    // Agent discovery is required: operator enumeration cannot substitute for its budget policy.
+    // Reserved filtering must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts.
+    if (!this.storage.listNamespacesForAgentDiscovery) {
       throw new Error("Storage cannot enumerate namespaces");
     }
-    const namespaces = await this.storage.listNamespaces();
+    const namespaces = await this.storage.listNamespacesForAgentDiscovery();
     // Recheck the backend contract before retaining or sorting its result;
     // internal namespaces count toward the bound as well.
     if (namespaces.length > MAX_DISCOVERED_NAMESPACES) {
