@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 /**
  * FilesystemStorage tests
  *
@@ -292,7 +293,7 @@ describe("FilesystemStorage", () => {
         masterKey,
         "recovery-key",
         auditLog,
-        { currentSessionBinding: () => binding.current },
+        { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => binding.current },
       );
       await identityManager.load();
       const identity = await callTool(l1Tools, "identity_create", {
@@ -423,7 +424,7 @@ describe("FilesystemStorage", () => {
         masterKey,
         "recovery-key",
         auditLog,
-        { currentSessionBinding: () => session("session-agent") },
+        { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => session("session-agent") },
       );
       const tool = tools.find((candidate) => candidate.name === "state_export");
       if (!tool?.approvalTargetArgs) {

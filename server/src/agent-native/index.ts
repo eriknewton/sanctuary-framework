@@ -22,3 +22,4 @@ export * from "./cooperative-surface.js";
 export * from "./capabilities-catalog.js";
 export * from "./protection-layers.js";
 export * from "./intent-classifier.js";
+export * from "./session-binding.js";

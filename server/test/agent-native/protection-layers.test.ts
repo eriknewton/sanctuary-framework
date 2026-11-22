@@ -1,3 +1,4 @@
+// fail-before-exempt: Construction assertions select a production-created identity for a resolved cooperative session.
 // fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 // fail-before-exempt: this change only reorders a clock freeze in an existing test so its audit entry is never timestamped after the frozen now; the source under test is unchanged, so the test passes against pre-change source by construction.
 import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
@@ -38,7 +39,7 @@ async function setup(extra: Partial<Parameters<typeof createAgentNativeCooperati
   let binding: SessionBinding | undefined;
   const stateStore = new StateStore(storage, key);
   const primitives = createCognitiveTools(stateStore, storage, key, "recovery-key", auditLog,
-    { currentSessionBinding: () => binding });
+    { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => binding });
   await primitives.identityManager.load();
   const created = await primitives.tools.find(t => t.name === "identity_create")!.handler({ label: "protections-test" });
   const identity = JSON.parse(created.content[0]!.text);
@@ -115,11 +116,13 @@ describe("protection layers", () => {
     const { createSanctuaryServer } = await import("../../src/index.js");
     const home = await createTempHome("protection-layers");
     const previousIdentity = process.env.SANCTUARY_SESSION_IDENTITY_ID;
-    process.env.SANCTUARY_SESSION_IDENTITY_ID = "protection-test-session";
+    delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
     let app: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
     try {
       app = await createSanctuaryServer({ storage: new MemoryStorage(), passphrase: TEST_PASSPHRASE });
       const handler = (app.server as unknown as { _requestHandlers: Map<string, Function> })._requestHandlers.get("tools/call")!;
+      const created = await handler({ method: "tools/call", params: { name: "identity_create", arguments: { label: "protection-test-session" } } }, {});
+      process.env.SANCTUARY_SESSION_IDENTITY_ID = JSON.parse(created.content[0].text).identity_id;
       const response = await handler({ method: "tools/call", params: { name: "sanctuary_active_protections", arguments: {} } }, {});
       const result = JSON.parse(response.content[0].text);
       expect(result.guarantees).toEqual(guarantees);

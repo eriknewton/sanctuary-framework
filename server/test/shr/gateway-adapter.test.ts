@@ -3,7 +3,7 @@
  *
  * Tests for SHR → authorization context transformation, scoring, and constraint generation.
  */
-
+// fail-before-exempt: Gateway scoring fixtures retain their config shape when the optional session binding key is added.
 import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -225,7 +225,7 @@ describe("Ping Identity Gateway Adapter", () => {
 
     it("with local-process environment, applies L2 degradations", () => {
       const localConfig = {
-        ...config,
+        ...(config as Omit<SanctuaryConfig, "session_binding" | "privacy_filter"> & Pick<SanctuaryConfig, "privacy_filter">),
         execution: {
           ...config.execution,
           environment: "local-process",
@@ -341,7 +341,7 @@ describe("Ping Identity Gateway Adapter", () => {
   describe("authorization constraint generation", () => {
     it("generates high-priority constraints for critical degradations", () => {
       const localConfig = {
-        ...config,
+        ...(config as Omit<SanctuaryConfig, "session_binding" | "privacy_filter"> & Pick<SanctuaryConfig, "privacy_filter">),
         execution: {
           ...config.execution,
           environment: "local-process",
@@ -366,7 +366,7 @@ describe("Ping Identity Gateway Adapter", () => {
     it("adjusts constraints based on overall sovereignty score", () => {
       // Create a very degraded config
       const veryDegradedConfig = {
-        ...config,
+        ...(config as Omit<SanctuaryConfig, "session_binding" | "privacy_filter"> & Pick<SanctuaryConfig, "privacy_filter">),
         execution: {
           ...config.execution,
           environment: "local-process",

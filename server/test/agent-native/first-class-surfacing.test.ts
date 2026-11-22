@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 import { describe, expect, it } from "vitest";
 import { generateRandomKey } from "../../src/core/random.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
@@ -61,7 +62,7 @@ async function setup() {
     masterKey,
     "recovery-key",
     auditLog,
-    { currentSessionBinding: () => active }
+    { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding: () => active }
   );
   await identityManager.load();
   const identity = await callTool(l1Tools, "identity_create", { label: "agent-a" });

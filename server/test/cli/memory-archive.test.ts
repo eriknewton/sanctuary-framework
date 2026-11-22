@@ -1,3 +1,4 @@
+// fail-before-exempt: archive custody cleanup supplies the additive identity load evidence.
 /**
  * Exit V2 SDW memory archive CLI composition tests.
  *
@@ -1248,7 +1249,7 @@ describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform)
   it.each(["zero identities", "no default identity"])("bootstrap releases custody with %s", async mode => {
     await withArchiveCustody(false, async fixture => {
       if (mode === "no default identity") {
-        vi.spyOn(IdentityManager.prototype, "load").mockResolvedValue({ total: 1, loaded: 1, failed: 0 });
+        vi.spyOn(IdentityManager.prototype, "load").mockResolvedValue({ total: 1, loaded: 1, failed: 0, skipped_null_reads: 0, duplicate_ids: 0, key_mismatches: 0, decrypted_keys: ["identity"] });
         vi.spyOn(IdentityManager.prototype, "getDefault").mockReturnValue(undefined);
       }
       const terminal = new TestTerminal();

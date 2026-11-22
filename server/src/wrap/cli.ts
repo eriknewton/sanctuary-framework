@@ -219,6 +219,8 @@ import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.
 import { runProvisionPin } from "../cli/castle-wall.js";
 import { stripTrailingSlashes } from "../strings.js";
 import { requireCliTestRunner, argvTokenForDisplay } from "../cli/argv.js";
+import { createFreshFortress, writeSoleBindingForFreshFortress, type FreshFortress } from "../config.js";
+import { sessionBindingEnableHint } from "../cli/session-binding.js";
 
 type ProcessShutdownCleanup = () => void | Promise<void>;
 
@@ -490,6 +492,22 @@ export function registerProcessShutdownCleanup(
   return () => {
     processShutdownCleanups.delete(cleanup);
   };
+}
+
+/**
+ * Write the default-binding flag for a fortress this wrap created and seeded.
+ * A failed write leaves the flag off and says so on its own line, separate
+ * from the identity seed's outcome, with the command that turns it on.
+ */
+async function enableFreshSessionBindingForWrap(freshFortress: FreshFortress, storagePath: string): Promise<void> {
+  try {
+    // Creation and seed evidence must match writeSoleBindingForFreshFortress in config.ts.
+    await writeSoleBindingForFreshFortress(freshFortress, join(storagePath, "sanctuary.json"));
+  } catch (err) {
+    // SAFETY: stderr is the operator-facing wrap channel.
+    console.error(`  Note: default session binding not enabled at wrap time (${(err as Error).message}).`);
+    console.error(sessionBindingEnableHint(storagePath));
+  }
 }
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -4097,6 +4115,13 @@ export async function runWrap(
     process.exit(2);
   }
 
+  const freshFortress = preResolvedAgentCredential === undefined
+    ? await createFreshFortress(storagePath) : undefined;
+  if (!freshFortress) {
+    // SAFETY: stderr is the operator-facing wrap channel.
+    console.error(sessionBindingEnableHint(storagePath));
+  }
+
   // Resolve the fortress credential through the ONE shared resolver
   // (wrap/custody-credential.ts). Its order and its mint condition live there;
   // this block only reports what it chose.
@@ -5103,6 +5128,7 @@ export async function runWrap(
     let ndAuditStorage: FilesystemStorage | undefined;
     let ndAuditMasterKey: Uint8Array | undefined;
     let unregisterNoDashboardAuditFlush: (() => void) | undefined;
+    let ndSeededDefault = false;
     // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
     // skipped identity bootstrap because the creation lived after the
     // dashboard startup path. Derive the master key and create a default
@@ -5164,6 +5190,8 @@ export async function runWrap(
             label: "default",
             source: "wrap-auto",
           });
+          await ndAuditLog.flush();
+          ndSeededDefault = true;
         }
         await ndAuditLog.flush();
         unregisterNoDashboardAuditFlush?.();
@@ -5174,6 +5202,7 @@ export async function runWrap(
             `(${(err as Error).message}).`,
         );
       }
+      if (ndSeededDefault && freshFortress) await enableFreshSessionBindingForWrap(freshFortress, storagePath);
     }
 
     failIfAnchorOptInDropped();
@@ -5364,6 +5393,7 @@ export async function runWrap(
       await enableAnchorTransparencyForWrap(v11Storage, derived.key, wrapAuditLog);
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
+      let seededDefault = false;
       try {
         const { IdentityManager } = await import("../cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
@@ -5382,6 +5412,8 @@ export async function runWrap(
             label: "default",
             source: "wrap-auto",
           });
+          await wrapAuditLog.flush();
+          seededDefault = true;
         }
         // Dashboard-fold PR-4: the identity/audit-log source threading into
         // the retired wrap-spawned server is gone; the surviving main
@@ -5393,6 +5425,7 @@ export async function runWrap(
             `(${(err as Error).message}).`,
         );
       }
+      if (seededDefault && freshFortress) await enableFreshSessionBindingForWrap(freshFortress, storagePath);
 
       // WP-V1.2-5: construct + load the Intelligence Substrate Selector
       // against the wrap-auto fortress -- RETIRED here by dashboard-fold

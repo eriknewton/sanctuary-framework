@@ -4,12 +4,13 @@
  * Loads and validates server configuration from file or environment variables.
  */
 
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, stat, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { ConfigLoadError } from "./errors/config-error.js";
 import { assertHermeticStoragePath } from "./paths.js";
+import { withPathLock, CROSS_PROCESS_LOCK_TIMEOUT_MS } from "./storage/cross-process-lock.js";
 import { getSanctuaryVersion } from "./version.js";
 
 const PKG_VERSION = getSanctuaryVersion();
@@ -67,6 +68,7 @@ const CONFIG_FEATURE_ERROR_PREFIX =
   "Sanctuary configuration references unimplemented features";
 
 export interface SanctuaryConfig {
+  session_binding?: { sole_identity?: boolean };
   version: string;
   storage_path: string;
 
@@ -571,6 +573,10 @@ export async function saveConfig(
 ): Promise<void> {
   const path =
     configPath ?? join(config.storage_path, "sanctuary.json");
+  await writeConfigAtomically(path, config);
+}
+
+async function writeConfigAtomically(path: string, config: object): Promise<void> {
   assertHermeticStoragePath(dirname(path));
   const tmpPath = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
   try {
@@ -584,6 +590,70 @@ export async function saveConfig(
     await rm(tmpPath, { force: true }).catch(() => {});
     throw err;
   }
+}
+
+/** The config lock name must match checkSessionBinding in cli/doctor.ts and predictNextStartBinding in agent-native/session-binding.ts. */
+export const FORTRESS_CONFIG_LOCK = "sanctuary.json.lock";
+
+type ConfigObject = Record<string, unknown>;
+
+function isConfigObject(value: unknown): value is ConfigObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function validSessionBinding(value: unknown): boolean {
+  return isConfigObject(value)
+    && (!Object.hasOwn(value, "sole_identity") || typeof value.sole_identity === "boolean");
+}
+
+/** Read the operator's config without rewriting or quarantining it. */
+export async function readFortressConfig(configFilePath: string): Promise<ConfigObject> {
+  let raw: string;
+  try {
+    raw = await readFile(configFilePath, "utf-8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return {};
+    throw error;
+  }
+  const disk: unknown = raw.trim() === "" ? {} : JSON.parse(raw);
+  if (!isConfigObject(disk)) throw new Error("Sanctuary config must be an object");
+  if (Object.hasOwn(disk, "session_binding") && !validSessionBinding(disk.session_binding)) {
+    throw new Error("session_binding.sole_identity must be a boolean when present");
+  }
+  return disk;
+}
+
+/** Serialize config owners and preserve every key outside the writer's authority. */
+export async function updateFortressConfig(
+  configFilePath: string,
+  owner: "boot" | "session_binding",
+  mutate: (config: ConfigObject) => object | Promise<object>,
+  // Observes contention on this helper's own lock, so a test can prove two writers serialize here; never changes the write.
+  observe: { onContended?: () => void } = {},
+): Promise<void> {
+  assertHermeticStoragePath(dirname(configFilePath));
+  await withPathLock(dirname(configFilePath), FORTRESS_CONFIG_LOCK, async () => {
+    const disk = await readFortressConfig(configFilePath);
+    const changed = await mutate(structuredClone(disk));
+    if (!isConfigObject(changed)) throw new Error("Config update must return an object");
+    let result: ConfigObject;
+    if (owner === "session_binding") {
+      // The session_binding owner key must match runSessionBindingCommand in cli/session-binding.ts.
+      result = { ...disk };
+      if (Object.hasOwn(changed, "session_binding")) result.session_binding = changed.session_binding;
+      else delete result.session_binding;
+    } else {
+      result = { ...disk, ...changed };
+      // Boot writes back the on-disk session_binding read under the lock, preserving the operator's choice.
+      if (Object.hasOwn(disk, "session_binding")) result.session_binding = disk.session_binding;
+      else delete result.session_binding;
+    }
+    if (Object.hasOwn(result, "session_binding") && !validSessionBinding(result.session_binding)) {
+      throw new Error("session_binding.sole_identity must be a boolean when present");
+    }
+    await writeConfigAtomically(configFilePath, result);
+  }, { timeoutMs: CROSS_PROCESS_LOCK_TIMEOUT_MS, ...(observe.onContended ? { onContended: observe.onContended } : {}) });
 }
 
 /**
@@ -610,6 +680,9 @@ export async function saveConfig(
 export function validateConfig(config: SanctuaryConfig): void {
   const featureErrors: string[] = [];
   const valueErrors: string[] = [];
+  if (Object.hasOwn(config, "session_binding") && !validSessionBinding(config.session_binding)) {
+    valueErrors.push("session_binding.sole_identity must be a boolean when present");
+  }
   // Back-compat alias: existing checks below push schema/feature problems into
   // `errors`. Pure scalar-range checks push into `valueErrors` explicitly.
   const errors = featureErrors;
@@ -1390,4 +1463,28 @@ function compareParsedVersions(
     if (delta !== 0) return delta;
   }
   return 0;
+}
+
+
+const FRESH_FORTRESS: unique symbol = Symbol("fresh-fortress");
+export type FreshFortress = Readonly<{ [FRESH_FORTRESS]: Readonly<{ dev: number; ino: number }> }>;
+
+/** Create the directory and return evidence only when this call created it. */
+export async function createFreshFortress(path: string): Promise<FreshFortress | undefined> {
+  assertHermeticStoragePath(path);
+  // Only mkdir's own result proves this invocation created the fortress; owner-only mode grants its owner all directory permissions.
+  const created = await mkdir(path, { recursive: true, mode: 0o700 });
+  if (created === undefined) return undefined;
+  const { dev, ino } = await stat(path);
+  return Object.freeze({ [FRESH_FORTRESS]: Object.freeze({ dev, ino }) });
+}
+
+/** Creation evidence must match the seed-success callers in wrap/init.ts and wrap/cli.ts. */
+export async function writeSoleBindingForFreshFortress(token: FreshFortress, configFilePath: string): Promise<void> {
+  const directory = await stat(dirname(configFilePath));
+  // Directory identity binds the creation evidence to the destination, including a held directory descriptor path.
+  if (directory.dev !== token[FRESH_FORTRESS].dev || directory.ino !== token[FRESH_FORTRESS].ino) {
+    throw new Error("Fresh fortress evidence does not match the config directory");
+  }
+  await updateFortressConfig(configFilePath, "session_binding", () => ({ session_binding: { sole_identity: true } }));
 }

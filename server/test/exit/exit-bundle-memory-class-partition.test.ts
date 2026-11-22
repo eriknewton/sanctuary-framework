@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 /**
  * Exit machinery Slice 1 — conservative partition wired into the real exit
  * bundle export.
@@ -75,6 +76,7 @@ async function buildSource() {
     "passphrase",
     auditLog,
     {
+      sessionBindingBootState: () => "state_BOUND_NAMED",
       currentSessionBinding: () =>
         sessionIdentityId
           ? {

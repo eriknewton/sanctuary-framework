@@ -1,3 +1,4 @@
+// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 import { describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -281,6 +282,7 @@ describe("state tool namespace names", () => {
       auditLog,
       {
         namespaceRegistry: registry,
+        sessionBindingBootState: () => "state_BOUND_NAMED",
         currentSessionBinding: () => ({
           identity_id: activeIdentity,
           requester_identity_fingerprint: fingerprintIdentityId(activeIdentity),

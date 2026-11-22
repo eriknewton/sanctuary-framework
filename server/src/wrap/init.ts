@@ -22,7 +22,7 @@
  * banner and forces re-entry; headless init prints only the destination.
  */
 
-import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
+import { lstat, open, readdir, unlink } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -110,6 +110,32 @@ import { runLocalIntelligenceSetup } from "./local-intelligence.js";
 import { LOCAL_INTELLIGENCE_OPT_IN_HINT } from "../intelligence/provisioning-consent.js";
 import type { CrossProcessLockLease } from "../storage/cross-process-lock.js";
 import { kernelBackedCrossProcessLockPlatformSupported } from "../storage/cross-process-lock.js";
+import { createFreshFortress, writeSoleBindingForFreshFortress, type FreshFortress } from "../config.js";
+import { sessionBindingEnableHint } from "../cli/session-binding.js";
+
+/**
+ * Write the default-binding flag only for a fortress this init created and
+ * seeded. Whenever no flag is written (an existing directory, no seed, or a
+ * failed write) the operator is told the command that turns it on, as wrap does.
+ */
+async function enableFreshSessionBindingForInit(
+  freshFortress: FreshFortress | undefined,
+  seededIdentity: boolean,
+  fortressPath: string,
+): Promise<void> {
+  if (freshFortress && seededIdentity) {
+    try {
+      // Creation and seed evidence must match writeSoleBindingForFreshFortress in config.ts.
+      await writeSoleBindingForFreshFortress(freshFortress, join(fortressPath, "sanctuary.json"));
+      return;
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`  Note: default session binding not enabled at init time (${(err as Error).message}).`);
+    }
+  }
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(sessionBindingEnableHint(fortressPath));
+}
 
 
 export interface InitOptions {
@@ -603,7 +629,7 @@ export async function runInit(
     throw err;
   }
 
-  await mkdir(fortressPath, { recursive: true, mode: 0o700 });
+  const freshFortress = await createFreshFortress(fortressPath);
   await preflightPolicyAncestors(fortressPath);
   // Pre-mint refusal of a planted (non-regular) principal-policy entry, using
   // the SAME lstat rule the writer applies under the lock. The writer runs at
@@ -618,6 +644,7 @@ export async function runInit(
   await deps.beforeCustodyLockAcquire?.();
 
   const storage = new FilesystemStorage(`${fortressPath}/state`);
+  let seededIdentity = false;
   let runPostLockLocalSetup: (() => Promise<void>) | undefined;
   let localSetupMaster: Uint8Array | undefined;
   // What a failed run actually did, so the failure message can say it out
@@ -1191,6 +1218,7 @@ export async function runInit(
               label: "operator",
             },
           }));
+          seededIdentity = true;
         }
       } finally {
         // Zero the symmetric key that wraps the new private key as soon as it
@@ -1587,6 +1615,7 @@ export async function runInit(
   });
   try {
     await runPostLockLocalSetup?.();
+    await enableFreshSessionBindingForInit(freshFortress, seededIdentity, fortressPath);
     // The ONLY completion claim in this command, and it is reachable only
     // after every step that can fail has run. Anything printed earlier
     // (including recovery-key verification) describes that moment, not the

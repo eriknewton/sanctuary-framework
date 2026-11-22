@@ -60,6 +60,7 @@ import {
   normalizedArgsHash,
   OpaqueNamespaceRegistry,
   resolveActiveSessionIdentity,
+  SessionIdentityError,
   type SessionBinding,
 } from "../agent-native/safety-base.js";
 // a `StoredIdentity` is `JSON.parse`d off disk, so every field is attacker-
@@ -67,6 +68,8 @@ import {
 // STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
 import { assertAdmissibleIdentityLabel } from "../signing/reserved-label.js";
+import type { SessionBindingBootState } from "../agent-native/session-binding-state.js";
+import { isSessionNotBoundError } from "../agent-native/session-not-bound.js";
 
 // Must match AUDIT_EVENT_SIGNING_DOMAIN_PREFIX / INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX
 // in core/signing-domains.ts (the identity_sign refusal list).
@@ -467,6 +470,17 @@ function normalizeInternalReceiptSigningPayload(
   };
 }
 
+/** Load counters must match the eight proof conditions in agent-native/session-binding.ts. */
+export interface IdentityLoadEvidence {
+  total: number;
+  loaded: number;
+  failed: number;
+  skipped_null_reads: number;
+  duplicate_ids: number;
+  key_mismatches: number;
+  decrypted_keys: string[];
+}
+
 /** Manages all identities - provides storage and retrieval */
 export class IdentityManager {
   private storage: StorageBackend;
@@ -533,12 +547,19 @@ export class IdentityManager {
    *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
    *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
    */
-  async load(): Promise<{ total: number; loaded: number; failed: number }> {
+  async load(): Promise<IdentityLoadEvidence> {
     const entries = await this.storage.list("_identities");
     let failed = 0;
+    let skipped_null_reads = 0;
+    let duplicate_ids = 0;
+    let key_mismatches = 0;
+    const decrypted_keys: string[] = [];
     for (const entry of entries) {
       const raw = await this.storage.read("_identities", entry.key);
-      if (!raw) continue;
+      if (!raw) {
+        skipped_null_reads++;
+        continue;
+      }
       try {
         const encrypted = JSON.parse(bytesToString(raw));
         const decrypted = decrypt(encrypted, this.encryptionKey);
@@ -558,6 +579,9 @@ export class IdentityManager {
         // `save()` uses (round 3), so load and save share one check rather
         // than two hand-mirrored ones that could drift.
         this.assertValidStoredIdentity(identity);
+        decrypted_keys.push(entry.key);
+        if (this.identities.has(identity.identity_id)) duplicate_ids++;
+        if (identity.identity_id !== entry.key) key_mismatches++;
         this.identities.set(identity.identity_id, identity);
       } catch {
         failed++;
@@ -587,7 +611,11 @@ export class IdentityManager {
       this.primaryIdentityId = this.identities.keys().next().value || null;
     }
 
-    return { total: entries.length, loaded: this.identities.size, failed };
+    return {
+      total: entries.length, loaded: this.identities.size, failed,
+      skipped_null_reads, duplicate_ids, key_mismatches,
+      decrypted_keys: decrypted_keys.sort(),
+    };
   }
 
   /** Save an identity to storage */
@@ -1000,6 +1028,30 @@ function takeStateExportApprovalBinding(
 }
 
 /**
+ * A session binding and its frozen boot decision are supplied together or not
+ * at all, so a caller that hands these tools a binding cannot omit the
+ * decision the sole-write hold reads.
+ */
+export type CognitiveSessionBindingOptions =
+  | { currentSessionBinding?: undefined; sessionBindingBootState?: undefined }
+  | {
+      currentSessionBinding: () => SessionBinding | undefined;
+      // The boot decision must match createSessionBindingAccessors in agent-native/session-binding.ts.
+      sessionBindingBootState: SessionBindingBootState;
+    };
+
+/**
+ * Refuse a write made under a sole binding until its origin value is
+ * supported. Callers must match the state_write argument builder and
+ * stateWriteOriginActor below, and holdSoleBoundCooperativeWrites in
+ * agent-native/session-binding.ts.
+ */
+export function assertSoleBoundWriteNotHeld(bootState: SessionBindingBootState | undefined): void {
+  // A sole binding is the only boot decision this refuses; every other decision keeps today's write path.
+  if (bootState?.() === "state_BOUND_SOLE_IDENTITY") throw new SessionIdentityError();
+}
+
+/**
  * Create all Cognitive-layer tool definitions.
  */
 export function createCognitiveTools(
@@ -1008,10 +1060,7 @@ export function createCognitiveTools(
   masterKey: Uint8Array,
   keyProtection: "passphrase" | "hardware-key" | "recovery-key",
   auditLog?: AuditLog,
-  options?: {
-    namespaceRegistry?: OpaqueNamespaceRegistry;
-    currentSessionBinding?: () => SessionBinding | undefined;
-  }
+  options?: { namespaceRegistry?: OpaqueNamespaceRegistry } & CognitiveSessionBindingOptions
 ): {
   tools: ToolDefinition[];
   identityManager: IdentityManager;
@@ -1284,6 +1333,11 @@ export function createCognitiveTools(
   }
 
   function stateWriteOriginActor(identityId: string): OriginActor {
+    // DEBT(AGENT-SEAT-SOLE-WRITE-HELD): sole-bound writes refuse until their origin value is supported.
+    // The boot decision must match sessionBindingAccessors in index.ts; this refusal remains outside the origin fallback.
+    // Second line of the hold: the argument builders refuse before the gate so no approval or audit row precedes
+    // the refusal; this check keeps any caller that reaches the handler directly from stamping a sole-bound write.
+    assertSoleBoundWriteNotHeld(options?.sessionBindingBootState);
     try {
       const active = resolveActiveSessionIdentity(options?.currentSessionBinding?.());
       return active.identity_id === identityId ? "agent" : "operator";
@@ -1665,7 +1719,10 @@ export function createCognitiveTools(
         required: ["namespace", "key", "value"],
       },
       approvalTargetArgs: async (args) => {
+        // A held sole-bound write refuses here, before the gate can ask for approval or the handler can record success.
+        assertSoleBoundWriteNotHeld(options?.sessionBindingBootState);
         await assertToolNamespaceReady("state_write", args.namespace as string);
+        assertIdentityMatchesSession(args.identity_id as string | undefined, "state_write");
         return args;
       },
       handler: async (args) => {
@@ -1707,6 +1764,8 @@ export function createCognitiveTools(
           throw err;
         }
 
+        // The origin is settled before the success audit, so a held write never leaves a success row behind it.
+        const originActor = stateWriteOriginActor(identity.identity_id);
         await recordCriticalAudit(auditLog, "l1", "state_write", identity.identity_id, {
           namespace: args.namespace,
           key: args.key,
@@ -1730,7 +1789,7 @@ export function createCognitiveTools(
               ttl_seconds: metadata?.ttl_seconds,
               tags: metadata?.tags,
               provenance: {
-                origin_actor: stateWriteOriginActor(identity.identity_id),
+                origin_actor: originActor,
               },
             }
           );
@@ -2198,6 +2257,8 @@ export function createCognitiveTools(
             // Discovery caps are capacity refusals, not ownership decisions;
             // preserve the fixed remediation that router.ts may safely surface.
             if (isNamespaceDiscoveryLimitError(error)) throw error;
+            // The not-bound cause reaches the operator ledger unwrapped; the agent sees the same refusal either way.
+            if (isSessionNotBoundError(error)) throw error;
             await denyNamespaceAccess("state_export", "state_export");
             // The cause stays server-side; the agent sees only the fixed message.
             throw new Error("namespace_ownership_ambiguous", { cause: error });

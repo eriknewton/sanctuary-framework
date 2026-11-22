@@ -1,3 +1,4 @@
+// fail-before-exempt: Dashboard construction assertions select a loaded identity and compare the two views by subject.
 // fail-before-exempt: this change hardens existing dashboard tests (inner-oracle assertions, finally-block shutdown, shared free-port helper) over a behavior-preserving refactor; the observations they check already shipped, so they pass against pre-change source by construction.
 /** Protection observations through the dashboard. */
 import { afterEach, expect, it, vi } from "vitest";
@@ -29,7 +30,7 @@ async function fixture() {
   const auditLog = new AuditLog(storage, masterKey);
   let binding: SessionBinding | undefined;
   const currentSessionBinding = () => binding;
-  const primitives = createCognitiveTools(stateStore, storage, masterKey, "recovery-key", auditLog, { currentSessionBinding });
+  const primitives = createCognitiveTools(stateStore, storage, masterKey, "recovery-key", auditLog, { sessionBindingBootState: () => "state_BOUND_NAMED", currentSessionBinding });
   await primitives.identityManager.load();
   const created = await primitives.tools.find(tool => tool.name === "identity_create")!.handler({ label: "observed-session" });
   const { identity_id } = JSON.parse(created.content[FIRST_CONTENT]!.text);
@@ -234,7 +235,7 @@ it("dashboard entry points preserve observation availability", async () => {
     process.env.SANCTUARY_DASHBOARD_PORT = String(await getFreePort());
     process.env.SANCTUARY_DASHBOARD_HOST = "127.0.0.1";
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = TOKEN;
-    process.env.SANCTUARY_SESSION_IDENTITY_ID = "observed-main-session";
+    delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
     app = await createSanctuaryServer({ storage: new MemoryStorage(), passphrase: TEST_PASSPHRASE });
     const main = channels.at(LAST_ROW)!;
     const mainSources = attachments.mock.calls.find(([value]) => value.stateStore)?.[FIRST_CONTENT];
@@ -242,12 +243,15 @@ it("dashboard entry points preserve observation availability", async () => {
     expect(mainSources?.currentSessionBinding, "main bound resolver").toEqual(expect.any(Function));
     expect(mainSources?.stateStore, "main store source").toBeInstanceOf(StateStore);
     expect(mainSources?.responseScreen?.assertReady, "main screen source").toEqual(expect.any(Function));
-    expect(mainSources?.currentSessionBinding, "same main session resolver").toBe(toolSources?.currentSessionBinding);
+
     expect(mainSources?.stateStore, "same main store").toBe(toolSources?.stateStore);
     expect(mainSources?.responseScreen, "same main screen").toBe(toolSources?.responseScreen);
     type ToolCallHandler = (request: unknown, extra: unknown) => Promise<{ content?: Array<{ text?: string }> } | undefined>;
     const handler = (app.server as unknown as { _requestHandlers: Map<string, ToolCallHandler> })._requestHandlers.get("tools/call");
     expect(handler, "main tool handler").toEqual(expect.any(Function));
+    const created = await handler?.({ method: "tools/call", params: { name: "identity_create", arguments: { label: "observed-main-session" } } }, {});
+    process.env.SANCTUARY_SESSION_IDENTITY_ID = JSON.parse(created?.content?.[FIRST_CONTENT]?.text ?? "null").identity_id;
+    expect(mainSources?.currentSessionBinding?.(), "same main session subject").toEqual(toolSources?.currentSessionBinding());
     const call = async () => {
       const response = await handler?.({ method: "tools/call", params: { name: "sanctuary_active_protections", arguments: {} } }, {});
       return JSON.parse(response?.content?.[FIRST_CONTENT]?.text ?? "null");
@@ -255,7 +259,7 @@ it("dashboard entry points preserve observation availability", async () => {
     const tool = await call();
     page = await readHome(urlOf(main));
     expect(status(page.home.protection_layers, "encrypted_vault"), "main constructed vault").toBe("on");
-    expect(status(page.home.protection_layers, "identity"), "main bound lookup").toBe("off");
+    expect(status(page.home.protection_layers, "identity"), "main bound lookup").toBe("on");
     expect(status(page.home.protection_layers, "identity")).toBe(status(tool?.layers, "identity"));
     delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
     page = await readHome(urlOf(main));

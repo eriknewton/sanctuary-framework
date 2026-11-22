@@ -351,7 +351,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "no session",
-    cause: "pre_gate_argument_refused",
+    cause: "session_not_bound",
     gateRow: true,
     run: async (b) => {
       const previous = process.env.SANCTUARY_SESSION_IDENTITY_ID;

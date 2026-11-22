@@ -1,3 +1,4 @@
+// fail-before-exempt: fresh-install load totals remain compatible with additive identity evidence.
 // fail-before-exempt: the castle-wall mock became a partial (importOriginal) mock so init.ts, which now imports the pin path and the host observers from that module, still loads; no new behaviour is asserted here, the init behaviour tests live in init-recovery-doctor.test.ts
 import {
   afterEach,
@@ -295,7 +296,7 @@ describe("fresh-install onboarding smoke", () => {
 
       const identityMgr = new IdentityManager(storage, unlocked.masterKey);
       const identityLoad = await identityMgr.load();
-      expect(identityLoad).toEqual({ total: 1, loaded: 1, failed: 0 });
+      expect(identityLoad).toMatchObject({ total: 1, loaded: 1, failed: 0 });
       expect(identityMgr.list()).toMatchObject([
         { label: "default", key_protection: "passphrase" },
       ]);
