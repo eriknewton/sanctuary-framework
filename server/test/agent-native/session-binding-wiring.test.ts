@@ -52,6 +52,38 @@ async function sole() {
   return { ...second, id };
 }
 
+async function stampAt(storage: MemoryStorage, namespace: string, key: string) {
+  const bytes = await storage.read(namespace, key);
+  return bytes === null ? null : JSON.parse(new TextDecoder().decode(bytes)).provenance_stamp as Record<string, unknown>;
+}
+
+it("a named own write stays agent and a named other write stays operator", async () => {
+  // The named-other arm is refused before the gate through state_write, so its operator value is pinned at the origin table.
+  const b = await boot();
+  const id = await b.create();
+  vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", id);
+  const saved = JSON.parse((await b.call("sanctuary_remember", { key: "own", value: "mine" })).content[0].text);
+  expect(await stampAt(b.storage, saved.namespace_handle, "own")).toMatchObject({ origin_actor: "agent", memory_class: "agent_owned" });
+});
+
+it("an unbound write stays operator", async () => {
+  const b = await boot();
+  await b.create();
+  expect((await b.call("state_write", { namespace: "notes", key: "unbound", value: "v" })).isError).not.toBe(true);
+  expect(await stampAt(b.storage, "notes", "unbound")).toMatchObject({ origin_actor: "operator", memory_class: "operator_owned" });
+});
+
+it("a sole-bound write naming another identity is refused before the gate and raises no approval request", async () => {
+  const b = await sole();
+  const other = await b.create();
+  const ledger = vi.spyOn(DenialLedger.prototype, "record");
+  b.approvals.mockClear();
+  expect(await b.call("state_write", { namespace: "other-notes", key: "k", value: "v", identity_id: other })).toEqual(expectedRefusal());
+  expect(b.approvals).not.toHaveBeenCalled();
+  expect(ledger.mock.calls.at(-1)).toEqual(["pre_gate_argument_refused", expect.objectContaining({ tool: "state_write" })]);
+  expect(await b.storage.list("other-notes")).toEqual([]);
+});
+
 it("every non-bound state returns the same frozen binding to cooperative consumers", async () => {
   const b = await boot();
   const binding = b.sources.currentSessionBinding();

@@ -1030,7 +1030,7 @@ function takeStateExportApprovalBinding(
 /**
  * A session binding and its frozen boot decision are supplied together or not
  * at all, so a caller that hands these tools a binding cannot omit the
- * decision the sole-write hold reads.
+ * decision that stamping a write reads.
  */
 export type CognitiveSessionBindingOptions =
   | { currentSessionBinding?: undefined; sessionBindingBootState?: undefined }
@@ -1041,11 +1041,11 @@ export type CognitiveSessionBindingOptions =
     };
 
 /**
- * Refuse a write made under a sole binding until its origin value is
- * supported. Callers must match the state_write argument builder and
- * stateWriteOriginActor below, and holdSoleBoundCooperativeWrites in
+ * Refuse a write made under a sole binding before the gate. Callers must match
+ * the state_write argument builder below and holdSoleBoundCooperativeWrites in
  * agent-native/session-binding.ts.
  */
+// DEBT(AGENT-SEAT-SOLE-WRITE-HELD): the pre-gate hold remains until its cooperative wrapper retires.
 export function assertSoleBoundWriteNotHeld(bootState: SessionBindingBootState | undefined): void {
   // A sole binding is the only boot decision this refuses; every other decision keeps today's write path.
   if (bootState?.() === "state_BOUND_SOLE_IDENTITY") throw new SessionIdentityError();
@@ -1333,11 +1333,9 @@ export function createCognitiveTools(
   }
 
   function stateWriteOriginActor(identityId: string): OriginActor {
-    // DEBT(AGENT-SEAT-SOLE-WRITE-HELD): sole-bound writes refuse until their origin value is supported.
-    // The boot decision must match sessionBindingAccessors in index.ts; this refusal remains outside the origin fallback.
-    // Second line of the hold: the argument builders refuse before the gate so no approval or audit row precedes
-    // the refusal; this check keeps any caller that reaches the handler directly from stamping a sole-bound write.
-    assertSoleBoundWriteNotHeld(options?.sessionBindingBootState);
+    // A sole binding names no author, so its writes are unattributed; this arm reads only the frozen boot decision,
+    // which must match bootState in createSessionBindingAccessors (agent-native/session-binding.ts).
+    if (options?.sessionBindingBootState?.() === "state_BOUND_SOLE_IDENTITY") return "unattributed";
     try {
       const active = resolveActiveSessionIdentity(options?.currentSessionBinding?.());
       return active.identity_id === identityId ? "agent" : "operator";

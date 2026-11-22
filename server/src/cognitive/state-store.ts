@@ -70,6 +70,7 @@ import {
 // `errors/untrusted-diagnostic.ts`.
 import { describeUntrusted } from "../errors/index.js";
 import {
+  isOriginActor,
   mintProvenanceStamp,
   serializeStamp,
   type DerivedFromEdge,
@@ -1037,7 +1038,7 @@ function entryBinding(namespace: string, key: string): string {
 }
 
 function resolveWriteOriginActor(actor: OriginActor | undefined): OriginActor {
-  return actor === "agent" || actor === "system" ? actor : "operator";
+  return actor === "agent" || actor === "system" || actor === "unattributed" ? actor : "operator";
 }
 
 function mintSerializedWriteStamp(args: {
@@ -1069,10 +1070,6 @@ function isMemoryClass(value: unknown): value is ProvenanceStamp["memory_class"]
     value === "agent_owned" ||
     value === "shared_entangled"
   );
-}
-
-function isOriginActor(value: unknown): value is OriginActor {
-  return value === "operator" || value === "agent" || value === "system";
 }
 
 function isStringArray(value: unknown): value is readonly string[] {
