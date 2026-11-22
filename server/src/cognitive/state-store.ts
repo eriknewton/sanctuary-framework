@@ -1079,6 +1079,15 @@ function isStringArray(value: unknown): value is readonly string[] {
 function normalizeDerivedEdgesForRemint(
   stamp: ProvenanceStamp
 ): readonly DerivedFromEdge[] | null {
+  if (stamp.origin_actor === "unattributed") {
+    // An empty lineage is canonical only for an unattributed origin, and it is that origin's one sealable shape:
+    // shared_entangled, no derived_from, no derived_from_edges key (must match mintProvenanceStamp in exit/memory-class.ts).
+    return stamp.memory_class === "shared_entangled" &&
+      stamp.derived_from.length === 0 &&
+      stamp.derived_from_edges === undefined
+      ? []
+      : null;
+  }
   if (stamp.derived_from_edges !== undefined) {
     if (!Array.isArray(stamp.derived_from_edges)) return null;
     const edges: DerivedFromEdge[] = [];
@@ -1148,6 +1157,49 @@ function normalizePersistedProvenanceStamp(value: unknown): ProvenanceStamp | nu
     ...stamp,
     ...(edges.length > 0 ? { derived_from_edges: edges } : {}),
   };
+}
+
+/**
+ * Recompute a persisted provenance stamp's class through the sealed minter. A
+ * stamp is sealed only when its declared class equals the class the minter
+ * computes from its origin and lineage; any other shape is unsealed.
+ *
+ * Exported ONLY so `test/exit/unattributed-origin-round-trip.test.ts` pins the
+ * canonical and non-canonical shapes on hand-edited stamps, which a signed
+ * entry can never present: remintVerifiedProvenanceStampForExport verifies the
+ * envelope signature first and is this function's one production caller.
+ */
+export function remintDeclaredProvenanceStamp(
+  stamp: unknown
+):
+  | { status: "sealed"; declaredStamp: ProvenanceStamp; sealedStamp: SealedProvenanceStamp }
+  | { status: "unsealed"; declaredStamp?: ProvenanceStamp } {
+  const declaredStamp = normalizePersistedProvenanceStamp(stamp);
+  if (declaredStamp === null) {
+    return { status: "unsealed" };
+  }
+
+  const derivedEdges = normalizeDerivedEdgesForRemint(declaredStamp);
+  if (derivedEdges === null) {
+    return { status: "unsealed", declaredStamp };
+  }
+
+  const sealedStamp = mintProvenanceStamp({
+    origin_actor: declaredStamp.origin_actor,
+    origin_ref: declaredStamp.origin_ref,
+    lineage_id: declaredStamp.lineage_id,
+    written_at: declaredStamp.written_at,
+    ...(declaredStamp.entry_binding !== undefined
+      ? { entry_binding: declaredStamp.entry_binding }
+      : {}),
+    ...(derivedEdges.length > 0 ? { derived_from: derivedEdges } : {}),
+  });
+
+  if (sealedStamp.memory_class !== declaredStamp.memory_class) {
+    return { status: "unsealed", declaredStamp };
+  }
+
+  return { status: "sealed", declaredStamp, sealedStamp };
 }
 
 export class StateStore {
@@ -2297,32 +2349,7 @@ export class StateStore {
       return { status: "unstamped" };
     }
 
-    const declaredStamp = normalizePersistedProvenanceStamp(entry.provenance_stamp);
-    if (declaredStamp === null) {
-      return { status: "unsealed" };
-    }
-
-    const derivedEdges = normalizeDerivedEdgesForRemint(declaredStamp);
-    if (derivedEdges === null) {
-      return { status: "unsealed", declaredStamp };
-    }
-
-    const sealedStamp = mintProvenanceStamp({
-      origin_actor: declaredStamp.origin_actor,
-      origin_ref: declaredStamp.origin_ref,
-      lineage_id: declaredStamp.lineage_id,
-      written_at: declaredStamp.written_at,
-      ...(declaredStamp.entry_binding !== undefined
-        ? { entry_binding: declaredStamp.entry_binding }
-        : {}),
-      ...(derivedEdges.length > 0 ? { derived_from: derivedEdges } : {}),
-    });
-
-    if (sealedStamp.memory_class !== declaredStamp.memory_class) {
-      return { status: "unsealed", declaredStamp };
-    }
-
-    return { status: "sealed", declaredStamp, sealedStamp };
+    return remintDeclaredProvenanceStamp(entry.provenance_stamp);
   }
 
   private async migrateLegacyEntryToSchema2(
