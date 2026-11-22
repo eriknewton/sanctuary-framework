@@ -1,3 +1,4 @@
+export { AGENT_DISCOVERY_SKIPPED_NAMESPACES, isAgentDiscoverySkippedNamespace } from "./agent-discovery.js";
 export type { StorageBackend, StorageEntryMeta } from "./interface.js";
 export {
   CustodyFsError,

@@ -191,8 +191,8 @@ describe("state import and checkpoint restore writer-key resolver parity", () =>
       /verifyStateEntrySignaturesWithAuthenticatedKey\(/g,
     ).map((site) => site.replace(/:\d+$/, ""));
     expect(signatureCallSites).toEqual([
-      "src/cognitive/state-store.ts",
-      "src/cognitive/state-store.ts",
+      "src/cognitive/state-entry-open.ts",
+      "src/cognitive/state-entry-open.ts",
       "src/cognitive/state-store.ts",
       "src/cognitive/state-store.ts",
       "src/cognitive/state-store.ts",

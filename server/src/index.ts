@@ -954,7 +954,9 @@ export async function createSanctuaryServer(options?: {
       handler: async () => {
         const { buildHealthEvidenceReport, castleWallSnapshotForHealthReport } =
           await import("./health/index.js");
-        const storageSizeBytes = await storage.totalSize();
+        if (!storage.totalSizeOfNonReservedNamespaces) throw new Error("Storage backend cannot report non-reserved size");
+        // Reserved namespaces hold fortress internals that hidden activity changes, so the agent-visible figure covers only default data.
+        const storageSizeBytes = await storage.totalSizeOfNonReservedNamespaces();
         // WIRED CONSUMER (AGENTS rule 4). Same evidence source as `exec_attest`
         // and the SHR publish payload, so the three cannot disagree about the
         // same wall.

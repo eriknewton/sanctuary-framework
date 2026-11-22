@@ -44,6 +44,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 // Generation uses a separate, configurable ceiling so callers can set a
 // tighter budget for tests without affecting the default 120 s production
 // budget. Show keeps DEFAULT_TIMEOUT_MS; model listing keeps its 1.5 s probe budget.
+// Must match LOCAL_CALL_TIMEOUT_MS in intelligence/sensitive-generation-client.ts.
 const GENERATION_TIMEOUT_MS = 120_000;
 const HARDWARE_PROBE_TIMEOUT_MS = 1_500;
 

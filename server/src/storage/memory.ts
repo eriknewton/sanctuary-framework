@@ -5,6 +5,7 @@
  * but stores everything in memory. Data does not persist across restarts.
  */
 
+import { isAgentDiscoverySkippedNamespace, isAgentAggregateReservedNamespace } from "./agent-discovery.js";
 import type {
   NamespaceLockStorageCapabilities,
   StorageBackend,
@@ -204,6 +205,31 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
       total += entry.data.length;
     }
     return total;
+  }
+
+  async totalSizeOfNonReservedNamespaces(): Promise<number> {
+    // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+    // Must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
+    let total = 0;
+    for (const [key, entry] of this.store) {
+      // The predicate sees the namespace component of the composite key (see storageKey), never the key itself.
+      const namespace = key.slice(0, key.indexOf("/"));
+      if (!isAgentAggregateReservedNamespace(namespace)) total += entry.data.length;
+    }
+    return total;
+  }
+
+  async listNamespacesForAgentDiscovery(): Promise<string[]> {
+    // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+    // Must match isAgentDiscoverySkippedNamespace in storage/agent-discovery.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
+    const namespaces: string[] = [];
+    for (const namespace of this.namespaceCounts.keys()) {
+      // Local stores consume no agent-visible namespace budget.
+      if (isAgentDiscoverySkippedNamespace(namespace)) continue;
+      if (namespaces.length >= MAX_DISCOVERED_NAMESPACES) throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+      namespaces.push(namespace);
+    }
+    return namespaces.sort();
   }
 
   async listNamespaces(): Promise<string[]> {

@@ -289,8 +289,10 @@ const STORAGE_READ_ONLY: ReadonlySet<string> = new Set([
   "readBounded",
   "list",
   "listNamespaces",
+  "listNamespacesForAgentDiscovery", // Must match the read-only implementations in storage/{filesystem,memory,read-only-guard,directory-capability-worker}.ts.
   "exists",
   "totalSize",
+  "totalSizeOfNonReservedNamespaces", // Must match the read-only implementations in storage/{filesystem,memory,read-only-guard,directory-capability-worker}.ts.
   // read-only handle lifecycle
   "openDirectoryCustodyWithinBase",
   "openExistingDirectoryNoFollow",

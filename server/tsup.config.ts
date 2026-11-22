@@ -61,6 +61,8 @@ export default defineConfig({
     "verify-transparency": "src/transparency/offline-cli.ts",
     "response-worker": "src/proxy/response-worker.ts",
     "directory-capability-worker": "src/storage/directory-capability-worker.ts",
+    // Must match resolveWorkerModule in src/local-recompile/worker-client.ts (built beside index.js).
+    "local-recompile-worker": "src/local-recompile/worker-entry.ts",
   },
   format: ["esm", "cjs"],
   dts: true,

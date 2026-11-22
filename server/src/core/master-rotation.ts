@@ -485,6 +485,10 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
   },
 
   _reputation: { kind: "purpose-encrypted", infos: ["l4-reputation"] },
+  // Must match LOCAL_OPLOG_PURPOSE in src/local-recompile/store-keys.ts.
+  _local_oplog: { kind: "purpose-encrypted", infos: ["local-oplog-v1"] },
+  // Must match LOCAL_RESULTS_PURPOSE in src/local-recompile/store-keys.ts.
+  _local_results: { kind: "purpose-encrypted", infos: ["local-results-v1"] },
   // HIGH-2 (independent gate on #1303, 2026-08-23): Exit V2 drill F2 added
   // `_known_signers` (reputation/known-signers-store.ts) with no rotation
   // recipe, so rotation preflight refused ("unsupported") on any fortress
