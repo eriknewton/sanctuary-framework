@@ -40,8 +40,9 @@ export const OPLOG_ROW_MAX_BYTES = 4 * KIB;
 // An append adds one row, so 64 deletions drain a backlog while bounding one append's work.
 export const OPLOG_PRUNE_MAX_PER_APPEND = 64;
 
-// Row keys carry the sequence as 12 zero-padded decimal digits.
+// Row keys carry the sequence as 12 zero-padded decimal digits after this prefix.
 export const OPLOG_SEQ_DIGITS = 12;
+const OPLOG_ROW_KEY_PREFIX = "row/";
 const OPLOG_MAX_SEQ = 10 ** OPLOG_SEQ_DIGITS - 1;
 // SHA-256 is 256 bits: 64 hex digits.
 const HASH_HEX_LENGTH = 256 / 4;
@@ -146,7 +147,7 @@ export interface OplogOptions extends LocalStoreLockOptions {
 
 export function oplogRowKey(seq: number): string {
   if (!isSeq(seq)) throw new LocalStoreError("capacity");
-  return `row/${String(seq).padStart(OPLOG_SEQ_DIGITS, "0")}`;
+  return `${OPLOG_ROW_KEY_PREFIX}${String(seq).padStart(OPLOG_SEQ_DIGITS, "0")}`;
 }
 
 function isSeq(value: unknown): value is number {
@@ -304,9 +305,20 @@ export class LocalOplog {
       }
       // A store with rows or an anchor but no head is damaged, never re-initialized over.
       if ((await this.readControl(ANCHOR_KEY)) !== null) throw new LocalStoreError("invalid_record");
+      // Only an interrupted first boot leaves a record without a head, and that record is genesis. Any
+      // other row (a successor, or the suffix a prune left after removing genesis) or a prune record
+      // means the head was lost, whatever row/0 holds. The listing is boot-only and bounded by the row cap.
+      this.assertOpen();
+      const allowed = oplogRowKey(0);
+      let stored: Array<{ key: string }>;
+      try {
+        stored = await this.storage.list(LOCAL_OPLOG_NAMESPACE);
+      } catch (error) {
+        throw toLocalStoreError(error);
+      }
+      const damaged = stored.some(({ key }) => (key.startsWith(OPLOG_ROW_KEY_PREFIX) && key !== allowed) || key === PRUNE_INTENT_KEY || key === PRUNE_BLOCKED_KEY);
+      if (damaged) throw new LocalStoreError("invalid_record");
       let genesis = await this.readRow(0);
-      // Only an interrupted first boot leaves genesis without a head; a genesis with a successor lost its head.
-      if (genesis !== null && (await this.readRow(1)) !== null) throw new LocalStoreError("invalid_record");
       if (genesis === null) {
         const row = validateOplogRow({ seq: 0, prev_hash: OPLOG_GENESIS_PREV_HASH, at: this.clock(), kind: "genesis", body: {} });
         genesis = { row, bytes: await this.publishRow(row) };

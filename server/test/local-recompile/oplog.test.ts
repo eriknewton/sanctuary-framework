@@ -308,6 +308,35 @@ describe("operator log boot refusals", () => {
     cleanups.push(() => reopened.close());
     await expect(reopened.ensure()).rejects.toMatchObject({ kind: "invalid_record" });
   });
+
+  it("after retention removed genesis, a lost head and anchor refuse at ensure rather than re-initialize", async () => {
+    const { storage, keys, log } = await openLog({ caps: { maxRows: 3 } });
+    for (let pid = 1; pid <= 6; pid += 1) await log.append("worker_spawned", { pid });
+    // Retention has pruned row/0 and row/1, so the surviving suffix starts later.
+    expect(await storage.read(LOCAL_OPLOG_NAMESPACE, oplogRowKey(0))).toBeNull();
+    expect(await storage.read(LOCAL_OPLOG_NAMESPACE, oplogRowKey(1))).toBeNull();
+    await storage.delete(LOCAL_OPLOG_NAMESPACE, "head");
+    await storage.delete(LOCAL_OPLOG_NAMESPACE, "anchor");
+    const surviving = await storage.listKeys(LOCAL_OPLOG_NAMESPACE, "row/");
+    const reopened = new LocalOplog(storage, keys.oplogKey, { now: () => FIXED_NOW, caps: { maxRows: 3 } });
+    cleanups.push(() => reopened.close());
+    await expect(reopened.ensure()).rejects.toMatchObject({ kind: "invalid_record" });
+    // Nothing was written over the suffix: no new genesis, head or anchor.
+    expect(await storage.listKeys(LOCAL_OPLOG_NAMESPACE, "row/")).toEqual(surviving);
+    expect(await storage.read(LOCAL_OPLOG_NAMESPACE, "head")).toBeNull();
+  });
+
+  it("a prune record with no head or anchor refuses at ensure", async () => {
+    const { storage, keys, log } = await openLog();
+    await storage.delete(LOCAL_OPLOG_NAMESPACE, "head");
+    await storage.delete(LOCAL_OPLOG_NAMESPACE, "anchor");
+    // Any prune record is evidence of a log that once had a head.
+    await storage.write(LOCAL_OPLOG_NAMESPACE, "prune", new TextEncoder().encode("left by a prune"));
+    log.close();
+    const reopened = new LocalOplog(storage, keys.oplogKey, { now: () => FIXED_NOW });
+    cleanups.push(() => reopened.close());
+    await expect(reopened.ensure()).rejects.toMatchObject({ kind: "invalid_record" });
+  });
 });
 
 describe("operator log capability refusals", () => {
