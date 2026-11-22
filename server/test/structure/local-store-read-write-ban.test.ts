@@ -34,7 +34,7 @@ const drivers: Record<string, Driver> = {
   "state_write": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: (namespace) => ({ ...namespaceArgs(namespace), value: "fixture" }) },
   "state_read": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: namespaceArgs },
   "state_disclose_unattributed": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: namespaceArgs },
-  "state_list": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: namespaceArgs },
+  "state_list": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: (namespace) => ({ namespace }) },
   "state_delete": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: namespaceArgs },
   "state_export": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: (namespace) => ({ namespace }) },
   "state_import": { class: "skips_reserved_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: (namespace) => ({ bundle: importBundles.get(namespace)!, allow_unverified_legacy: true }) },
@@ -139,6 +139,8 @@ const drivers: Record<string, Driver> = {
   "context_gate_apply_template": { class: "no_namespace_input", reason: "takes a template identifier and policy label; policy storage namespace is fixed" },
 };
 
+// The positive control's namespace: an ordinary name every addressing driver must reach with the same input shape.
+const ORDINARY_NAMESPACE = "notes";
 let fortress: Awaited<ReturnType<typeof createTempFortress>>;
 let runtime: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
 let client: Client | undefined;
@@ -164,7 +166,7 @@ beforeAll(async () => {
   const identity = runtime.identityManager.getDefault()!;
   const key = derivePurposeKey(runtime.masterKey, IDENTITY_ENCRYPTION_PURPOSE);
   try {
-    for (const namespace of [...AGENT_DISCOVERY_SKIPPED_NAMESPACES, "_identities"]) {
+    for (const namespace of [...AGENT_DISCOVERY_SKIPPED_NAMESPACES, "_identities", ORDINARY_NAMESPACE]) {
       const source = new MemoryStorage();
       const state = new StateStore(source, runtime.masterKey);
       await state.write(namespace, "one", "fixture", identity.identity_id, identity.encrypted_private_key, key);
@@ -239,5 +241,24 @@ it.each(Object.entries(drivers).filter(([, driver]) => driver.class !== "no_name
           expect(response.isError, `${tool}: ${namespace}`).toBe(true);
         }
       }
+    }
+  });
+
+// Drivers whose ordinary-namespace input is also refused in this fixture before any namespace handling:
+// the SDW vault tools refuse a fortress with a second wrapped-agent identity, the facade tools refuse a raw
+// namespace name at their argument gate, and the compound tool refuses those facade steps. For these the
+// reserved-name case above shows only that storage under the name was untouched. Pinned so the set cannot
+// grow silently; a driver that becomes reachable must leave this list.
+const ORDINARY_INPUT_REFUSED = ["sdw_export", "sdw_import", "sanctuary_remember", "sanctuary_recall", "sanctuary_hide",
+  "sanctuary_forget", "sanctuary_compound_execute"];
+it.each(Object.entries(drivers).filter(([, driver]) => driver.class !== "no_namespace_input"))(
+  "%s positive control: the same input with an ordinary namespace is accepted or reaches storage under it", async (tool, driver) => {
+    if (driver.class === "no_namespace_input") throw new Error("driver class");
+    const inputs = await driver.args(ORDINARY_NAMESPACE);
+    for (const args of Array.isArray(inputs) ? inputs : [inputs]) {
+      calls.length = 0;
+      const response = await client!.callTool({ name: tool, arguments: args });
+      const reached = response.isError !== true || calls.some((call) => call.namespace === ORDINARY_NAMESPACE);
+      expect(reached, `${tool}: ordinary input`).toBe(!ORDINARY_INPUT_REFUSED.includes(tool));
     }
   });
