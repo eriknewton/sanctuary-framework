@@ -6,7 +6,7 @@
 
 import { execSync as nodeExecSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, constants, open, readdir, readFile, stat } from "node:fs/promises";
+import { access, constants, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -1198,20 +1198,22 @@ export async function checkSessionBinding(
   // The lock name must match FORTRESS_CONFIG_LOCK in config.ts.
   const lockPath = join(storagePath, FORTRESS_CONFIG_LOCK);
   try {
-    // One open decides presence and supplies the metadata, so the report never
+    // One read decides presence and supplies the metadata, so the report never
     // describes a different file than the one whose presence it checked.
-    const handle = await open(lockPath, "r");
+    const raw = await readFile(lockPath, "utf8");
     lockPresent = true;
     let holder = "holder metadata unavailable";
     try {
-      const record = JSON.parse(await handle.readFile("utf8")) as { pid?: unknown; acquired_at?: unknown };
+      const record = JSON.parse(raw) as { pid?: unknown; acquired_at?: unknown };
       holder = `pid ${String(record.pid ?? "unknown")}, acquired_at ${String(record.acquired_at ?? "unknown")}`;
-    } catch { /* A present lock remains reportable without its metadata. */ } finally {
-      await handle.close().catch(() => undefined);
-    }
+    } catch { /* A present lock remains reportable without its metadata. */ }
     lines.push(`${FORTRESS_CONFIG_LOCK} present: ${holder}; remove only when no Sanctuary process is running`);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+    if ((error as NodeJS.ErrnoException).code === "EISDIR") {
+      // A non-file at the lock path still holds the lock; only its metadata is missing.
+      lockPresent = true;
+      lines.push(`${FORTRESS_CONFIG_LOCK} present: holder metadata unavailable; remove only when no Sanctuary process is running`);
+    } else if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       lockPresent = true;
       lines.push(`${FORTRESS_CONFIG_LOCK} could not be inspected; remove only when no Sanctuary process is running`);
     }
