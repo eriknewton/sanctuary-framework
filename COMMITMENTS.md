@@ -4,13 +4,13 @@ This page lists every promise Sanctuary makes to the people who run it. Each pro
 
 ## How to read a promise
 
-- **Evidence.** *drill* means we ran the shipped product on the named platform and published the record. *tests* means automated tests back it, but no one has yet run it end to end on a real machine and published the result. *stated* means it is our word only: nothing yet would catch us breaking it. We list stated promises anyway, so you can hold us to them.
+- **Evidence.** *drill* means we ran the shipped product on the named platform and published the record. *tests* means automated tests back it, but no one has yet run it end to end on a real machine and published the result. *stated* means it is our word: no check yet covers the whole promise, though some tests may cover part of it. We list stated promises anyway, so you can hold us to them.
 - **Enforced.** *below the agent* means your operating system enforces it, so an agent cannot switch it off from inside its own account. *cooperative code* means Sanctuary's own program does it; an agent that does not go through Sanctuary is not stopped by it. *release process* means it is a property of how we build and publish releases.
 - **Backed by.** The row of the Assurance Matrix that holds the evidence and the full list of gaps.
 
 ## How these promises change
 
-A change to any promise below, or to the evidence behind it, is labelled in its pull request, listed under "Commitments changed" in the [changelog](CHANGELOG.md), and published in a preview release (npm's `next` channel) at least seven days before it can reach the stable channel. Nothing updates itself, so you see a change before you could receive it. One exception: when we learn a promise is wider than the truth, we narrow it at once and say so; we do not wait. If the reason is a security problem whose fix is not yet released, the narrowed wording says what the promise now covers and not why, so that it points no one at the problem. A withdrawn promise stays at the bottom of this page with the version that withdrew it.
+A change to any promise below, or to the evidence behind it, is labelled in its pull request, listed under "Commitments changed" in the [changelog](CHANGELOG.md), and published in a preview release (npm's `next` channel) at least seven days before it can reach the stable channel. That wait is a manual release rule today; no automated check enforces it yet. Nothing updates itself, so you see a change before you could receive it. One exception: when we learn a promise is wider than the truth, we narrow it at once and say so; we do not wait. If the reason is a security problem whose fix is not yet released, the narrowed wording says what the promise now covers and not why, so that it points no one at the problem. A withdrawn promise stays at the bottom of this page with the version that withdrew it.
 
 To compare the promises in two versions, run `git diff v<older> v<newer> -- COMMITMENTS.md` in a clone of this repository. Releases made before this page existed have nothing to compare.
 
@@ -36,15 +36,15 @@ To compare the promises in two versions, run `git diff v<older> v<newer> -- COMM
 - Enforced: release process
 - Holds on: the npm package `@sanctuary-framework/mcp-server`, releases 1.8.0 and later
 - Limit: One signing key, held by the project, signs every release. A valid signature shows the file is the one that key signed. It does not show independent review.
-- Check it yourself: follow "Verify Before You Trust" in `SECURITY.md`; the last step is `node scripts/verify-release-artifact.mjs --tarball <file> --manifest release-manifest.json --version <version> --expected-public-key <key>`.
+- Check it yourself: follow "Verify Before You Trust" in `SECURITY.md`; its npm package check ends with `node scripts/verify-release-artifact.mjs --tarball <file> --manifest release-manifest.json --version <version> --expected-public-key <key>`.
 
-## C-03. Sanctuary makes no network connection you did not ask for.
+## C-03. In a recorded drill, Sanctuary made no network connection you did not ask for.
 
 - Backed by: No unrequested network contact (observed by packet capture)
 - Evidence: drill
 - Enforced: cooperative code
 - Holds on: Linux (Docker container on one x86-64 host); npm package 1.8.4 only
-- Limit: This is about Sanctuary's own program, and it is what we saw it do, not proof that it cannot connect. Installing it contacts the npm registry, and in a session started through `npx` the registry is contacted before the server first answers; after that answer, no new connection opened. Update checks, publishing to a public transparency log, and local model downloads connect only when you turn them on. Your agent, your harness and your model provider make their own connections, which this promise does not cover.
+- Limit: This is what we saw Sanctuary's own program do, not proof that it cannot connect. It was observed on one Linux host in Docker, for version 1.8.4 only, set up without the Castle Wall helper (`init --no-pin`). On 1.8.4 the default policy refused remember and recall, so their storage path did not run. Installing contacts the npm registry, and an update check you ask for contacts only its allowed names. In a session started through `npx`, the registry was contacted before the server first answered, by a process the capture cannot name; after that answer, no new connection opened. Features the drill did not run, such as local model downloads and settings you opt into, are not covered. Your agent, your harness and your model provider make their own connections, which this promise does not cover.
 - Check it yourself: read `docs/audit/zero-outbound-linux-drill-2026-11-20.md`
 
 ## C-04. Your keys are created on your machine, and no copy is sent to us.
