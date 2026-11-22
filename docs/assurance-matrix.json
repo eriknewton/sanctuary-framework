@@ -39,7 +39,7 @@
     {
       "claim": "Approval gating (Tier 1 / Tier 2 / Tier 3 policy)",
       "platform": "Cross-platform server",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/test/principal-policy/approval-gate.test.ts",
@@ -57,7 +57,7 @@
     {
       "claim": "Critical audit durability (appendCritical)",
       "platform": "Cross-platform server storage",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #271",
@@ -145,7 +145,7 @@
     {
       "claim": "State encryption",
       "platform": "Cross-platform server storage",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/test/security/tamper-detection.test.ts",
@@ -213,7 +213,7 @@
     {
       "claim": "Config/profile fail-closed",
       "platform": "Cross-platform server startup and profile storage",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #269",
@@ -243,7 +243,7 @@
     {
       "claim": "Health and attestation evidence-based",
       "platform": "Cross-platform server tools",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #273",
@@ -411,7 +411,7 @@
     {
       "claim": "Query anonymity (selective disclosure)",
       "platform": "Cross-platform server outbound payloads",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/test/query-anonymity/header-strip.test.ts",
@@ -441,7 +441,7 @@
     {
       "claim": "Context-gate single source of truth",
       "platform": "Cross-platform server tools",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #281",
@@ -471,7 +471,7 @@
     {
       "claim": "Proxy isolation: env (PR #267)",
       "platform": "Cross-platform stdio MCP upstreams",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #267",
@@ -493,7 +493,7 @@
     {
       "claim": "Proxy SSE SSRF protection",
       "platform": "Cross-platform SSE MCP upstreams",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #278",
@@ -511,7 +511,7 @@
     {
       "claim": "Dynamic proxy tool discovery",
       "platform": "Cross-platform MCP upstreams",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #283",
@@ -533,7 +533,7 @@
     {
       "claim": "did:key encoding (PR #268, base58btc compliant)",
       "platform": "Cross-platform identity",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #268",
@@ -555,7 +555,7 @@
     {
       "claim": "Identity signing authority (PR #270, raw identity_sign Tier 1)",
       "platform": "Cross-platform identity",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #270",
@@ -629,7 +629,7 @@
     {
       "claim": "Verifiable transparency checkpoint format and offline verifier",
       "platform": "Cross-platform server and CLI; signing custody macOS helper-as-signer",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/src/transparency/checkpoint.ts",

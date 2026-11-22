@@ -20,7 +20,7 @@
  *   - public root docs: README*, CHANGELOG*, ROADMAP.md,
  *     SANCTUARY_ARCHITECTURE.md, sanctuary_framework.md, plus the
  *     community/governance/legal docs (CONTRIBUTING, CODE_OF_CONDUCT,
- *     GOVERNANCE, LICENSE, ASSURANCE_MATRIX)
+ *     GOVERNANCE, LICENSE, ASSURANCE_MATRIX, COMMITMENTS)
  *   - the npm-shipped server README (server/package.json ships README.md)
  *   - public text subtrees: docs/, announcements/, examples/, quickstart/,
  *     rfcs/, plugin/, the product components (integrations/, menubar/,
@@ -90,6 +90,8 @@ const ROOT_DOC_EXACT: ReadonlySet<string> = new Set([
   "GOVERNANCE.md",
   "LICENSE",
   "ASSURANCE_MATRIX.md",
+  // the public list of user-facing promises that the matrix backs
+  "COMMITMENTS.md",
   // the security policy GitHub renders on the Security tab — public-facing,
   // so the no-CIMC + no-em-dash guards must cover it too.
   "SECURITY.md",

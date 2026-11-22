@@ -68,6 +68,8 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "CODEX_BANNER_SUMMARY.md",
   "CODEX_BANNER_VERDICT.md",
   "CODE_OF_CONDUCT.md",
+  // The public list of user-facing promises, each tied to its Assurance Matrix row.
+  "COMMITMENTS.md",
   "CONTRIBUTING.md",
   "GOVERNANCE.md",
   "LICENSE",
