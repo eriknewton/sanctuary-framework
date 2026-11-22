@@ -70,6 +70,7 @@ import { describeUntrusted } from "../errors/index.js";
 import { assertAdmissibleIdentityLabel } from "../signing/reserved-label.js";
 import type { SessionBindingBootState } from "../agent-native/session-binding-state.js";
 import { isSessionNotBoundError } from "../agent-native/session-not-bound.js";
+import { OriginUnresolvedError } from "./origin-unresolved.js";
 
 // Must match AUDIT_EVENT_SIGNING_DOMAIN_PREFIX / INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX
 // in core/signing-domains.ts (the identity_sign refusal list).
@@ -1052,6 +1053,54 @@ export function assertSoleBoundWriteNotHeld(bootState: SessionBindingBootState |
 }
 
 /**
+ * Decide a state write's origin from the frozen boot decision and the per-call
+ * binding. No arm reaches operator through a catch; only an explicitly
+ * non-bound primitive session stamps operator. A failed arm throws
+ * OriginUnresolvedError (must match cognitive/origin-unresolved.ts), so the
+ * write fails and stores nothing.
+ */
+export function resolveStateWriteOrigin(input: {
+  bootState: SessionBindingBootState | undefined;
+  binding: (() => SessionBinding | undefined) | undefined;
+  identityId: string;
+}): OriginActor {
+  let bootState: ReturnType<SessionBindingBootState> | undefined;
+  try {
+    bootState = input.bootState?.();
+  } catch (cause) {
+    // arm_BOOT_UNREADABLE: without the boot decision no origin can be claimed.
+    throw new OriginUnresolvedError({ cause });
+  }
+  // arm_SOLE_UNATTRIBUTED: a sole binding names no author, so its writes are unattributed; this arm reads only the
+  // frozen boot decision, which must match bootState in createSessionBindingAccessors (agent-native/session-binding.ts).
+  if (bootState === "state_BOUND_SOLE_IDENTITY") return "unattributed";
+  let binding: SessionBinding | undefined;
+  try {
+    binding = input.binding?.();
+  } catch (cause) {
+    // arm_BINDING_UNREADABLE: an unreadable binding is never read as non-bound.
+    throw new OriginUnresolvedError({ cause });
+  }
+  if (binding === undefined) {
+    // arm_UNBOUND_OPERATOR: the primitive view returns undefined only for a non-bound session.
+    // DEBT(AGENT-SEAT-UNBOUND-ORIGIN): a write in a session with no bound identity is stamped operator, as before
+    // default binding existed; a later slice scopes it behind the binding flag.
+    return "operator";
+  }
+  let activeIdentityId: string;
+  try {
+    activeIdentityId = resolveActiveSessionIdentity(binding).identity_id;
+  } catch (cause) {
+    // arm_NAMED_UNRESOLVED: a binding without valid identity evidence names no one, so no origin is claimed for it.
+    throw new OriginUnresolvedError({ cause });
+  }
+  // arm_NAMED_OWN_AGENT: the launch-variable session's own write is the agent's.
+  if (activeIdentityId === input.identityId) return "agent";
+  // arm_NAMED_OTHER_OPERATOR: a write signed by an identity other than the bound one stays the operator's.
+  return "operator";
+}
+
+/**
  * Create all Cognitive-layer tool definitions.
  */
 export function createCognitiveTools(
@@ -1333,15 +1382,7 @@ export function createCognitiveTools(
   }
 
   function stateWriteOriginActor(identityId: string): OriginActor {
-    // A sole binding names no author, so its writes are unattributed; this arm reads only the frozen boot decision,
-    // which must match bootState in createSessionBindingAccessors (agent-native/session-binding.ts).
-    if (options?.sessionBindingBootState?.() === "state_BOUND_SOLE_IDENTITY") return "unattributed";
-    try {
-      const active = resolveActiveSessionIdentity(options?.currentSessionBinding?.());
-      return active.identity_id === identityId ? "agent" : "operator";
-    } catch {
-      return "operator";
-    }
+    return resolveStateWriteOrigin({ bootState: options?.sessionBindingBootState, binding: options?.currentSessionBinding, identityId });
   }
 
   const tools: ToolDefinition[] = [
@@ -1762,7 +1803,8 @@ export function createCognitiveTools(
           throw err;
         }
 
-        // The origin is settled before the success audit, so a held write never leaves a success row behind it.
+        // The origin is settled before the success audit, so a write whose origin cannot be determined leaves no
+        // success row and stores nothing.
         const originActor = stateWriteOriginActor(identity.identity_id);
         await recordCriticalAudit(auditLog, "l1", "state_write", identity.identity_id, {
           namespace: args.namespace,
