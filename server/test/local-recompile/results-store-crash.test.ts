@@ -118,16 +118,18 @@ async function withCrashAt(storage: StrictMemoryStorage, crashAt: number, operat
       throw new FixtureCrash("fixture crash");
     }
   };
+  let finished = false;
   try {
     await operation();
-    expect(crashed, "an operation that finished never saw the crash").toBe(false);
-    return true;
+    finished = true;
   } catch (error) {
     if (!crashed) throw error;
-    return false;
   } finally {
     storage.beforeMutation = () => undefined;
   }
+  // Outside the try, so this check can fail: an operation that finished must not have swallowed the crash.
+  if (finished) expect(crashed, "an operation that finished never saw the crash").toBe(false);
+  return finished;
 }
 
 /** One pending object A and one committed object B; returns the index total, so a store can be opened exactly full. */
@@ -232,6 +234,16 @@ describe("results store crash consistency", () => {
       if (finished) finishedAt = crashAt;
     }
     expect(finishedAt, "the sweep finished within the crash-point bound").toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("results store crash harness", () => {
+  it("fails when an operation finishes after swallowing the injected crash", async () => {
+    const storage = new StrictMemoryStorage();
+    const swallowing = async () => {
+      await storage.delete(LOCAL_RESULTS_NAMESPACE, "fixture").catch(() => undefined);
+    };
+    await expect(withCrashAt(storage, 0, swallowing)).rejects.toThrow("never saw the crash");
   });
 });
 
