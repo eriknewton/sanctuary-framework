@@ -107,6 +107,9 @@
     { "label": "key-17:erc8004-identity:v1", "class": "crypto-domain-label", "owner": "key-17/erc8004-identity-signer.ts:58 (direct hkdf)", "fixture": false, "note": "ERC-8004 identity signer key; folder token embedded." },
     { "label": "key-17:ap2-mandate:v1", "class": "crypto-domain-label", "owner": "key-17/ap2-mandate-signer.ts:62 (direct hkdf)", "fixture": false, "note": "AP2 mandate signer key; folder token embedded." },
 
+    { "label": "local-oplog-v1", "class": "decryptable-store", "owner": "local-recompile/store-keys.ts (LOCAL_OPLOG_PURPOSE)", "fixture": false, "fixture_via": "test/local-recompile/rotation.test.ts", "note": "Operator log in _local_oplog; record key is the AAD; master rotation re-encrypts it. scan-reconciled 2026-11-22." },
+    { "label": "local-results-v1", "class": "decryptable-store", "owner": "local-recompile/store-keys.ts (LOCAL_RESULTS_PURPOSE)", "fixture": false, "fixture_via": "test/local-recompile/rotation.test.ts", "note": "Operator job results and index in _local_results; record key is the AAD; master rotation re-encrypts it. scan-reconciled 2026-11-22." },
+
     { "label": "sanctuary.v1.session-token", "class": "crypto-domain-label", "owner": "v1/session-service.ts:63 (TOKEN_AAD)", "fixture": false, "note": "AES-GCM AAD (not an HKDF info string) binding v1 session tokens to their domain; co-located domain-separation constant. scan-reconciled 2026-06-16." }
   ]
 }
