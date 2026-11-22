@@ -1,3 +1,4 @@
+// fail-before-exempt: pins the build-root inventory, which gains only the local job worker entry.
 // Pins shared validation and parser-depth imports while retaining inert dispatch and native byte boundaries.
 // W-JOIN-BOUNDS
 import {it,expect} from "vitest";
@@ -90,7 +91,7 @@ const expectedImports={
   ]
 };
 // Must match the src/ entry literals in tsup.config.ts and tsup.boot-runtime.config.ts, including the separately bundled worker and boot runtime.
-const KNOWN_BUILD_ROOTS = ["index.ts", "intelligence/index.ts", "cli.ts", "cli/linux-policy-sign.ts", "transparency/offline-cli.ts", "proxy/response-worker.ts", "storage/directory-capability-worker.ts", "signing/worker.ts", "cli/castle-wall-boot-daemon.ts"];
+const KNOWN_BUILD_ROOTS = ["index.ts", "intelligence/index.ts", "cli.ts", "cli/linux-policy-sign.ts", "transparency/offline-cli.ts", "proxy/response-worker.ts", "storage/directory-capability-worker.ts", "local-recompile/worker-entry.ts", "signing/worker.ts", "cli/castle-wall-boot-daemon.ts"];
 function ast(name:string){return ts.createSourceFile(name,readFileSync(resolve(sourceRoot,name),"utf8"),ts.ScriptTarget.Latest,true);}
 function imports(name:string){return ast(name).statements.filter(ts.isImportDeclaration).map(n=>(n.moduleSpecifier as ts.StringLiteral).text).sort();}
 function dependencies(name:string){

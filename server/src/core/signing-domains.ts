@@ -36,10 +36,9 @@ export const SDW_EXPORT_SCOPE_DIGEST_DOMAIN = "sanctuary.sdw-export-scope-digest
 export const SDW_EXPORT_MANIFEST_SIGNING_DOMAIN = "sanctuary.sdw-export-manifest.v1\n";
 
 /**
- * State-store envelope signing domain PREFIX (must match
- * `STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX` in cognitive/state-store.ts; every
- * versioned envelope domain starts with it). Envelopes are signed with the
- * writer's managed identity key.
+ * State-store envelope signing domain PREFIX (imported by
+ * cognitive/state-entry-open.ts, which builds every versioned envelope domain
+ * from it). Envelopes are signed with the writer's managed identity key.
  */
 export const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
 

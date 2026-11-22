@@ -119,7 +119,7 @@ describe("Q5E structural chokepoints", () => {
     expect(inventory
       .filter(({ source }) => source.includes("/api/generate"))
       .map(({ path }) => path)
-      .sort()).toEqual(["intelligence/substrates/local.ts"]);
+      .sort()).toEqual(["intelligence/sensitive-generation-client.ts", "intelligence/substrates/local.ts"]);
   });
 
   it("makes immune integrity refusals terminal before the remote fallback chain", async () => {

@@ -16,16 +16,19 @@ export const RELEASE_VERSION_SHAPE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Z
 export const MAX_RELEASE_TARBALL_BYTES = 64 * 1024 * 1024;
 
 const PACKAGE_NAME = "@sanctuary-framework/mcp-server";
-// Decompressed ceiling. Measured at 1.8.6-rc.1: 136,023,052 B unpacked across
-// 81 entries, of which 100,429,174 B (73.8%) are `dist/**/*.map` debug source
-// maps. 192 MiB = 201,326,592 B, which is 1.48x the measured size.
+// Decompressed ceiling. Re-measured at 1.9.0-rc.4 with the local job worker
+// build entry: 202,558,464 B of tar stream across 107 entries (npm reports
+// 202,473,437 B of file content), most of it `dist/**/*.map` debug source maps.
+// 256 MiB = 268,435,456 B, which is 1.33x the measured size and leaves
+// 65,876,992 B (about 62.8 MiB) of headroom. (Earlier: 136,023,052 B across 81
+// entries at 1.8.6-rc.1 under a 192 MiB ceiling.)
 //
 // The two ceilings are INDEPENDENT ABSOLUTE bounds; neither constrains the
 // expansion RATIO between them, and reading the pair as a ratio limit is wrong:
 // a small archive that decompresses to just under the output ceiling passes both
 // at an expansion of many hundreds to one. The cost of this raise stated
-// plainly: moving the output ceiling from 128 MiB to 192 MiB admits 64 MiB more
-// decompressed output (a 50% increase), plus the decompression work and the
+// plainly: moving the output ceiling from 192 MiB to 256 MiB admits 64 MiB more
+// decompressed output (a 33% increase), plus the decompression work and the
 // transient allocation that output implies, and the verifier does this
 // decompression BEFORE it verifies any signature. Bounded, but weaker by exactly
 // that amount.
@@ -33,7 +36,7 @@ const PACKAGE_NAME = "@sanctuary-framework/mcp-server";
 // or verifying a HEALTHY release refuses with "tarball is not a bounded valid
 // gzip archive", which reads like a corrupt or hostile archive rather than a
 // ceiling the package outgrew.
-const MAX_UNPACKED_BYTES = 192 * 1024 * 1024;
+const MAX_UNPACKED_BYTES = 256 * 1024 * 1024;
 
 /** Open once and read a bounded regular-file snapshot from that descriptor. */
 export function readBoundedRegularFile(path, maxBytes, label) {

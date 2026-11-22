@@ -206,6 +206,14 @@ async function perform(
       const { namespace, args } = requestNamespaceArg(request);
       return storage.exists(namespace, String(args[0]));
     }
+    case "listNamespacesForAgentDiscovery":
+      // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+      // Must match isAgentDiscoverySkippedNamespace in storage/agent-discovery.ts and FilesystemStorage.listNamespacesForAgentDiscovery in filesystem.ts.
+      return storage.listNamespacesForAgentDiscovery();
+    case "totalSizeOfNonReservedNamespaces":
+      // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
+      // Must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts and FilesystemStorage.totalSizeOfNonReservedNamespaces in filesystem.ts.
+      return storage.totalSizeOfNonReservedNamespaces();
     case "listNamespaces":
       return storage.listNamespaces();
     case "totalSize":

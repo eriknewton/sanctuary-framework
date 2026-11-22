@@ -36,7 +36,7 @@ import {
   generateMerkleProof,
   verifyMerkleProof,
 } from "../core/hashing.js";
-import { sign, verify } from "../core/identity.js";
+import { sign } from "../core/identity.js";
 import { deriveNamespaceKey } from "../core/key-derivation.js";
 import {
   toBase64url,
@@ -48,6 +48,21 @@ import type { EncryptedPayload as EncPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { verifyRotationChain } from "../core/rotation-chain.js";
+import {
+  LEGACY_STATE_ENVELOPE_SCHEMA_VERSION,
+  STATE_ENVELOPE_SCHEMA_VERSION,
+  StateVerificationError,
+  buildSignedEnvelope,
+  canonicalJson,
+  decryptStateEntryPayload,
+  parseStateEntry,
+  stateEnvelopeSigningBytes,
+  validateSignedStateEnvelope,
+  verifyStateEntrySignatureWithKeys,
+  verifyStateEntrySignaturesWithAuthenticatedKey,
+  type LegacyEnvelopeWarningInfo,
+  type StateEntry,
+} from "./state-entry-open.js";
 // Every field of a persisted entry is attacker-influenced: `JSON.parse` gives
 // back whatever is on disk, so `StateEntry` is an assertion, not a guarantee.
 // Diagnostics built from those fields go through this chokepoint, never a bare
@@ -63,11 +78,18 @@ import {
   type SealedProvenanceStamp,
 } from "../exit/memory-class.js";
 
-const LEGACY_STATE_ENVELOPE_SCHEMA_VERSION = 2;
-const STATE_ENVELOPE_SCHEMA_VERSION = 3;
-const LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
-// Must match STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX in core/signing-domains.ts (identity_sign refusal list).
-const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
+// The envelope, its verifier and its refusal type moved to state-entry-open.ts;
+// re-exported here under their existing names for every current importer.
+export {
+  StateVerificationError,
+  verifyStateEntrySignaturesWithAuthenticatedKey,
+  type LegacyEnvelopeWarningInfo,
+  type SignedStateEnvelope,
+  type StateEntry,
+  type StateVerificationClassification,
+  type StateVerificationReason,
+} from "./state-entry-open.js";
+
 // CONTRACT PIN (coordinator gate, 2026-08-22): exported so
 // server/src/exit/bundle.ts can snapshot these two exact `_meta` keys by
 // PRECISE location before an exit-import's state re-key runs, instead of a
@@ -157,51 +179,6 @@ export interface StateImportVersionFloorPreflight {
   skippedKeys: number;
   skippedInvalidSig: number;
   skippedUnknownKid: number;
-}
-
-export type StateVerificationClassification =
-  | "signature_mismatch"
-  | "kid_unknown"
-  | "integrity_hash_mismatch"
-  | "schema_mismatch"
-  | "rollback_detected"
-  // "the writer could not be established", which is a DISTINCT answer from all
-  // four above and must never be collapsed into one of them: the bytes are
-  // intact (not `integrity_hash_mismatch`), no signature was examined and found
-  // wrong (not `signature_mismatch`), the shape parsed (not `schema_mismatch`),
-  // and the version is at or above its floor (not `rollback_detected`). It is
-  // also distinct from `kid_unknown`, which a signed-envelope (v2+) read raises
-  // when key resolution fails outright; this one is raised by the enforcing read
-  // path when verification was REQUESTED and finished without establishing a
-  // writer. A caller that treats them as the same value loses the one
-  // distinction that tells it a migration, not a repair, is the remedy.
-  | "writer_unverified"
-  // "the writer COULD be established, so this caller asked the wrong path".
-  // Raised only by the operator disclosure surface, which serves exactly the
-  // entries the enforcing read refuses and refuses everything else, so it can
-  // never become a way to skip verification on an entry that does not need it.
-  // Distinct from every value above because nothing failed: this is a refusal
-  // to bypass a control that would have succeeded.
-  | "writer_is_establishable";
-
-export type StateVerificationReason =
-  | "legacy_version_ceiling"
-  | "version_below_floor";
-
-export class StateVerificationError extends Error {
-  readonly classification: StateVerificationClassification;
-  readonly reason?: StateVerificationReason;
-
-  constructor(
-    classification: StateVerificationClassification,
-    message: string,
-    reason?: StateVerificationReason
-  ) {
-    super(message);
-    this.name = "StateVerificationError";
-    this.classification = classification;
-    this.reason = reason;
-  }
 }
 
 export interface StateImportWrittenKey {
@@ -446,36 +423,6 @@ export class LegacyEnvelopeWarning extends Error {
   }
 }
 
-export interface LegacyEnvelopeWarningInfo {
-  name: "LegacyEnvelopeWarning";
-  classification: "legacy_schema_1";
-  message: string;
-}
-
-export interface SignedStateEnvelope {
-  namespace: string;
-  key: string;
-  version: number;
-  kid: string;
-  metadata: {
-    timestamp: string;
-    schema_version: number;
-    content_type?: string;
-    ttl_seconds?: number;
-    tags?: string[];
-  };
-  provenance_stamp?: ProvenanceStamp;
-  integrity_hash: string;
-  payload: {
-    schema_version: number;
-    algo: string;
-    nonce: string;
-    tag: string;
-    ciphertext: string;
-    encrypted_at: string;
-  };
-}
-
 /**
  * Reserved namespace prefixes - used by internal subsystems.
  * Imported bundles MUST NOT write to these namespaces.
@@ -532,6 +479,7 @@ export const RESERVED_NAMESPACE_PREFIXES = [
  * want a precise label (see `getReservedNamespaceViolation` directly below)
  * something to match against; it is never the boundary itself.
  */
+// Must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts, which mirrors this rule because storage cannot import its consumers.
 export function isReservedNamespace(namespace: string): boolean {
   return namespace.startsWith("_");
 }
@@ -558,39 +506,6 @@ export function getReservedNamespaceViolation(namespace: string): string | null 
     }
   }
   return namespace;
-}
-
-/** On-disk format for an encrypted state entry */
-export interface StateEntry {
-  /** Format version. v1 is legacy signed-ciphertext-only; v2+ signs the full envelope. */
-  v: number;
-  /** Canonical state envelope signed by envelope_sig. */
-  envelope?: SignedStateEnvelope;
-  /** Encrypted payload */
-  payload: EncryptedPayload;
-  /** Version number (monotonically increasing) */
-  ver: number;
-  /** Legacy-compatible signature over ciphertext by the writing identity (base64url) */
-  sig: string;
-  /** Signature over the canonical envelope by the writing identity (base64url) */
-  envelope_sig?: string;
-  /**
-   * Schema-3 user-state provenance stamp. Present only on new writes after
-   * Exit Slice 2. Legacy schema-2 entries intentionally remain unstamped.
-   */
-  provenance_stamp?: ProvenanceStamp;
-  /** Identity that wrote this entry */
-  kid: string;
-  /** SHA-256 of the plaintext value (base64url, for client-side verification) */
-  integrity_hash: string;
-  /** Metadata */
-  metadata: {
-    content_type?: string;
-    ttl_seconds?: number;
-    tags?: string[];
-    schema_version?: number;
-    written_at: string;
-  };
 }
 
 export type WriterPublicKeyTrustBasis = "authenticated" | "unauthenticated";
@@ -683,34 +598,6 @@ export function createStateImportWriterKeyResolver(
       ? importableKeys.map((key) => key.publicKey)
       : null;
   };
-}
-
-export function verifyStateEntrySignaturesWithAuthenticatedKey(args: {
-  publicKeys: readonly Uint8Array[];
-  legacyCiphertext: Uint8Array;
-  legacySignature: Uint8Array;
-  envelopeBytes?: Uint8Array;
-  envelopeSignature?: Uint8Array;
-}): boolean {
-  // INVARIANT: schema-2+ entries bind the envelope and legacy ciphertext to
-  // the same authenticated writer key; separate matching keys would install
-  // bytes the enforcing reader refuses.
-  if (
-    (args.envelopeBytes === undefined) !==
-    (args.envelopeSignature === undefined)
-  ) {
-    return false;
-  }
-  return args.publicKeys.some((publicKey) => {
-    if (
-      args.envelopeBytes !== undefined &&
-      args.envelopeSignature !== undefined &&
-      !verify(args.envelopeBytes, args.envelopeSignature, publicKey)
-    ) {
-      return false;
-    }
-    return verify(args.legacyCiphertext, args.legacySignature, publicKey);
-  });
 }
 
 /** Result of a state write operation */
@@ -1010,30 +897,6 @@ interface CachedKey {
   expiresAt: number;
 }
 
-function canonicalize(value: unknown): unknown {
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((item) => canonicalize(item));
-  }
-
-  const record = value as Record<string, unknown>;
-  const canonical: Record<string, unknown> = {};
-  for (const key of Object.keys(record).sort()) {
-    const item = record[key];
-    if (item !== undefined) {
-      canonical[key] = canonicalize(item);
-    }
-  }
-  return canonical;
-}
-
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
-}
-
 function sortExportItems(entries: ExportedStateItem[]): ExportedStateItem[] {
   return [...entries]
     .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
@@ -1167,76 +1030,6 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
     diff |= a[i]! ^ b[i]!;
   }
   return diff === 0;
-}
-
-function stateEnvelopeSigningDomain(envelope: SignedStateEnvelope): string {
-  const schemaVersion = envelope.metadata.schema_version;
-  if (schemaVersion <= LEGACY_STATE_ENVELOPE_SCHEMA_VERSION) {
-    return LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN;
-  }
-  return `${STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX}${schemaVersion}\n`;
-}
-
-function stateEnvelopeSigningBytes(envelope: SignedStateEnvelope): Uint8Array {
-  return stringToBytes(stateEnvelopeSigningDomain(envelope) + canonicalJson(envelope));
-}
-
-function legacyWarning(): LegacyEnvelopeWarningInfo {
-  return {
-    name: "LegacyEnvelopeWarning",
-    classification: "legacy_schema_1",
-    message:
-      "Legacy state envelope v1 loaded with ciphertext-only signature verification",
-  };
-}
-
-function payloadAuthTag(payload: EncryptedPayload): string {
-  const ciphertextAndTag = fromBase64url(payload.ct);
-  if (ciphertextAndTag.length < 16) {
-    throw new StateVerificationError(
-      "schema_mismatch",
-      "Encrypted payload is too short to contain an authentication tag"
-    );
-  }
-  return toBase64url(ciphertextAndTag.slice(ciphertextAndTag.length - 16));
-}
-
-function buildSignedEnvelope(args: {
-  namespace: string;
-  key: string;
-  version: number;
-  kid: string;
-  schemaVersion: number;
-  metadata: StateEntry["metadata"];
-  provenanceStamp?: ProvenanceStamp;
-  integrityHash: string;
-  payload: EncryptedPayload;
-}): SignedStateEnvelope {
-  return {
-    namespace: args.namespace,
-    key: args.key,
-    version: args.version,
-    kid: args.kid,
-    metadata: {
-      timestamp: args.metadata.written_at,
-      schema_version: args.schemaVersion,
-      content_type: args.metadata.content_type,
-      ttl_seconds: args.metadata.ttl_seconds,
-      tags: args.metadata.tags,
-    },
-    ...(args.provenanceStamp !== undefined
-      ? { provenance_stamp: args.provenanceStamp }
-      : {}),
-    integrity_hash: args.integrityHash,
-    payload: {
-      schema_version: args.payload.v,
-      algo: args.payload.alg,
-      nonce: args.payload.iv,
-      tag: payloadAuthTag(args.payload),
-      ciphertext: args.payload.ct,
-      encrypted_at: args.payload.ts,
-    },
-  };
 }
 
 function entryBinding(namespace: string, key: string): string {
@@ -2439,66 +2232,6 @@ export class StateStore {
     return disclosure;
   }
 
-  private validateSignedEnvelope(
-    entry: StateEntry,
-    namespace: string,
-    key: string
-  ): SignedStateEnvelope {
-    if (!entry.envelope) {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `State envelope is missing for ${namespace}/${key}`
-      );
-    }
-
-    if (
-      entry.v !== LEGACY_STATE_ENVELOPE_SCHEMA_VERSION &&
-      entry.v !== STATE_ENVELOPE_SCHEMA_VERSION
-    ) {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `Unsupported state envelope schema: ${describeUntrusted(entry.v)}`
-      );
-    }
-
-    if (entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION && entry.provenance_stamp !== undefined) {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `Legacy state envelope schema ${LEGACY_STATE_ENVELOPE_SCHEMA_VERSION} cannot carry provenance for ${namespace}/${key}`
-      );
-    }
-
-    if (entry.v === STATE_ENVELOPE_SCHEMA_VERSION && entry.provenance_stamp === undefined) {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `State envelope schema ${STATE_ENVELOPE_SCHEMA_VERSION} is missing provenance for ${namespace}/${key}`
-      );
-    }
-
-    const expected = buildSignedEnvelope({
-      namespace,
-      key,
-      version: entry.ver,
-      kid: entry.kid,
-      schemaVersion: entry.v,
-      metadata: entry.metadata,
-      ...(entry.provenance_stamp !== undefined
-        ? { provenanceStamp: entry.provenance_stamp }
-        : {}),
-      integrityHash: entry.integrity_hash,
-      payload: entry.payload,
-    });
-
-    if (canonicalJson(entry.envelope) !== canonicalJson(expected)) {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `State envelope metadata mismatch for ${namespace}/${key}`
-      );
-    }
-
-    return entry.envelope;
-  }
-
   private async verifyEntrySignature(
     entry: StateEntry,
     namespace: string,
@@ -2511,75 +2244,9 @@ export class StateStore {
           .filter((resolved) => resolved.trustBasis === "authenticated")
           .map((resolved) => resolved.publicKey);
 
-    if (entry.v === 1) {
-      const warnings = [legacyWarning()];
-      if (publicKeys.length === 0) {
-        return { verified: false, warnings };
-      }
-
-      const sigValid = verifyStateEntrySignaturesWithAuthenticatedKey({
-        publicKeys,
-        legacyCiphertext: fromBase64url(entry.payload.ct),
-        legacySignature: fromBase64url(entry.sig),
-      });
-      if (!sigValid) {
-        throw new StateVerificationError(
-          "signature_mismatch",
-          `Legacy state signature verification failed for ${namespace}/${key}`
-        );
-      }
-      return { verified: true, warnings };
-    }
-
-    if (
-      entry.v !== LEGACY_STATE_ENVELOPE_SCHEMA_VERSION &&
-      entry.v !== STATE_ENVELOPE_SCHEMA_VERSION
-    ) {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `Unsupported state envelope schema: ${describeUntrusted(entry.v)}`
-      );
-    }
-
-    if (publicKeys.length === 0) {
-      throw new StateVerificationError(
-        "kid_unknown",
-        `Writer key not found for ${describeUntrusted(entry.kid)}`
-      );
-    }
-
-    const envelope = this.validateSignedEnvelope(entry, namespace, key);
-    if (!entry.envelope_sig) {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `State envelope signature is missing for ${namespace}/${key}`
-      );
-    }
-    if (typeof entry.sig !== "string") {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `State envelope legacy ciphertext signature is missing for ${namespace}/${key}`
-      );
-    }
-    const envelopeSig = fromBase64url(entry.envelope_sig);
-    const legacySig = fromBase64url(entry.sig);
-    const signedEnvelope = stateEnvelopeSigningBytes(envelope);
-    const legacyCiphertext = fromBase64url(entry.payload.ct);
-    const sigValid = verifyStateEntrySignaturesWithAuthenticatedKey({
-      publicKeys,
-      envelopeBytes: signedEnvelope,
-      envelopeSignature: envelopeSig,
-      legacyCiphertext,
-      legacySignature: legacySig,
-    });
-    if (!sigValid) {
-      throw new StateVerificationError(
-        "signature_mismatch",
-        `Signature verification failed for state envelope ${namespace}/${key}`
-      );
-    }
-
-    return { verified: true };
+    // Must match openStateEntry in cognitive/state-entry-open.ts: one verifier
+    // serves the state store and the local job worker.
+    return verifyStateEntrySignatureWithKeys(entry, namespace, key, publicKeys);
   }
 
   /**
@@ -2724,15 +2391,8 @@ export class StateStore {
     const raw = await this.storage.read(namespace, key);
     if (!raw) return null;
 
-    let stateEntry: StateEntry;
-    try {
-      stateEntry = JSON.parse(bytesToString(raw));
-    } catch {
-      throw new StateVerificationError(
-        "schema_mismatch",
-        `Corrupted state entry: ${namespace}/${key}`
-      );
-    }
+    // Must match openStateEntry in cognitive/state-entry-open.ts (same parse step).
+    let stateEntry = parseStateEntry(raw, namespace, key);
 
     // Anti-rollback check
     const vk = this.versionKey(namespace, key);
@@ -2814,19 +2474,10 @@ export class StateStore {
       options.unattributedDisclosure !== true &&
       !journalMaybePending;
 
-    // Decrypt
+    // Decrypt and verify the integrity hash; must match openStateEntry in
+    // cognitive/state-entry-open.ts (same step, same refusals).
     const namespaceKey = this.getNamespaceKey(namespace);
-    const plaintext = decrypt(stateEntry.payload, namespaceKey);
-    const value = bytesToString(plaintext);
-
-    // Verify integrity hash
-    const computedHash = hashToString(plaintext);
-    if (computedHash !== stateEntry.integrity_hash) {
-      throw new StateVerificationError(
-        "integrity_hash_mismatch",
-        `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${describeUntrusted(stateEntry.integrity_hash)}`
-      );
-    }
+    const { value } = decryptStateEntryPayload(stateEntry, namespaceKey, namespace, key);
 
     // Migration re-signs the entry under a locally resolved identity and
     // OVERWRITES the original legacy bytes in place, so it must run only behind
@@ -3143,10 +2794,12 @@ export class StateStore {
     // Must match sessionOwnedExportNamespaces in tools.ts: approval and full
     // export share durable discovery; an absent capability never falls back
     // to the warm cache, which cannot prove completeness after a restart.
-    if (!this.storage.listNamespaces) {
+    // Agent discovery is required: operator enumeration cannot substitute for its budget policy.
+    // Reserved filtering must match isAgentAggregateReservedNamespace in storage/agent-discovery.ts.
+    if (!this.storage.listNamespacesForAgentDiscovery) {
       throw new Error("Storage cannot enumerate namespaces");
     }
-    const namespaces = await this.storage.listNamespaces();
+    const namespaces = await this.storage.listNamespacesForAgentDiscovery();
     // Recheck the backend contract before retaining or sorting its result;
     // internal namespaces count toward the bound as well.
     if (namespaces.length > MAX_DISCOVERED_NAMESPACES) {
@@ -3316,7 +2969,7 @@ export class StateStore {
           return "invalid-sig";
         }
         const signedEnvelope = stateEnvelopeSigningBytes(
-          this.validateSignedEnvelope(entry, namespace, key)
+          validateSignedStateEnvelope(entry, namespace, key)
         );
         const envelopeSignature = fromBase64url(entry.envelope_sig);
         const legacyCiphertext = fromBase64url(entry.payload.ct);

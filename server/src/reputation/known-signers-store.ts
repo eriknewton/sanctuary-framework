@@ -71,6 +71,7 @@ export const KNOWN_SIGNERS_NAMESPACE = "_known_signers";
  */
 export const MAX_KNOWN_SIGNERS = MAX_REPUTATION_RECORDS;
 export const MEMORY_PROVENANCE_SIGNER_PREFIX = "memprov." as const;
+/** Must match MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES in sdw/memory-provenance-contract.ts. */
 export const MAX_MEMORY_PROVENANCE_SIGNERS = MAX_MEMORY_PROVENANCE_CANDIDATES;
 export type KnownSignerPartition = "reputation" | "memory_provenance";
 

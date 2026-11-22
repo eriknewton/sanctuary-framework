@@ -46,7 +46,8 @@
 
 import os from "node:os";
 import { randomBytes } from "node:crypto";
-import { isIP } from "node:net";
+// Must match isLoopbackOllamaEndpoint in intelligence/loopback-endpoint.ts.
+import { isLoopbackOllamaEndpoint } from "./loopback-endpoint.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
@@ -3007,24 +3008,6 @@ function lightVerificationIsDue(
   // wall-clock rollback can only make verification due, never extend trust.
   return elapsed < 0 || wallNow < completedWallMs ||
     elapsed >= IMMUNE_FULL_VERIFICATION_CADENCE_MS;
-}
-
-function isLoopbackOllamaEndpoint(endpoint: string): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(endpoint);
-  } catch {
-    return false;
-  }
-  if (parsed.username.length > 0 || parsed.password.length > 0) return false;
-  const rawHost = parsed.hostname.toLowerCase();
-  const host = rawHost.startsWith("[") && rawHost.endsWith("]")
-    ? rawHost.slice(1, -1)
-    : rawHost;
-  if (host === "localhost" || host === "::1") return true;
-  if (isIP(host) !== 4) return false;
-  // Design section 5.3 accepts the complete IPv4 127.0.0.0/8 loopback block.
-  return host.split(".")[0] === "127";
 }
 
 function withTotalLatency(resp: SubstrateResponse, startedAt: number): SubstrateResponse {

@@ -392,7 +392,7 @@ const REFUSAL_CASES: RefusalCase[] = [
     cause: "export_capacity",
     gateRow: true,
     run: async (b) => {
-      const list = vi.spyOn(b.storage, "listNamespaces").mockResolvedValue(
+      const list = vi.spyOn(b.storage, "listNamespacesForAgentDiscovery").mockResolvedValue(
         Array.from({ length: OVER_DISCOVERY_CAP }, (_, i) => `ns-${i}`),
       );
       try { return await call(b, "state_export", {}); } finally { list.mockRestore(); }
