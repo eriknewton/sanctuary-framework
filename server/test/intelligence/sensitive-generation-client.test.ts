@@ -32,6 +32,8 @@ async function countingListener(host = "127.0.0.1") {
     sockets.add(socket);
     let bytes = 0;
     socket.on("data", (chunk) => { bytes += chunk.length; });
+    // A reset from the client's side is an expected way for the connection to end, not a test failure.
+    socket.on("error", () => undefined);
     socket.on("close", () => resolveClosed(bytes));
   });
   rawServers.push({ server, sockets });
@@ -41,11 +43,11 @@ async function countingListener(host = "127.0.0.1") {
   if (!address || typeof address === "string") throw new Error("listener address");
   return { port: address.port, closed };
 }
-/** Whether this host can listen on the IPv6 loopback address. */
-async function ipv6LoopbackAvailable(): Promise<boolean> {
+/** Whether this host can listen on `host`. */
+async function canListen(host: string): Promise<boolean> {
   const probe = createRawServer();
   try {
-    probe.listen(0, "::1");
+    probe.listen(0, host);
     await once(probe, "listening");
     return true;
   } catch {
@@ -53,6 +55,19 @@ async function ipv6LoopbackAvailable(): Promise<boolean> {
   } finally {
     if (probe.listening) await new Promise<void>((resolve) => probe.close(() => resolve()));
   }
+}
+/** Whether this host can listen on the IPv6 loopback address. */
+async function ipv6LoopbackAvailable(): Promise<boolean> {
+  return canListen("::1");
+}
+/**
+ * A loopback address other than 127.0.0.1 that this host can bind: the IPv6 loopback where it exists,
+ * else 127.0.0.2 (Linux routes all of 127.0.0.0/8 to loopback; macOS binds only 127.0.0.1 by default).
+ */
+async function secondLoopbackAddress(): Promise<{ host: string; family: 4 | 6 } | null> {
+  if (await canListen("::1")) return { host: "::1", family: 6 };
+  if (await canListen("127.0.0.2")) return { host: "127.0.0.2", family: 4 };
+  return null;
 }
 async function listen(handler: RequestListener, host = "127.0.0.1") {
   const server = createServer(handler);
@@ -111,11 +126,12 @@ it("the client never calls fetch", () => {
   expect(source).not.toMatch(/\bfetch\s*\(/);
 });
 it("a connection whose remote address differs is closed before any byte", async (context) => {
-  // A second loopback address, available on every common host, so the peer differs only by address.
-  if (!(await ipv6LoopbackAvailable())) context.skip();
-  const other = await countingListener("::1");
+  // A second loopback address, so the peer differs only by address; skipped only on a host that binds neither.
+  const second = await secondLoopbackAddress();
+  if (second === null) context.skip();
+  const other = await countingListener(second!.host);
   const f = await listen((_req, res) => res.end(final));
-  const client = new SensitiveGenerationClient(f.target, { connect: () => connect({ host: "::1", port: other.port, family: 6 }) });
+  const client = new SensitiveGenerationClient(f.target, { connect: () => connect({ host: second!.host, port: other.port, family: second!.family }) });
   expect(await client.generate(input)).toEqual({ ok: false, reason: "connect_address_mismatch" });
   // Counted until the peer's side of the connection closed, so no late header or body byte is missed.
   expect(await other.closed).toBe(0);

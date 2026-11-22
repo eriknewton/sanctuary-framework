@@ -55,7 +55,11 @@ function edges(source: string): Edge[] {
     }
     // A require built by createRequire can load any module. Only the form that resolves a path and
     // loads nothing, createRequire(...).resolve(...), is not an edge.
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "createRequire") {
+    // The callee may be the bare name or a property of a namespace import (`m.createRequire`).
+    const callee = ts.isCallExpression(node) ? node.expression : undefined;
+    const createsRequire = callee !== undefined &&
+      ((ts.isIdentifier(callee) && callee.text === "createRequire") || (ts.isPropertyAccessExpression(callee) && callee.name.text === "createRequire"));
+    if (ts.isCallExpression(node) && createsRequire) {
       const parent = node.parent;
       const resolvesOnly = ts.isPropertyAccessExpression(parent) && parent.expression === node && parent.name.text === "resolve" &&
         ts.isCallExpression(parent.parent) && parent.parent.expression === parent;
@@ -131,6 +135,17 @@ describe("local job worker import graph", () => {
       { specifier: "<createRequire>", dynamic: true },
       { specifier: "<createRequire>", dynamic: true },
       { specifier: "node:fs", dynamic: true },
+    ]);
+  });
+
+  it("the parser sees createRequire reached through a namespace import, and allows its resolve-only form", () => {
+    expect(edges([
+      'import * as m from "node:module";',
+      'm.createRequire(import.meta.url)("./h.js");',
+      'const path = m.createRequire(import.meta.url).resolve("tsx");',
+    ].join("\n"))).toEqual([
+      { specifier: "node:module", dynamic: false },
+      { specifier: "<createRequire>", dynamic: true },
     ]);
   });
 });
