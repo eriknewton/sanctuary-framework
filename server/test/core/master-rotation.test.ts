@@ -1,4 +1,4 @@
-// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Master-rotation tests (F7, custody/crypto lane).
  *
@@ -201,7 +201,7 @@ async function buildFortress(): Promise<Fortress> {
     "hello sovereign world",
     KID,
     identity.encrypted_private_key,
-    idKey
+    idKey, { provenance: { origin_actor: "operator" } }
   );
   await stateStore.write(
     "notes",
@@ -209,7 +209,7 @@ async function buildFortress(): Promise<Fortress> {
     "second entry",
     KID,
     identity.encrypted_private_key,
-    idKey
+    idKey, { provenance: { origin_actor: "operator" } }
   );
   await stateStore.write(
     "plans",
@@ -217,7 +217,7 @@ async function buildFortress(): Promise<Fortress> {
     JSON.stringify({ goal: "rotate safely" }),
     KID,
     identity.encrypted_private_key,
-    idKey
+    idKey, { provenance: { origin_actor: "operator" } }
   );
 
   // Audit chain (entries stay byte-identical across rotation; epoch-scoped
@@ -492,7 +492,7 @@ describe("master rotation: happy path", () => {
       "written after identity rotation",
       KID,
       updatedIdentity.encrypted_private_key,
-      identityKey
+      identityKey, { provenance: { origin_actor: "operator" } }
     );
 
     await rotateMaster(rotateOpts(fortress));
@@ -525,7 +525,7 @@ describe("master rotation: happy path", () => {
       "written after declared-compromise rotation",
       KID,
       updatedIdentity.encrypted_private_key,
-      identityKey
+      identityKey, { provenance: { origin_actor: "operator" } }
     );
 
     await rotateMaster(rotateOpts(fortress));
@@ -1247,7 +1247,7 @@ describe("master rotation: fail-closed coverage", () => {
       }),
       KID,
       fortress.identity.encrypted_private_key,
-      identityKey
+      identityKey, { provenance: { origin_actor: "operator" } }
     );
 
     await rotateMaster(rotateOpts(fortress));

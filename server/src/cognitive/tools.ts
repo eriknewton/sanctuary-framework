@@ -2294,8 +2294,8 @@ export function createCognitiveTools(
               await denyStorageNameAccess("state_export", "state_export", error);
               throw error;
             }
-            // Discovery caps are capacity refusals, not ownership decisions;
-            // preserve the fixed remediation that router.ts may safely surface.
+            // Discovery caps are capacity refusals, not ownership decisions; it reaches the operator ledger
+            // unwrapped as export_capacity (argumentStageCause in tool-outcome.ts), and the agent sees the one refusal.
             if (isNamespaceDiscoveryLimitError(error)) throw error;
             // The not-bound cause reaches the operator ledger unwrapped; the agent sees the same refusal either way.
             if (isSessionNotBoundError(error)) throw error;

@@ -846,21 +846,25 @@ async function runRawWriteObserver(
   }
 }
 
+/** The provenance a StateStore.write caller declares; its origin is decided by the caller, never by the store. */
+export interface WriteProvenance {
+  origin_actor: OriginActor;
+  origin_ref?: string;
+  lineage_id?: string;
+  derived_from?: readonly DerivedFromEdge[];
+}
+
 /** Options for state write */
 export interface WriteOptions {
   content_type?: string;
   ttl_seconds?: number;
   tags?: string[];
-  provenance?: {
-    /**
-     * Internal, derived actor signal. `agent` is passed only from the existing
-     * session-identity path; absent/unknown fails closed to operator.
-     */
-    origin_actor?: OriginActor;
-    origin_ref?: string;
-    lineage_id?: string;
-    derived_from?: readonly DerivedFromEdge[];
-  };
+  /**
+   * The write's provenance. Every caller names `origin_actor` explicitly; it is
+   * never defaulted, and an absent or unknown value fails the write before any
+   * storage write.
+   */
+  provenance: WriteProvenance;
   /**
    * N4 (coordinator gate, 2026-08-22): a scoped opt-out of the
    * pending-exit-import write refusal below, for the one call path that
@@ -1037,27 +1041,24 @@ function entryBinding(namespace: string, key: string): string {
   return `${namespace}/${key}`;
 }
 
-function resolveWriteOriginActor(actor: OriginActor | undefined): OriginActor {
-  return actor === "agent" || actor === "system" || actor === "unattributed" ? actor : "operator";
-}
-
 function mintSerializedWriteStamp(args: {
   namespace: string;
   key: string;
   identityId: string;
   writtenAt: string;
   version: number;
-  provenance?: WriteOptions["provenance"];
+  provenance: WriteProvenance;
 }): ProvenanceStamp {
   const stamp = mintProvenanceStamp({
-    origin_actor: resolveWriteOriginActor(args.provenance?.origin_actor),
-    origin_ref: args.provenance?.origin_ref ?? args.identityId,
+    // A write's origin comes from its caller and is never defaulted; the minter's origin check throws on an absent or unknown value.
+    origin_actor: args.provenance.origin_actor,
+    origin_ref: args.provenance.origin_ref ?? args.identityId,
     lineage_id:
-      args.provenance?.lineage_id ??
+      args.provenance.lineage_id ??
       `state:${entryBinding(args.namespace, args.key)}:v${args.version}`,
     written_at: args.writtenAt,
     entry_binding: entryBinding(args.namespace, args.key),
-    ...(args.provenance?.derived_from !== undefined
+    ...(args.provenance.derived_from !== undefined
       ? { derived_from: args.provenance.derived_from }
       : {}),
   });
@@ -1928,7 +1929,7 @@ export class StateStore {
    * @param identityId - Identity performing the write
    * @param encryptedPrivateKey - Identity's encrypted private key (for signing)
    * @param identityEncryptionKey - Key to decrypt the identity's private key
-   * @param options - Optional metadata
+   * @param options - Metadata and the write's required provenance
    */
   async write(
     namespace: string,
@@ -1937,7 +1938,7 @@ export class StateStore {
     identityId: string,
     encryptedPrivateKey: EncPayload,
     identityEncryptionKey: Uint8Array,
-    options: WriteOptions = {}
+    options: WriteOptions
   ): Promise<WriteResult> {
     return this.withStateMutationLock(async () => {
     // N4 (coordinator gate, 2026-08-22): while a durable exit-import

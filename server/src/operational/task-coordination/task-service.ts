@@ -239,6 +239,8 @@ export class TaskService {
       {
         content_type: "application/json",
         tags: ["task", task.status, task.fortress_id],
+        // Records of this store are operator-owned at exit, the value this write carried before provenance was required.
+        provenance: { origin_actor: "operator" },
       },
     );
   }

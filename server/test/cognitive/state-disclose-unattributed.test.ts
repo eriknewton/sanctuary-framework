@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * CAPABILITY (STATE-DISCLOSE-UNATTRIB-01): an operator-approved surface that
  * discloses the content of a state entry whose writer the fortress cannot
@@ -292,7 +293,7 @@ describe("the operator unattributed-disclosure surface", () => {
       "routine-value",
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await plantUnattributableLegacyEntry({
       storage,
@@ -384,7 +385,7 @@ describe("the operator unattributed-disclosure surface", () => {
       "routine-value",
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     // The ordinary read succeeds on this entry, so the disclosure surface must
@@ -597,7 +598,7 @@ describe("the operator unattributed-disclosure surface", () => {
       "routine-value",
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const outcome = await discloseUnattributedState({
@@ -633,7 +634,7 @@ describe("the operator unattributed-disclosure surface", () => {
       "anchored",
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await plantUnattributableLegacyEntry({
       storage,
@@ -676,7 +677,7 @@ describe("the operator unattributed-disclosure surface", () => {
         `ALLOW=v${version}`,
         identity.identity_id,
         identity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
     await plantUnattributableLegacyEntry({
@@ -721,7 +722,7 @@ describe("the operator unattributed-disclosure surface", () => {
       "anchored",
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await plantAttributableLegacyEntry({
       storage,

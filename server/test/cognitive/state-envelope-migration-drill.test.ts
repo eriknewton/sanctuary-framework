@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -189,7 +190,7 @@ async function seedSchema2Entry(args: {
     args.fixture.value,
     args.identity.identity_id,
     args.identity.encrypted_private_key,
-    args.identityEncKey
+    args.identityEncKey, { provenance: { origin_actor: "operator" } }
   );
   return readEntry(args.storage, args.fixture.namespace, args.fixture.key);
 }
@@ -318,7 +319,7 @@ describe("state envelope migration drill", () => {
       target.value,
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const restarted = new StateStore(storage, MASTER_KEY);

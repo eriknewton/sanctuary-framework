@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * state_import enforces durable version floors through the MCP tool path.
  *
@@ -325,7 +326,7 @@ async function sourceBundle(args: {
       item.value,
       args.identity.identity_id,
       args.identity.encrypted_private_key,
-      args.identityEncKey
+      args.identityEncKey, { provenance: { origin_actor: "operator" } }
     );
   }
   for (const item of args.facadeHiddenMarkers ?? []) {
@@ -352,7 +353,7 @@ async function sourceBundleFromSignedEntries(args: {
       item.value,
       item.identity.identity_id,
       item.identity.encrypted_private_key,
-      args.identityEncKey
+      args.identityEncKey, { provenance: { origin_actor: "operator" } }
     );
   }
   return (await sourceStore.exportNamespaces(["notes"])).bundle;
@@ -1055,7 +1056,7 @@ describe("state_import version floor tool path", () => {
             "concurrent",
             identity.identity_id,
             identity.encrypted_private_key,
-            rig.identityEncKey
+            rig.identityEncKey, { provenance: { origin_actor: "operator" } }
           );
           const settled = await Promise.race([
             concurrentWrite.then(() => "settled" as const),

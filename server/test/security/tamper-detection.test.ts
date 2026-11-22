@@ -1,4 +1,4 @@
-// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Security Test: Tamper Detection
  *
@@ -37,7 +37,7 @@ describe("Tamper Detection", () => {
       "original-value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
   });
 
@@ -91,7 +91,7 @@ describe("Tamper Detection", () => {
       "updated-value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     // Verify version is 2

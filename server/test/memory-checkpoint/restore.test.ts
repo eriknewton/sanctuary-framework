@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Memory checkpoint restore tests.
  * CHECKPOINT-RESTORE-COLD-VERSION-FLOOR-01
@@ -208,7 +209,7 @@ async function writeEntry(
     value,
     fixture.identity.storedIdentity.identity_id,
     fixture.identity.storedIdentity.encrypted_private_key,
-    fixture.identityEncKey,
+    fixture.identityEncKey, { provenance: { origin_actor: "operator" } },
   );
 }
 
@@ -1183,7 +1184,7 @@ describe("restoreCheckpoint", () => {
       "checkpoint-from-unknown-signer",
       otherIdentity.storedIdentity.identity_id,
       otherIdentity.storedIdentity.encrypted_private_key,
-      fixture.identityEncKey,
+      fixture.identityEncKey, { provenance: { origin_actor: "operator" } },
     );
     const checkpointId = await createCheckpointFromBundle(
       fixture,
@@ -1252,7 +1253,7 @@ describe("restoreCheckpoint", () => {
       "post-checkpoint",
       updatedIdentity.identity_id,
       updatedIdentity.encrypted_private_key,
-      fixture.identityEncKey,
+      fixture.identityEncKey, { provenance: { origin_actor: "operator" } },
     );
     const before = await exportEntries(fixture.stateStore);
     const deleteSpy = vi.spyOn(fixture.stateStore, "delete");
@@ -1305,7 +1306,7 @@ describe("restoreCheckpoint", () => {
       "checkpoint",
       updatedIdentity.identity_id,
       updatedIdentity.encrypted_private_key,
-      fixture.identityEncKey,
+      fixture.identityEncKey, { provenance: { origin_actor: "operator" } },
     );
     const decoded = decodeBundle((await sourceStore.exportNamespaces(["mem"])).bundle);
     const entry = decoded.data.mem?.find((item) => item.key === "paired")?.entry;
