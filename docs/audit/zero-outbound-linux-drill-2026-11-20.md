@@ -11,7 +11,7 @@ scope: observed network contact of the published npm package from install throug
 
 **Purpose.** This document is the in-repo trace target for the ASSURANCE_MATRIX row "No unrequested network contact (observed by packet capture)". Sanctuary says it does not phone home. This drill checked that from the outside: the published package ran through a new user's first steps while a separate container recorded every packet, and a second reader then re-read the raw captures on its own.
 
-## Claim proven
+## What the drill shows
 
 We recorded every packet while Sanctuary 1.8.4 installed, set up, protected a Claude Code configuration and served three agent sessions, three times over, on Linux in Docker. Outside the install itself, an update check the user asked for, and the npx case in the next sentence, no network connection opened and no name was looked up. When a session was started through npx, the npm registry was contacted before the server answered its first request; after that answer, no new connection opened and no data byte left.
 
