@@ -1,4 +1,5 @@
-// fail-before-exempt: new local stores; the preflight case below fails on base by assertion (base refuses the two namespaces as having no recipe).
+// fail-before-exempt: new local stores; this file imports branch modules, so on base it fails by import.
+// The base witness for the two rotation recipes is rotation-recipe-witness.test.ts, which fails on base by assertion.
 import { afterEach, describe, expect, it } from "vitest";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { rotateMaster } from "../../src/core/master-rotation.js";
