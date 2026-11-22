@@ -158,12 +158,20 @@ export class LocalResultsStore {
     this.key.fill(0);
   }
 
-  /** Create an empty index when absent; otherwise check it authenticates and parses. */
+  /**
+   * Create an empty index when absent. Otherwise check it authenticates and parses, and bring every
+   * entry into agreement with its object, the repair sweep also makes: a crash between an object write
+   * and its index write is reconciled at the next boot, before any read or mutation relies on the entry.
+   */
   async ensure(): Promise<"created" | "verified"> {
     return this.locked(async () => {
-      if ((await this.readIndexOrNull()) !== null) return "verified";
-      await this.writeIndex([]);
-      return "created";
+      let entries = await this.readIndexOrNull();
+      if (entries === null) {
+        await this.writeIndex([]);
+        return "created";
+      }
+      for (const entry of [...entries]) entries = (await this.repairEntry(entries, entry)).entries;
+      return "verified";
     });
   }
 
@@ -262,7 +270,7 @@ export class LocalResultsStore {
     return this.locked(async () => {
       const objects: LocalResultObject[] = [];
       for (const entry of await this.readIndex()) {
-        if (!visible(entry, options.includeUncommitted === true)) continue;
+        // Visibility is the object's state, not the entry's copy, which a crash can leave behind the object.
         const object = await this.readObject(entry.request_id);
         if (object !== null && visible(object, options.includeUncommitted === true)) objects.push(object);
       }
@@ -282,21 +290,14 @@ export class LocalResultsStore {
       const summary: SweepSummary = { expired: 0, indeterminate: 0, repaired: 0 };
       let entries = await this.readIndex();
       for (const entry of [...entries]) {
-        const object = await this.readObject(entry.request_id);
-        if (object === null) {
-          entries = entries.filter((candidate) => candidate.request_id !== entry.request_id);
-          await this.writeIndex(entries);
-          summary.repaired += 1;
-          continue;
-        }
-        // An entry a crash left behind its object (a raised size, or the old state) is rewritten from the object.
-        const actual = indexEntry(object, objectBytes(object));
-        if (!sameEntry(entry, actual)) {
-          entries = entries.map((candidate) => (candidate.request_id === actual.request_id ? actual : candidate));
-          await this.writeIndex(entries);
-          summary.repaired += 1;
-        }
-        if (now < object.expires_at) continue;
+        // An entry evicted earlier in this sweep, to make room for a transition, is already gone.
+        const current = entries.find((candidate) => candidate.request_id === entry.request_id);
+        if (current === undefined) continue;
+        const repaired = await this.repairEntry(entries, current);
+        entries = repaired.entries;
+        if (repaired.repaired) summary.repaired += 1;
+        const object = repaired.object;
+        if (object === null || now < object.expires_at) continue;
         if (object.state === "pending") {
           entries = await this.toIndeterminateEntries(entries, object, now);
           summary.indeterminate += 1;
@@ -331,10 +332,35 @@ export class LocalResultsStore {
     await this.oplog.append(kind, { request_id: requestId });
   }
 
+  /**
+   * Bring one entry into agreement with its object: drop it when the object is gone, and rewrite an
+   * entry a crash left behind its object (a raised size, or the old state) from the object.
+   */
+  private async repairEntry(
+    entries: IndexEntry[],
+    entry: IndexEntry,
+  ): Promise<{ entries: IndexEntry[]; object: LocalResultObject | null; repaired: boolean }> {
+    const object = await this.readObject(entry.request_id);
+    if (object === null) {
+      const kept = entries.filter((candidate) => candidate.request_id !== entry.request_id);
+      await this.writeIndex(kept);
+      return { entries: kept, object, repaired: true };
+    }
+    const actual = indexEntry(object, objectBytes(object));
+    if (sameEntry(entry, actual)) return { entries, object, repaired: false };
+    const updated = entries.map((candidate) => (candidate.request_id === actual.request_id ? actual : candidate));
+    await this.writeIndex(updated);
+    return { entries: updated, object, repaired: true };
+  }
+
   private async toIndeterminateEntries(entries: IndexEntry[], object: LocalResultObject, now: number): Promise<IndexEntry[]> {
     const next = indeterminateOf(object, now);
+    const bytes = objectBytes(next);
+    // The indeterminate object is larger than the pending one, so room is made under the byte cap first,
+    // the same as a commit; the transitioning entry keeps its slot and is never a victim.
+    const kept = await this.evictFor(entries, bytes, 0, object.request_id);
     await this.log("result_indeterminate", object.request_id);
-    return this.replaceObject(entries, next, objectBytes(next));
+    return this.replaceObject(kept, next, bytes);
   }
 
   /**

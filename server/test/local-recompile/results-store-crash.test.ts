@@ -22,6 +22,8 @@ const MINUTE = 60_000;
 const BODY_CHARS = 1_000;
 // Room for one committed object plus one pending object, but not two committed objects.
 const FIXTURE_MAX_TOTAL_BYTES = 2_000;
+// Far more mutations than any one fixture operation makes; a loop that reaches it fails instead of hanging.
+const MAX_CRASH_POINTS = 64;
 // Far above any fixture index or object; the reader only needs to open what the store sealed.
 const READ_BOUNDS = {
   plaintextMaxBytes: RESULTS_MAX_OBJECTS * RESULT_OBJECT_MAX_BYTES,
@@ -35,10 +37,15 @@ afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
 });
 
-function open(storage: StrictMemoryStorage, keys: { oplogKey: Uint8Array; resultsKey: Uint8Array }, clock: { now: number }) {
+function open(
+  storage: StrictMemoryStorage,
+  keys: { oplogKey: Uint8Array; resultsKey: Uint8Array },
+  clock: { now: number },
+  maxTotalBytes = FIXTURE_MAX_TOTAL_BYTES,
+) {
   const now = () => clock.now;
   const oplog = new LocalOplog(storage, keys.oplogKey, { now });
-  const results = new LocalResultsStore(storage, keys.resultsKey, oplog, { now, caps: { maxTotalBytes: FIXTURE_MAX_TOTAL_BYTES } });
+  const results = new LocalResultsStore(storage, keys.resultsKey, oplog, { now, caps: { maxTotalBytes } });
   cleanups.push(() => {
     results.close();
     oplog.close();
@@ -61,7 +68,7 @@ async function raw(storage: StrictMemoryStorage, resultsKey: Uint8Array) {
 }
 
 /** Reachability and size under a crash: every object has an entry, and no entry undercounts its object. */
-async function expectCrashConsistent(storage: StrictMemoryStorage, resultsKey: Uint8Array, label: string) {
+async function expectCrashConsistent(storage: StrictMemoryStorage, resultsKey: Uint8Array, label: string, cap = FIXTURE_MAX_TOTAL_BYTES) {
   const { index, objects } = await raw(storage, resultsKey);
   for (const [id, object] of objects) {
     const entry = index.find((candidate) => candidate.request_id === id);
@@ -70,7 +77,18 @@ async function expectCrashConsistent(storage: StrictMemoryStorage, resultsKey: U
       canonicalBytes(object, RESULT_OBJECT_MAX_BYTES).length,
     );
   }
-  expect(index.reduce((sum, entry) => sum + entry.bytes, 0), `${label}: index total within the cap`).toBeLessThanOrEqual(FIXTURE_MAX_TOTAL_BYTES);
+  expect(indexTotal(index), `${label}: index total within the cap`).toBeLessThanOrEqual(cap);
+}
+
+function indexTotal(index: RawEntry[]): number {
+  return index.reduce((sum, entry) => sum + entry.bytes, 0);
+}
+
+/** The store's own list agrees with the objects' states, whatever an entry's copy says. */
+async function expectListFollowsObjects(storage: StrictMemoryStorage, results: LocalResultsStore, resultsKey: Uint8Array, label: string) {
+  const { objects } = await raw(storage, resultsKey);
+  const committed = [...objects.values()].filter((object) => object.state === "committed").map((object) => object.request_id);
+  expect((await results.list()).map((object) => object.request_id).sort(), label).toEqual(committed.sort());
 }
 
 /** After recovery housekeeping the index agrees with every object exactly. */
@@ -86,26 +104,49 @@ async function expectAgreement(storage: StrictMemoryStorage, resultsKey: Uint8Ar
   }
 }
 
-/** Run `operation` with a crash injected before mutation number `crashAt`; true when it finished first. */
+/**
+ * Run `operation` with a crash injected before mutation number `crashAt`; true when it finished first.
+ * Only a failure that follows the injected crash counts as the crash (the store maps the storage error
+ * to its own kind); any other failure is rethrown, so a regression fails the test.
+ */
 async function withCrashAt(storage: StrictMemoryStorage, crashAt: number, operation: () => Promise<unknown>): Promise<boolean> {
   let count = 0;
+  let crashed = false;
   storage.beforeMutation = () => {
-    if (count++ === crashAt) throw new FixtureCrash("fixture crash");
+    if (count++ === crashAt) {
+      crashed = true;
+      throw new FixtureCrash("fixture crash");
+    }
   };
   try {
     await operation();
+    expect(crashed, "an operation that finished never saw the crash").toBe(false);
     return true;
-  } catch {
+  } catch (error) {
+    if (!crashed) throw error;
     return false;
   } finally {
     storage.beforeMutation = () => undefined;
   }
 }
 
+/** One pending object A and one committed object B; returns the index total, so a store can be opened exactly full. */
+async function pendingBesideCommitted(storage: StrictMemoryStorage, keys: { oplogKey: Uint8Array; resultsKey: Uint8Array }, clock: { now: number }) {
+  const setup = open(storage, keys, clock);
+  await setup.oplog.ensure();
+  await setup.results.ensure();
+  await setup.results.putPending({ request_id: fixtureRequestId(1), seat: FIXTURE_SEAT, kind: "summarize", deadline: START + MINUTE });
+  clock.now += 1;
+  await setup.results.putPending({ request_id: fixtureRequestId(2), seat: FIXTURE_SEAT, kind: "summarize", deadline: START + MINUTE });
+  await setup.results.markCommitted(fixtureRequestId(2), { summary: "b".repeat(BODY_CHARS) });
+  return indexTotal((await raw(storage, keys.resultsKey)).index);
+}
+
 describe("results store crash consistency", () => {
   it("a commit that evicts keeps the index and the object in agreement under a crash at any write", async () => {
     let crashPoints = 0;
-    for (let crashAt = 0; ; crashAt += 1) {
+    let finishedAt = -1;
+    for (let crashAt = 0; crashAt < MAX_CRASH_POINTS && finishedAt < 0; crashAt += 1) {
       const storage = new StrictMemoryStorage();
       const keys = fixtureStoreKeys();
       const clock = { now: START };
@@ -121,23 +162,31 @@ describe("results store crash consistency", () => {
         first.results.markCommitted(fixtureRequestId(1), { summary: "a".repeat(BODY_CHARS) }),
       );
       await expectCrashConsistent(storage, keys.resultsKey, `crash before write ${crashAt}`);
-      // A restarted store's housekeeping brings the index into exact agreement with the objects.
+      // Before any repair, the crashed store's own list already follows the objects.
+      await expectListFollowsObjects(storage, first.results, keys.resultsKey, `list after crash before write ${crashAt}`);
+      // A restarted store's boot brings the index into exact agreement with the objects, before any sweep.
       const restarted = open(storage, keys, clock);
+      await restarted.oplog.ensure();
+      await restarted.results.ensure();
+      await expectAgreement(storage, keys.resultsKey, `booted after write ${crashAt}`);
       await restarted.results.sweep();
-      await expectAgreement(storage, keys.resultsKey, `recovered after write ${crashAt}`);
+      await expectAgreement(storage, keys.resultsKey, `swept after write ${crashAt}`);
       if (finished) {
         expect(await restarted.results.get(fixtureRequestId(1))).toMatchObject({ state: "committed" });
         expect(await restarted.results.get(fixtureRequestId(2), { includeUncommitted: true })).toBeNull();
-        break;
+        finishedAt = crashAt;
+      } else {
+        crashPoints += 1;
       }
-      crashPoints += 1;
     }
+    expect(finishedAt, "the commit finished within the crash-point bound").toBeGreaterThanOrEqual(0);
     // The commit evicts, logs and writes several records, so several crash points were exercised.
     expect(crashPoints).toBeGreaterThan(3);
   });
 
   it("a pending object that becomes indeterminate stays consistent under a crash at any write", async () => {
-    for (let crashAt = 0; ; crashAt += 1) {
+    let finishedAt = -1;
+    for (let crashAt = 0; crashAt < MAX_CRASH_POINTS && finishedAt < 0; crashAt += 1) {
       const storage = new StrictMemoryStorage();
       const keys = fixtureStoreKeys();
       const clock = { now: START };
@@ -149,13 +198,57 @@ describe("results store crash consistency", () => {
       const finished = await withCrashAt(storage, crashAt, () => first.results.sweep());
       await expectCrashConsistent(storage, keys.resultsKey, `crash before write ${crashAt}`);
       const restarted = open(storage, keys, clock);
+      await restarted.oplog.ensure();
+      await restarted.results.ensure();
+      await expectAgreement(storage, keys.resultsKey, `booted after write ${crashAt}`);
       await restarted.results.sweep();
       await expectAgreement(storage, keys.resultsKey, `recovered after write ${crashAt}`);
       // Whatever the crash point, the object ends indeterminate and a late completion is refused.
       expect(await restarted.results.get(fixtureRequestId(1), { includeUncommitted: true })).toMatchObject({ state: "indeterminate" });
       await expect(restarted.results.markCommitted(fixtureRequestId(1), { summary: "late" })).rejects.toMatchObject({ kind: "conflict" });
-      if (finished) break;
+      if (finished) finishedAt = crashAt;
     }
+    expect(finishedAt, "the sweep finished within the crash-point bound").toBeGreaterThanOrEqual(0);
+  });
+
+  it("an indeterminate transition in a full store makes room and stays consistent under a crash at any write", async () => {
+    let finishedAt = -1;
+    for (let crashAt = 0; crashAt < MAX_CRASH_POINTS && finishedAt < 0; crashAt += 1) {
+      const storage = new StrictMemoryStorage();
+      const keys = fixtureStoreKeys();
+      const clock = { now: START };
+      const cap = await pendingBesideCommitted(storage, keys, clock);
+      const full = open(storage, keys, clock, cap);
+      clock.now = START + MINUTE + PENDING_GRACE_MS;
+      const finished = await withCrashAt(storage, crashAt, () => full.results.sweep());
+      await expectCrashConsistent(storage, keys.resultsKey, `crash before write ${crashAt}`, cap);
+      const restarted = open(storage, keys, clock, cap);
+      await restarted.oplog.ensure();
+      await restarted.results.ensure();
+      await restarted.results.sweep();
+      await expectAgreement(storage, keys.resultsKey, `recovered after write ${crashAt}`);
+      expect(indexTotal((await raw(storage, keys.resultsKey)).index)).toBeLessThanOrEqual(cap);
+      expect(await restarted.results.get(fixtureRequestId(1), { includeUncommitted: true })).toMatchObject({ state: "indeterminate" });
+      if (finished) finishedAt = crashAt;
+    }
+    expect(finishedAt, "the sweep finished within the crash-point bound").toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("results store byte cap", () => {
+  it("a pending object that becomes indeterminate in an exactly full store keeps the index within the cap", async () => {
+    const storage = new StrictMemoryStorage();
+    const keys = fixtureStoreKeys();
+    const clock = { now: START };
+    const cap = await pendingBesideCommitted(storage, keys, clock);
+    const { results } = open(storage, keys, clock, cap);
+    clock.now = START + MINUTE + PENDING_GRACE_MS;
+    await results.sweep();
+    const { index } = await raw(storage, keys.resultsKey);
+    expect(indexTotal(index)).toBeLessThanOrEqual(cap);
+    expect(await results.get(fixtureRequestId(1), { includeUncommitted: true })).toMatchObject({ state: "indeterminate" });
+    // The committed object was the only other entry, so it made the room.
+    expect(await results.get(fixtureRequestId(2), { includeUncommitted: true })).toBeNull();
   });
 });
 
