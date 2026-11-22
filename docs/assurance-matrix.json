@@ -343,6 +343,20 @@
       "next": "Unattended-reboot drill with as-uid differential after the remaining safe-mode surfacing and lease-TTL fixes land; sustained-operation drill measured in hours; the TTL-expiry leg through the real CLI enable path once W7-1 closes; a second macOS host or OS version; p99 overhead capture; and hardware boot-verification of the GUI host-app launch and the #596 crash fix on a fresh reboot."
     },
     {
+      "claim": "No unrequested network contact (observed by packet capture)",
+      "platform": "Linux (Docker container on one x86-64 host); npm package 1.8.4 only",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "docs/audit/zero-outbound-linux-drill-2026-11-20.md",
+          "href": "docs/audit/zero-outbound-linux-drill-2026-11-20.md"
+        }
+      ],
+      "evidence_text": "[docs/audit/zero-outbound-linux-drill-2026-11-20.md](docs/audit/zero-outbound-linux-drill-2026-11-20.md)",
+      "bounds": "The proven claim is exactly: with every packet recorded while Sanctuary 1.8.4 installed, set up, protected a Claude Code configuration and served three agent sessions, three times over on Linux in Docker, no network connection opened and no name was looked up outside the install itself, an update check the user asked for, and npm registry contact made before the server's first answer in sessions started through npx. Basis, per the 2026-11-20 drill record (the Evidence link): three runs of eight steps each (install from the registry, install from a local copy, `sanctuary init --no-pin`, `sanctuary protect --claude-code`, two sessions started through npx with 120 and 300 second idle periods, one session started directly, `sanctuary check-updates`) plus a capture probe, 25 captures in all, every one complete with all planted controls seen; verdict PASS with 0 findings; a second reader from a different model family decoded all 25 raw captures itself and agreed. LIMITS, each part of the claim: (1) ONE PLATFORM: Linux in Docker on one x86-64 host; macOS, Windows and host-level desktop behaviour are not evidenced. (2) ONE VERSION: the 1.8.4 bytes only; a later release is not covered until it has its own run. (3) COOPERATIVE-ONLY SETUP: `init --no-pin` with no Castle Wall root helper; nothing about the Castle Wall install path. (4) REMEMBER AND RECALL REFUSED: on 1.8.4 the default policy refuses `sanctuary_remember` and `sanctuary_recall`, so the drill shows the refusal path opens no connection and does not cover the storage write and read path, which did not run. (5) NPX: in sessions started through npx the registry was contacted before the server's first answer, and the capture cannot tell which process sent it; after that answer there was no new connection and no data byte, while the already-open registry connection sent only empty acknowledgements and a close, so say no new connection and no data after the server started, never no packet at all. (6) DOES NOT, NOT CANNOT: this is observed behaviour, not structural inability to connect; the structural claim is Castle Wall egress enforcement, the separate rows above, and this row never stands in for it. Also not covered: uninstall (no uninstall step ran); anything after the observation windows (minutes, no reboot or days of use); a real Claude Code process or a model in the loop; tools other than those the sessions called; federation or peer configuration; and what travelled inside the encrypted install and update-check connections.",
+      "next": "The same drill rerun on each later release before it inherits this row, first on a release that serves `sanctuary_remember` and `sanctuary_recall` so the storage path is covered; an uninstall step; the equivalent capture on macOS and on Windows; a run with the Castle Wall install path in place; and longer observation windows including a reboot."
+    },
+    {
       "claim": "Per-agent network stop",
       "platform": "macOS",
       "status": "partial",
