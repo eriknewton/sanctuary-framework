@@ -1,3 +1,4 @@
+// fail-before-exempt: pins the build-root inventory, which gains only the local job worker entry.
 // Pins shared validation and parser-depth imports while retaining inert dispatch and native byte boundaries.
 // W-JOIN-BOUNDS
 import {it,expect} from "vitest";
