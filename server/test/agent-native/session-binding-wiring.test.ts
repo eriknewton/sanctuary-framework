@@ -107,12 +107,39 @@ it("a remember whose boot decision cannot be read is refused, stores nothing, an
   const result = await b.call("sanctuary_remember", { key: "unreadable-boot", value: "v" });
   armed = false;
   expect(result).toEqual(expectedRefusal());
-  // Today the cause is handler_error; the deferred-causes debt marked in tool-outcome.ts gives it its own cause later.
-  expect(ledger.mock.calls.at(-1)).toEqual(["handler_error", expect.objectContaining({ tool: "sanctuary_remember" })]);
+  // The same unresolved-origin throw reaches the handler stage through remember, so the operator sees its own cause.
+  expect(ledger.mock.calls.at(-1)).toEqual(["origin_unresolved", expect.objectContaining({ tool: "sanctuary_remember" })]);
   expect(await writes()).toBe(writesBefore);
   for (const namespace of await b.storage.listNamespaces()) {
     expect(await b.storage.read(namespace, "unreadable-boot"), namespace).toBeNull();
   }
+});
+
+it("a state_write whose origin cannot be established is recorded for the operator as an unresolved origin", async () => {
+  // Test-only composition: the real resolver, wrapped so its boot decision becomes unreadable once armed.
+  const realResolve = sessionBinding.resolveSessionBinding;
+  let armed = false;
+  vi.spyOn(sessionBinding, "resolveSessionBinding").mockImplementation(async (options) => {
+    const resolver = await realResolve(options);
+    return Object.freeze({
+      cooperative: () => resolver.cooperative(),
+      primitive: () => resolver.primitive(),
+      get bootState() {
+        if (armed) throw new Error("boot decision unreadable");
+        return resolver.bootState;
+      },
+    });
+  });
+  const b = await boot();
+  await b.create();
+  const ledger = vi.spyOn(DenialLedger.prototype, "record");
+  armed = true;
+  const result = await b.call("state_write", { namespace: "origin-notes", key: "unresolved", value: "v" });
+  armed = false;
+  expect(result).toEqual(expectedRefusal());
+  expect(ledger.mock.calls.at(-1)).toEqual(["origin_unresolved", expect.objectContaining({ tool: "state_write" })]);
+  expect(await b.storage.read("origin-notes", "unresolved")).toBeNull();
+  expect(await b.storage.list("origin-notes")).toEqual([]);
 });
 
 it("an unbound write stays operator", async () => {

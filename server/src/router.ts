@@ -30,6 +30,7 @@ import {
 import {
   argumentStageCause,
   classifyToolOutcome,
+  handlerStageCause,
   proxiedOutcomeFact,
   refusedResultFacts,
 } from "./tool-outcome.js";
@@ -475,7 +476,7 @@ export function createServer(
           }));
           break;
         case "state_HANDLER":
-          recordDenial("handler_error", denialInput(call, {
+          recordDenial(handlerStageCause(err), denialInput(call, {
             error: err,
             linkedRef: await recordToolError(call, err),
           }));

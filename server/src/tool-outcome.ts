@@ -14,6 +14,7 @@
 import { isNamespaceDiscoveryLimitError } from "./storage/interface.js";
 import type { DenialCause } from "./agent-native/denial-ledger.js";
 import { isSessionNotBoundError } from "./agent-native/session-not-bound.js";
+import { isOriginUnresolvedError } from "./cognitive/origin-unresolved.js";
 
 export type ToolOutcome = "success" | "refusal";
 
@@ -317,12 +318,22 @@ export function classifyToolOutcome(toolName: string, result: unknown, tool?: ob
  * Must match the argument-stage cause entries of DENIAL_CAUSES in
  * agent-native/denial-ledger.ts; narrowing a cause here needs no router edit.
  */
-// DEBT(AGENT-SEAT-CI-DEFERRED-CAUSES): two causes await producers: unresolved origin for a write,
-// and pre-gate events, audit search and compound refusals in a session with no identity.
+// DEBT(AGENT-SEAT-CI-DEFERRED-CAUSES): causes for call-scoped cursor and audit refusals await their producers in a later slice.
 // A session with no bound identity is recorded as session_not_bound; a handle the session does not own stays pre_gate_argument_refused.
 export function argumentStageCause(error: unknown): Extract<DenialCause, "export_capacity" | "pre_gate_argument_refused" | "session_not_bound"> {
   return isSessionNotBoundError(error) ? "session_not_bound"
     : isNamespaceDiscoveryLimitError(error) ? "export_capacity" : "pre_gate_argument_refused";
+}
+
+/**
+ * The operator-side cause of a handler-stage throw, chosen by error type and
+ * never by message text. An unresolved write origin must match
+ * isOriginUnresolvedError in cognitive/origin-unresolved.ts, and both causes
+ * must match DENIAL_CAUSES in agent-native/denial-ledger.ts.
+ */
+export function handlerStageCause(error: unknown): Extract<DenialCause, "handler_error" | "origin_unresolved"> {
+  // A write whose origin cannot be established is its own operator-side cause, not a generic handler fault.
+  return isOriginUnresolvedError(error) ? "origin_unresolved" : "handler_error";
 }
 
 /**

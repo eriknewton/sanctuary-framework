@@ -18,7 +18,9 @@ import {
   LEDGER_CLOSE_DEADLINE_MS,
   type DenialRecorder,
 } from "../../src/agent-native/denial-ledger.js";
-import { refusalResult } from "../../src/agent-native/safety-base.js";
+import { refusalResult, SessionIdentityError, SessionNotBoundError } from "../../src/agent-native/safety-base.js";
+import { argumentStageCause, handlerStageCause } from "../../src/tool-outcome.js";
+import { OriginUnresolvedError } from "../../src/cognitive/origin-unresolved.js";
 import { AuditLog, AuditPersistenceError, type AuditEntryInput } from "../../src/operational/audit-log.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -419,14 +421,26 @@ describe("denial ledger call sites", () => {
     expect(ledgerCalls).toEqual([expect.stringMatching(/router\.ts: cause$/)]);
     expect(sites.length).toBeGreaterThan(0);
     for (const site of sites) {
-      if (site.first.startsWith("argumentStageCause(")) continue;
+      if (site.first.startsWith("argumentStageCause(") || site.first.startsWith("handlerStageCause(")) continue;
       expect(site.first, site.file).toMatch(/^"[a-z_]+"$/);
       expect(causes.has(site.first.slice(1, -1)), `${site.file}: ${site.first}`).toBe(true);
     }
-    // The argument-stage helper returns only list literals.
-    const helper = readFileSync(join(SRC_DIR, "tool-outcome.ts"), "utf8").match(/export function argumentStageCause[\s\S]*?\n}\n/)![0];
-    const returned = [...helper.matchAll(/"([a-z_]+)"/g)].map((match) => match[1]!);
-    expect(returned.length).toBeGreaterThan(0);
-    for (const literal of returned) expect(causes.has(literal), literal).toBe(true);
+    // The argument-stage and handler-stage helpers return only list literals.
+    for (const name of ["argumentStageCause", "handlerStageCause"]) {
+      const helper = readFileSync(join(SRC_DIR, "tool-outcome.ts"), "utf8").match(new RegExp(`export function ${name}[\\s\\S]*?\\n}\\n`))![0];
+      const returned = [...helper.matchAll(/"([a-z_]+)"/g)].map((match) => match[1]!);
+      expect(returned.length, name).toBeGreaterThan(0);
+      for (const literal of returned) expect(causes.has(literal), literal).toBe(true);
+    }
+  });
+
+  it("the handler stage records an unresolved origin as its own cause and every other handler error as handler_error", () => {
+    expect(handlerStageCause(new OriginUnresolvedError())).toBe("origin_unresolved");
+    expect(handlerStageCause(new Error("write origin could not be determined"))).toBe("handler_error");
+  });
+
+  it("the argument stage still records a session with no identity as session_not_bound", () => {
+    expect(argumentStageCause(new SessionNotBoundError())).toBe("session_not_bound");
+    expect(argumentStageCause(new SessionIdentityError())).toBe("pre_gate_argument_refused");
   });
 });

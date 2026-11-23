@@ -330,6 +330,13 @@ export function createAgentNativeCooperativeTools(
     return toolResult(fixedDenial(auditRef, remediation, retryAfter));
   }
 
+  function requireBoundSessionArgs(args: Record<string, unknown>): Record<string, unknown> {
+    // A bound-only tool refuses before the gate when the session has no identity, so no approval request reaches the operator.
+    active();
+    // The gate evaluates the handler's own arguments, unchanged.
+    return args;
+  }
+
   async function rememberPrimitiveArgs(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const namespace = await facadeMemoryNamespace(args);
     const opts = (args.opts as Record<string, unknown> | undefined) ?? {};
@@ -901,6 +908,7 @@ export function createAgentNativeCooperativeTools(
       name: COOPERATIVE_TOOL_NAMES.eventsOpenCursor,
       description: "Open a paginated cursor over your own redacted local audit events, optionally filtered by operation. Use before sanctuary_events_read to page through recent activity. Returns { cursor, audit_ref }. Bound to your identity; cross-agent and callback/URL filters are refused.",
       tool_class: "read",
+      approvalTargetArgs: requireBoundSessionArgs,
       inputSchema: {
         type: "object",
         properties: {
@@ -936,6 +944,7 @@ export function createAgentNativeCooperativeTools(
       name: COOPERATIVE_TOOL_NAMES.eventsRead,
       description: "Read the next page of redacted events from a cursor opened with sanctuary_events_open_cursor (default 10, max 25 per call). Returns { events, next_cursor, audit_ref }. Only your own identity's events are visible; capped at 10 reads per cursor, then rate-limited.",
       tool_class: "read",
+      approvalTargetArgs: requireBoundSessionArgs,
       inputSchema: {
         type: "object",
         properties: {
@@ -990,6 +999,7 @@ export function createAgentNativeCooperativeTools(
       name: COOPERATIVE_TOOL_NAMES.eventsClose,
       description: "Release an event cursor opened with sanctuary_events_open_cursor. Call when done paging to free the cursor. Returns { closed: true, audit_ref }.",
       tool_class: "write",
+      approvalTargetArgs: requireBoundSessionArgs,
       inputSchema: { type: "object", properties: { cursor: { type: "string" } }, required: ["cursor"] },
       handler: async (args) => {
         try {
@@ -1009,6 +1019,7 @@ export function createAgentNativeCooperativeTools(
       name: COOPERATIVE_TOOL_NAMES.auditSearch,
       description: "Search your own recent audit entries for a text match. Scope is always own_signed and a bound session identity is required. Only the operation name and a small allowlist of detail fields are searched, over a bounded window of your most recent entries, and the number of matches is capped, so this is not a complete history search. Each match gives timestamp, operation, result, and a verification label saying whether the full chain or only its post-split part was verified. Refuses when the audit chain reports integrity findings. Use to find when a recent operation ran and how it ended.",
       tool_class: "read",
+      approvalTargetArgs: requireBoundSessionArgs,
       inputSchema: {
         type: "object",
         properties: {
@@ -1094,6 +1105,7 @@ export function createAgentNativeCooperativeTools(
       name: COOPERATIVE_TOOL_NAMES.compoundExecute,
       description: "Execute a short plan of sanctuary_remember, sanctuary_recall, sanctuary_hide and sanctuary_forget steps in order, in one call. Tier 1 under the default policy: requires operator approval for the call itself. Each step is { tool, args } and gets a step_id by position (step-1, step-2, and so on). Every sanctuary_forget step also needs its own operator approval, passed in approvals keyed by step_id and bound to this exact plan and step. Step approvals are reserved before any step runs, and if one is missing or does not match, no step runs. Completed steps are not rolled back: if a later step fails, the result is partial_failed with completed_steps and failed_step.",
       tool_class: "write",
+      approvalTargetArgs: requireBoundSessionArgs,
       inputSchema: {
         type: "object",
         properties: {
