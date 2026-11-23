@@ -1,4 +1,4 @@
-// fail-before-exempt: pins that every content tool refuses or skips the local store names before storage access.
+// fail-before-exempt: passes the origin every state write now requires; still pins that every content tool refuses or skips the local store names before storage access.
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";

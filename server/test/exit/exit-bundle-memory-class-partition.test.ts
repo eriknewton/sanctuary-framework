@@ -1,4 +1,4 @@
-// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
+// fail-before-exempt: operator writes in the fixture now come from an unbound session, because a state write must establish its origin; asserts no new behaviour.
 /**
  * Exit machinery Slice 1 — conservative partition wired into the real exit
  * bundle export.

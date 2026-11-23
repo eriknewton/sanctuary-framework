@@ -1,4 +1,4 @@
-// fail-before-exempt: new state-entry opener module, no base behaviour; the state store's read is the parity reference.
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour beyond the opener parity it already pinned.
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { encrypt } from "../../src/core/encryption.js";
