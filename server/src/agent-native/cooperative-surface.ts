@@ -18,6 +18,8 @@ import { observeProtections } from "./protection-observations.js";
 import { composeProtectionLayers, summarizeProtectionLayers } from "./protection-layers.js";
 import {
   COOPERATIVE_CAPABILITIES,
+  UNBOUND_OPERATOR_ACTION,
+  UNCONFIRMED_OPERATOR_ACTION,
 } from "./capabilities-catalog.js";
 import {
   ApprovalProofStore,
@@ -30,7 +32,10 @@ import {
   OpaqueNamespaceRegistry,
   resolveActiveSessionIdentity,
   SessionIdentityError,
+  SessionNotBoundError,
   sha256,
+  UNBOUND_SESSION,
+  type ActiveSessionIdentity,
   type SessionBinding,
 } from "./safety-base.js";
 import {
@@ -39,6 +44,7 @@ import {
   type CompoundExecutableToolName,
 } from "./tool-names.js";
 
+// The catalog half must match UNBOUND_CATALOG_TOOLS in capabilities-catalog.ts.
 const UNBOUND_COOPERATIVE_TOOLS = new Set<string>([
   COOPERATIVE_TOOL_NAMES.help, COOPERATIVE_TOOL_NAMES.capabilities,
   COOPERATIVE_TOOL_NAMES.whoAmI, COOPERATIVE_TOOL_NAMES.activeProtections,
@@ -48,6 +54,17 @@ const BOUND_ONLY_COOPERATIVE_TOOLS = new Set<string>(
 );
 
 const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
+
+/** One read of the session, named by what it establishes. */
+type SessionView =
+  | { state: "session_BOUND"; identity: ActiveSessionIdentity; binding: SessionBinding; binding_source: SessionBinding["binding_source"] }
+  | { state: "session_NOT_BOUND"; error: SessionIdentityError }
+  | { state: "session_UNCONFIRMED"; error: SessionIdentityError };
+
+/** What the operator should do for a session with no confirmed identity; the sentences must match capabilities-catalog.ts. */
+function operatorActionFor(view: Exclude<SessionView, { state: "session_BOUND" }>): string {
+  return view.state === "session_NOT_BOUND" ? UNBOUND_OPERATOR_ACTION : UNCONFIRMED_OPERATOR_ACTION;
+}
 
 type PrimitiveCaller = (
   name: string,
@@ -125,8 +142,24 @@ export function createAgentNativeCooperativeTools(
     return JSON.parse(result.content[0]?.text ?? "{}") as Record<string, unknown>;
   };
 
-  function active() {
-    return resolveActiveSessionIdentity(options.currentSessionBinding());
+  function sessionView(): SessionView {
+    // The three session-reporting tools read one predicate, so none claims an identity the others deny.
+    const binding = options.currentSessionBinding();
+    try {
+      const identity = resolveActiveSessionIdentity(binding);
+      return { state: "session_BOUND", identity, binding: binding!, binding_source: binding!.binding_source };
+    } catch (error) {
+      if (error instanceof SessionNotBoundError) return { state: "session_NOT_BOUND", error };
+      if (error instanceof SessionIdentityError) return { state: "session_UNCONFIRMED", error };
+      throw error;
+    }
+  }
+
+  function active(): ActiveSessionIdentity {
+    const view = sessionView();
+    if (view.state === "session_BOUND") return view.identity;
+    // The original error is rethrown, so argumentStageCause in tool-outcome.ts keeps its cause.
+    throw view.error;
   }
 
   async function activeMemoryNamespace(): Promise<string> {
@@ -802,19 +835,26 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.capabilities,
-      description: "Return the start-here catalog of Sanctuary's cooperative tools: for each tool, what it does and when to reach for it. Read-only, takes no arguments. Call this to discover what cooperative memory/identity/audit tools are available and route your work through them instead of ad-hoc state. The same catalog is also delivered in the MCP server instructions at connect time; this tool re-serves it on demand. Returns { capabilities: [{ tool, does, when }], audit_ref }.",
+      description: "Return the start-here catalog of Sanctuary's cooperative tools: for each tool, what it does and when to reach for it. Read-only, takes no arguments. Call this to discover what cooperative memory/identity/audit tools are available and route your work through them instead of ad-hoc state. The same catalog is also delivered in the MCP server instructions at connect time; this tool re-serves it on demand. Returns { session: { bound, binding_source } when bound or { bound, operator_action } when not, capabilities: [{ tool, does, when, available }], audit_ref }.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         try {
+          const view = sessionView();
+          const bound = view.state === "session_BOUND";
           const auditRef = await audit("sanctuary_capabilities", {
             tool_count: COOPERATIVE_CAPABILITIES.length,
           });
           return toolResult({
+            session: view.state === "session_BOUND"
+              ? { bound: true, binding_source: view.binding_source }
+              : { bound: false, operator_action: operatorActionFor(view) },
             capabilities: COOPERATIVE_CAPABILITIES.map((entry) => ({
               tool: entry.tool,
               does: entry.does,
               when: entry.when,
+              // Availability is computed from the same session read as the session field.
+              available: bound || UNBOUND_COOPERATIVE_TOOLS.has(entry.tool),
             })),
             audit_ref: auditRef,
           });
@@ -825,16 +865,25 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.whoAmI,
-      description: "Return the disclosable identity facts for the current session: label, did, active-identity fingerprint, and memory namespace handle. Use to confirm which sovereign identity you are operating as. Read-only; private keys are never included.",
+      description: "Return whether this session has a Sanctuary identity and how it was bound, with the disclosable identity facts when it does: label, did, active-identity fingerprint and memory namespace handle. With no identity it answers bound false and says what to tell your operator. A default binding lasts until this server process exits. Read-only; private keys are never included.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         try {
-          const activeIdentity = active();
+          const view = sessionView();
+          if (view.state !== "session_BOUND") {
+            // arm_UNBOUND: an unbound answer carries no identity fact and no refusal marker, so the router passes it as a success.
+            const auditRef = await audit("sanctuary_who_am_i");
+            return toolResult({ bound: false, operator_action: operatorActionFor(view), audit_ref: auditRef });
+          }
+          // arm_BOUND: every fact comes from the one session read above.
+          const activeIdentity = view.identity;
           const identity = options.identityManager.get(activeIdentity.identity_id);
           if (!identity) return deny("audit:sanctuary_who_am_i");
           const auditRef = await audit("sanctuary_who_am_i");
           return toolResult({
+            bound: true,
+            binding_source: view.binding_source,
             label: identity.label,
             active_identity_fingerprint: activeIdentity.requester_identity_fingerprint,
             memory_namespace_handle:
@@ -843,18 +892,21 @@ export function createAgentNativeCooperativeTools(
             audit_ref: auditRef,
           });
         } catch {
+          // arm_FAULT: a session read that fails for a reason other than identity gives the fixed denial.
           return deny("audit:sanctuary_who_am_i");
         }
       },
     },
     {
       name: COOPERATIVE_TOOL_NAMES.activeProtections,
-      description: "List every layer of Sanctuary with its evidence-based status, including layers that are off, not built, or unknown. Use to ask what is protecting this session right now. Read-only; returns { guarantees, layers, summary, audit_ref }. The guarantees field preserves legacy flags; layers and the one-line-per-layer summary report observed status.",
+      description: "List every layer of Sanctuary with its evidence-based status, including layers that are off, not built, or unknown. Use to ask what is protecting this session right now. Read-only; returns { guarantees, layers, summary, audit_ref }. The guarantees field preserves legacy flags; layers and the one-line-per-layer summary report observed status. Answers in a session with no identity; the identity layer then reads unknown.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         try {
-          const identity = active();
+          const view = sessionView();
+          // A session with no confirmed identity is observed as unbound, so the identity layer reads unknown.
+          const observedBinding = view.state === "session_BOUND" ? view.binding : UNBOUND_SESSION;
           const auditRef = await audit("sanctuary_active_protections");
           // Must match the dashboard accessor: this key pins broker heartbeat signatures, not agent identity.
           const brokerKey = await Promise.resolve().then(() => options.resolveBrokerProducerKey?.()).catch(() => null);
@@ -878,7 +930,7 @@ export function createAgentNativeCooperativeTools(
           // Must match observeProtections in protection-observations.ts: supply raw consumers and qualified reads.
           const layers = composeProtectionLayers(observeProtections({
             get identityManager() { return options.identityManager; },
-            currentSessionBinding: () => identity,
+            currentSessionBinding: () => observedBinding,
             get stateStore() { return options.stateStore; },
             get responseScreen() { return options.responseScreen; },
           }, {
@@ -1103,7 +1155,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.compoundExecute,
-      description: "Execute a short plan of sanctuary_remember, sanctuary_recall, sanctuary_hide and sanctuary_forget steps in order, in one call. Tier 1 under the default policy: requires operator approval for the call itself. Each step is { tool, args } and gets a step_id by position (step-1, step-2, and so on). Every sanctuary_forget step also needs its own operator approval, passed in approvals keyed by step_id and bound to this exact plan and step. Step approvals are reserved before any step runs, and if one is missing or does not match, no step runs. Completed steps are not rolled back: if a later step fails, the result is partial_failed with completed_steps and failed_step.",
+      description: "Execute a short plan of sanctuary_remember, sanctuary_recall, sanctuary_hide and sanctuary_forget steps in order, in one call. Tier 1 under the default policy: requires operator approval for the call itself. Each step is { tool, args } and gets a step_id by position (step-1, step-2, and so on). Every sanctuary_forget step also needs its own operator approval, passed in approvals keyed by step_id and bound to this exact plan and step. Step approvals are reserved before any step runs, and if one is missing or does not match, no step runs. Completed steps are not rolled back: if a step fails, the call returns the standard refusal, and the steps before it may have taken effect; use sanctuary_recall to check your current memory state.",
       tool_class: "write",
       approvalTargetArgs: requireBoundSessionArgs,
       inputSchema: {

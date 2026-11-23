@@ -85,7 +85,8 @@ import {
   ApprovalProofStore,
 } from "./agent-native/safety-base.js";
 import { createAgentNativeCooperativeTools } from "./agent-native/cooperative-surface.js";
-import { buildServerInstructions } from "./agent-native/capabilities-catalog.js";
+import { buildServerInstructions, type InstructionsSession } from "./agent-native/capabilities-catalog.js";
+import type { SessionBindingState } from "./agent-native/session-binding-state.js";
 import { createSHRTools } from "./shr/tools.js";
 import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
@@ -2463,7 +2464,7 @@ export async function createSanctuaryServer(options?: {
     toolCallTrapRuntime,
     currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
     currentSessionBinding: sessionBindingAccessors.cooperative,
-    instructions: buildServerInstructions(),
+    instructions: buildServerInstructions(instructionsSessionFor(sessionBindingAccessors.bootState())),
   });
   if (proxyRouter) {
     enableToolListChangedNotifications(server);
@@ -2751,6 +2752,28 @@ const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "zk_range_verify",
   "zk_verify",
 ] as const);
+
+/** The instructions variant is chosen once from the frozen boot decision; who-am-I and capabilities are the live answers. */
+function instructionsSessionFor(state: SessionBindingState): InstructionsSession {
+  // Must match SessionBindingState in agent-native/session-binding-state.ts: a new state fails to compile here until it is mapped.
+  switch (state) {
+    case "state_BOUND_NAMED":
+      return "named";
+    case "state_BOUND_SOLE_IDENTITY":
+      return "sole";
+    case "state_UNBOUND_FLAG_OFF":
+    case "state_UNBOUND_NO_IDENTITY":
+    case "state_UNBOUND_SEVERAL_IDENTITIES":
+    case "state_UNBOUND_UNPROVEN":
+    case "state_NAMED_EMPTY":
+    case "state_NAMED_UNRESOLVED":
+      return "unbound";
+    default: {
+      const exhaustive: never = state;
+      return exhaustive;
+    }
+  }
+}
 
 function classifyMcpTools(tools: ToolDefinition[]): ToolDefinition[] {
   return tools.map((tool) => {

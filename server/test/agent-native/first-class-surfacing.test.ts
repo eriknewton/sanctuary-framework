@@ -1,5 +1,9 @@
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
@@ -25,7 +29,7 @@ import {
   buildServerInstructions,
 } from "../../src/agent-native/capabilities-catalog.js";
 import { createSanctuaryServer } from "../../src/index.js";
-import { DEFAULT_POLICY, enforceForcedTiers } from "../../src/principal-policy/loader.js";
+import { DEFAULT_POLICY, enforceForcedTiers, generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 import {
   CATALOG_COOPERATIVE_TOOL_NAMES,
@@ -111,8 +115,8 @@ describe("first-class tool surfacing", () => {
       }
     });
 
-    it("builds MCP server instructions naming the discovery entrypoints and every catalog tool", () => {
-      const instructions = buildServerInstructions();
+    it.each(["named", "sole", "unbound"] as const)("builds MCP server instructions naming the discovery entrypoints and every catalog tool (%s)", (variant) => {
+      const instructions = buildServerInstructions(variant);
       expect(instructions).toContain(COOPERATIVE_TOOL_NAMES.help);
       expect(instructions).toContain(COOPERATIVE_TOOL_NAMES.capabilities);
       for (const entry of COOPERATIVE_CAPABILITIES) {
@@ -143,8 +147,8 @@ describe("first-class tool surfacing", () => {
       expect(instructions).not.toContain("\u2014");
     });
 
-    it("the instructions carry the refusal line before the bounds paragraph", () => {
-      const instructions = buildServerInstructions();
+    it.each(["named", "sole", "unbound"] as const)("the instructions carry the refusal line before the bounds paragraph (%s)", (variant) => {
+      const instructions = buildServerInstructions(variant);
       // Must match REFUSAL_INSTRUCTION_LINE in agent-native/capabilities-catalog.ts.
       const line = "A refusal does not say why. If a call is refused, do not repeat it as it is: change the request, or tell your operator what you were trying to do.";
       expect(instructions).toContain(`\n${line}\n`);
@@ -252,4 +256,146 @@ describe("first-class tool surfacing", () => {
       }
     });
   });
+});
+
+// The session lines and lead are written out here, byte for byte, never imported.
+const NAMED_SESSION_LINE = "Session: bound to the identity your operator named at launch. Call sanctuary_who_am_i to see it.";
+const SOLE_SESSION_LINE = "Session: bound by default to this fortress's only identity, because your operator enabled default binding. Notes you save are marked unattributed. Call sanctuary_who_am_i to see it.";
+const UNBOUND_SESSION_LINE = "Session: no identity. sanctuary_help, sanctuary_capabilities, sanctuary_who_am_i and sanctuary_active_protections answer; the other cooperative tools refuse. sanctuary_who_am_i says what to tell your operator.";
+const UNBOUND_LEAD = "Sanctuary offers encrypted, audited working memory and identity tools. This session has no identity yet, so most of them are not available.";
+const BOUND_LEAD = [
+  "Sanctuary gives you sovereign, encrypted, audited working memory and identity tools.",
+  "Route memory and identity work through these cooperative tools rather than ad-hoc state: they encrypt at rest, bind to your identity, and write an append-only audit trail you can query.",
+];
+const NEEDS_IDENTITY = " Needs a session identity.";
+const BOUND_ONLY_CATALOG = ["sanctuary_remember", "sanctuary_recall", "sanctuary_hide", "sanctuary_forget", "sanctuary_events_open_cursor", "sanctuary_audit_search"];
+const ANSWERING_CATALOG = ["sanctuary_help", "sanctuary_who_am_i", "sanctuary_active_protections"];
+
+describe("instructions follow the boot decision", () => {
+  let cleanups: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    try { for (const cleanup of cleanups.reverse()) await cleanup(); }
+    finally { cleanups = []; vi.unstubAllEnvs(); }
+  });
+
+  async function fortress() {
+    vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", undefined);
+    const home = await createTempHome("sanctuary-instructions");
+    cleanups.push(() => home.cleanup());
+    await mkdir(home.defaultFortressPath, { recursive: true });
+    await writeFile(join(home.defaultFortressPath, "principal-policy.yaml"),
+      generateDefaultPolicyYaml().replace(/approval_channel:\n  type: \w+/, "approval_channel:\n  type: callback"));
+    return { home, storage: new MemoryStorage() };
+  }
+
+  async function boot(storage: MemoryStorage) {
+    const approve = async () => ({ decision: "approve" as const, decided_at: new Date().toISOString(), decided_by: "human" as const });
+    const app = await createSanctuaryServer({ storage, passphrase: TEST_PASSPHRASE, approvalCallback: approve });
+    const client = new Client({ name: "instructions-witness", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await app.server.connect(serverTransport);
+    await client.connect(clientTransport);
+    let closed = false;
+    const close = async () => {
+      if (closed) return;
+      closed = true;
+      try { await client.close(); } finally { await app.cleanup(); }
+    };
+    cleanups.push(close);
+    const call = async (name: string, args: Record<string, unknown> = {}) => {
+      const result = await client.callTool({ name, arguments: args }) as { content: Array<{ text: string }> };
+      return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+    };
+    return { app, client, call, close };
+  }
+
+  async function createIdentity(storage: MemoryStorage): Promise<string> {
+    const first = await boot(storage);
+    const id = (await first.call("identity_create", { label: "instructions-subject" })).identity_id as string;
+    await first.close();
+    return id;
+  }
+
+  async function enableDefaultBinding(home: Awaited<ReturnType<typeof createTempHome>>) {
+    const configPath = join(home.defaultFortressPath, "sanctuary.json");
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    await writeFile(configPath, JSON.stringify({ ...config, session_binding: { sole_identity: true } }));
+  }
+
+  function lines(text: string): string[] {
+    return text.split("\n");
+  }
+
+  it("unbound instructions say the session has no identity, mark each bound-only catalog entry as needing one, and send the agent to sanctuary_who_am_i", async () => {
+    const { storage } = await fortress();
+    const b = await boot(storage);
+    const instructions = b.client.getInstructions()!;
+    const all = lines(instructions);
+    expect(all[0]).toBe(UNBOUND_LEAD);
+    expect(all).toContain(UNBOUND_SESSION_LINE);
+    expect(all.indexOf(UNBOUND_SESSION_LINE)).toBeLessThan(all.indexOf("Start here:"));
+    for (const line of BOUND_LEAD) expect(all).not.toContain(line);
+    for (const tool of BOUND_ONLY_CATALOG) {
+      const entry = all.find((line) => line.startsWith(`- ${tool}: `));
+      expect(entry, tool).toBeDefined();
+      expect(entry!.endsWith(NEEDS_IDENTITY), tool).toBe(true);
+    }
+    for (const tool of ANSWERING_CATALOG) {
+      const entry = all.find((line) => line.startsWith(`- ${tool}: `));
+      expect(entry, tool).toBeDefined();
+      expect(entry!.endsWith(NEEDS_IDENTITY), tool).toBe(false);
+    }
+    expect(instructions.toLowerCase()).not.toContain("block");
+    expect(instructions).not.toContain("\u2014");
+  });
+
+  it("sole-bound instructions name default binding and unattributed notes, and make no claim about other processes", async () => {
+    const { home, storage } = await fortress();
+    await createIdentity(storage);
+    await enableDefaultBinding(home);
+    const b = await boot(storage);
+    const instructions = b.client.getInstructions()!;
+    const all = lines(instructions);
+    expect(all.slice(0, 2)).toEqual(BOUND_LEAD);
+    expect(all).toContain(SOLE_SESSION_LINE);
+    expect(all).not.toContain(UNBOUND_SESSION_LINE);
+    expect(instructions).not.toContain(NEEDS_IDENTITY);
+    expect(instructions.toLowerCase()).not.toContain("share");
+    expect(instructions.toLowerCase()).not.toContain("every process");
+    expect(instructions.toLowerCase()).not.toContain("block");
+    expect(instructions).not.toContain("\u2014");
+  });
+
+  it("named instructions name the launch identity", async () => {
+    const { storage } = await fortress();
+    const id = await createIdentity(storage);
+    vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", id);
+    const b = await boot(storage);
+    const instructions = b.client.getInstructions()!;
+    const all = lines(instructions);
+    expect(all.slice(0, 2)).toEqual(BOUND_LEAD);
+    expect(all).toContain(NAMED_SESSION_LINE);
+    expect(all).not.toContain(UNBOUND_SESSION_LINE);
+    expect(instructions).not.toContain(NEEDS_IDENTITY);
+    expect(instructions.toLowerCase()).not.toContain("block");
+    expect(instructions).not.toContain("\u2014");
+  });
+
+  it.each(["flag off with no launch variable", "launch variable naming no identity"] as const)(
+    "instructions keep the boot variant while who-am-I and capabilities follow the live binding (%s)",
+    async (start) => {
+      const { storage } = await fortress();
+      if (start === "launch variable naming no identity") vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", "identity-that-does-not-exist");
+      const b = await boot(storage);
+      const first = b.client.getInstructions()!;
+      expect(lines(first)).toContain(UNBOUND_SESSION_LINE);
+      const id = (await b.call("identity_create", { label: "late-subject" })).identity_id as string;
+      vi.stubEnv("SANCTUARY_SESSION_IDENTITY_ID", id);
+      const who = await b.call("sanctuary_who_am_i");
+      expect(who).toMatchObject({ bound: true, binding_source: "launch_variable" });
+      const capabilities = await b.call("sanctuary_capabilities");
+      expect(capabilities.session).toEqual({ bound: true, binding_source: "launch_variable" });
+      expect(b.client.getInstructions()).toBe(first);
+    },
+  );
 });

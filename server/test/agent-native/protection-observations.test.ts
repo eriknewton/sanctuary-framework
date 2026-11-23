@@ -177,9 +177,10 @@ it("protection surfaces share every observed layer", async () => {
     expect(signed?.status).toBe("unknown");
     expect(chained.layers).toEqual(composeProtectionLayers(observeProtections(f.runtime, { ...panels, auditChain: verdict.status })));
     f.setBinding(undefined);
-    const denied = JSON.parse((await f.makeTool().handler({})).content[FIRST_CONTENT]!.text);
-    expect(denied.denied).toBe(true);
-    expect(denied.layers).toBeUndefined();
+    const unbound = JSON.parse((await f.makeTool().handler({})).content[FIRST_CONTENT]!.text);
+    // A session with no identity still gets an answer; only its identity layer is unknown.
+    expect(unbound.denied).toBeUndefined();
+    expect(status(unbound.layers, "identity")).toBe("unknown");
     await f.auditLog.flush();
   } finally { await homeDirectory.cleanup(); }
 });
