@@ -47,7 +47,9 @@
 import os from "node:os";
 import { randomBytes } from "node:crypto";
 // Must match isLoopbackOllamaEndpoint in intelligence/loopback-endpoint.ts.
-import { isLoopbackOllamaEndpoint, resolveLoopbackConnectTarget } from "./loopback-endpoint.js";
+import { isLoopbackOllamaEndpoint } from "./loopback-endpoint.js";
+// The local job descriptor's literal connect target; must match resolveLoopbackConnectTarget in intelligence/loopback-endpoint.ts.
+import { resolveLoopbackConnectTarget } from "./loopback-endpoint.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
