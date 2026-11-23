@@ -75,10 +75,19 @@ export const OPLOG_KINDS = [
   "operator_export",
   "operator_render",
   "prune_blocked",
+  "job_dropped",
 ] as const;
 export type OplogKind = (typeof OPLOG_KINDS)[number];
 
 export const WORKER_EXIT_CAUSES = ["exit", "signal", "fault"] as const;
+
+/**
+ * Why accepted work never reached a job: the worker was not ready or its
+ * channel was backlogged, or the worker's queue or the seat's share was full.
+ * Must match the drop producers in tool.ts and job-queue.ts.
+ */
+export const JOB_DROP_CAUSES = ["worker_unavailable", "queue_full", "seat_full"] as const;
+export type JobDropCause = (typeof JOB_DROP_CAUSES)[number];
 
 /** Closed body per kind: ids and counters only, never key material or record text. */
 export interface OplogBodies {
@@ -94,6 +103,7 @@ export interface OplogBodies {
   operator_export: { request_id: string };
   operator_render: { request_id: string };
   prune_blocked: { base_seq: number };
+  job_dropped: { request_id: string; cause: JobDropCause };
 }
 export type OplogAppendKind = Exclude<OplogKind, "genesis">;
 
@@ -181,6 +191,12 @@ export function validateOplogBody<K extends OplogKind>(kind: K, input: unknown):
     case "prune_blocked":
       requireExactFields(body, ["base_seq"]);
       if (!isSeq(body.base_seq)) throw new LocalStoreError("invalid_record");
+      break;
+    case "job_dropped":
+      requireExactFields(body, ["request_id", "cause"]);
+      if (!isRequestId(body.request_id) || !JOB_DROP_CAUSES.some((cause) => cause === body.cause)) {
+        throw new LocalStoreError("invalid_record");
+      }
       break;
     default:
       if (!OPLOG_KINDS.includes(kind)) throw new LocalStoreError("invalid_record");

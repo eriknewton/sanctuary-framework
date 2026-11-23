@@ -94,7 +94,7 @@ async function sweep(): Promise<void> {
   }
 }
 
-async function init(storageRoot: string, oplogKey: Uint8Array, resultsKey: Uint8Array): Promise<void> {
+async function init(storageRoot: string, lockRoot: string, oplogKey: Uint8Array, resultsKey: Uint8Array): Promise<void> {
   if (oplog !== undefined) {
     // A second init's key bytes are zeroed before the fault, the same as the first's.
     oplogKey.fill(0);
@@ -104,8 +104,9 @@ async function init(storageRoot: string, oplogKey: Uint8Array, resultsKey: Uint8
   }
   try {
     const storage = new FilesystemStorage(storageRoot);
-    const log = new LocalOplog(storage, oplogKey);
-    const store = new LocalResultsStore(storage, resultsKey, log);
+    // Every store lock rendezvouses under the server's resolved root, so both processes take the same kernel lock.
+    const log = new LocalOplog(storage, oplogKey, { runtimeRoot: lockRoot });
+    const store = new LocalResultsStore(storage, resultsKey, log, { runtimeRoot: lockRoot });
     // Published before the first await, so a shutdown or fault taken meanwhile closes them.
     oplog = log;
     results = store;
@@ -152,7 +153,11 @@ process.on("message", (raw: unknown) => {
     if (message.outcome === "granted") for (const key of message.keys) key.fill(0);
     return;
   }
-  init(message.storage_root, message.oplog_key, message.results_key).catch(() => fault("uncaught"));
+  if (message.type === "job") {
+    // Job dispatch lands with the job queue; until then an accepted job is not acted on.
+    return;
+  }
+  init(message.storage_root, message.custody_lock_root, message.oplog_key, message.results_key).catch(() => fault("uncaught"));
 });
 
 // The worker never outlives its parent: a closed channel ends the process.

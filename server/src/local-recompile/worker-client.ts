@@ -42,6 +42,8 @@ export type WorkerClientEvent =
 export interface LocalWorkerClientOptions {
   /** Fortress storage root the worker opens; required. */
   storageRoot: string;
+  /** The lock rendezvous root this process resolved; the worker takes its store locks under exactly this root. */
+  custodyLockRoot: string;
   /** Derived operator-log key; required. The master key is never accepted. */
   oplogKey: Uint8Array;
   /** Derived results-store key; required. */
@@ -89,6 +91,7 @@ export class LocalWorkerClient {
   private readonly oplogKey: Uint8Array;
   private readonly resultsKey: Uint8Array;
   private readonly storageRoot: string;
+  private readonly custodyLockRoot: string;
   private readonly timers: WorkerTimers;
   private readonly spawnWorker: WorkerSpawn;
   private readonly onEvent: (event: WorkerClientEvent) => void;
@@ -113,6 +116,7 @@ export class LocalWorkerClient {
       throw new TypeError("local worker requires a storage root");
     }
     this.storageRoot = options.storageRoot;
+    this.custodyLockRoot = options.custodyLockRoot;
     // Required, exactly 32 bytes each, copied so the caller can zero its own.
     let oplogKey: Uint8Array | undefined;
     let resultsKey: Uint8Array | undefined;
@@ -216,7 +220,13 @@ export class LocalWorkerClient {
   }
 
   private initMessage(oplogKey: Uint8Array, resultsKey: Uint8Array): ParentMessage {
-    return { type: "init", storage_root: this.storageRoot, oplog_key: oplogKey, results_key: resultsKey };
+    return {
+      type: "init",
+      storage_root: this.storageRoot,
+      custody_lock_root: this.custodyLockRoot,
+      oplog_key: oplogKey,
+      results_key: resultsKey,
+    };
   }
 
   private setState(state: WorkerState | "state_CLOSED"): void {

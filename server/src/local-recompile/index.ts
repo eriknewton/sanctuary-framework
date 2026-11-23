@@ -1,7 +1,8 @@
 /**
- * Local recompile: the operator log, the results store and the job worker
- * client. This slice registers no MCP tool. The worker entry itself is a
- * build root (dist/local-recompile-worker.js), never re-exported here.
+ * Local recompile: the operator log, the results store, the job worker
+ * client, and the `sanctuary_local_task` tool with its startup arming. The
+ * worker entry itself is a build root (dist/local-recompile-worker.js), never
+ * re-exported here.
  */
 export {
   LOCAL_OPLOG_PURPOSE,
@@ -65,3 +66,8 @@ export {
   type WorkerState,
 } from "./worker-protocol.js";
 export { LocalWorkerClient, type LocalWorkerClientOptions, type WorkerClientEvent } from "./worker-client.js";
+export { composeLocalTask, type ComposedLocalTask, type LocalTaskStatus, type LocalTaskTestSeams } from "./compose.js";
+export { LOCAL_TASK_DISARM_CAUSES, LOCAL_TASK_HANDLER_STATES, LOCAL_REQUEST_SUBMITTED_OPERATION, createLocalTaskTool } from "./tool.js";
+export { LOCAL_TASK_DESCRIPTION, LOCAL_TASK_TOOL_NAME } from "./responses.js";
+export { LocalAuthority, LOCAL_TASK_DECOY_KEY_LABEL } from "./authority.js";
+export * from "./limits.js";

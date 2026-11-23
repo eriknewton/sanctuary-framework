@@ -9,7 +9,7 @@
  */
 import { serialize } from "node:v8";
 import { isAbsolute } from "node:path";
-import { CROSS_PROCESS_LOCK_TIMEOUT_MS } from "../storage/cross-process-lock.js";
+import { CROSS_PROCESS_LOCK_TIMEOUT_MS, custodyLockRootFits } from "../storage/cross-process-lock.js";
 import { parseBindingDescriptor, type LocalBindingDescriptor } from "./binding.js";
 import { INSTRUCTION_MAX_CHARS, SOURCE_REFS_MAX } from "./limits.js";
 import { KIB, LOCAL_STORE_KEY_BYTES, SECOND_MS, isRequestId } from "./store-record.js";
@@ -93,8 +93,37 @@ export type AuthorityReply =
     }
   | { type: "authority_reply"; request_id: string; outcome: "refused"; cause: AuthorityRefusalCause };
 
+/** The one job kind slice 1 runs; must match LOCAL_RESULT_KINDS in results-store.ts. */
+export const LOCAL_TASK_KINDS = ["summarize"] as const;
+export type LocalTaskKind = (typeof LOCAL_TASK_KINDS)[number];
+
+/** One accepted submission as the worker queues it: the parsed request only, never record text. */
+export interface LocalTaskJob {
+  type: "job";
+  request_id: string;
+  seat: string;
+  kind: LocalTaskKind;
+  refs: LocalTaskRef[];
+  instruction: string;
+}
+
+/**
+ * `custody_lock_root` is the lock rendezvous directory the server resolved for
+ * itself. The worker inherits no SANCTUARY_* variable, so it takes every store
+ * lock under exactly this root, never one it resolves from its own environment.
+ * Must match the init built in worker-client.ts and read in worker-entry.ts.
+ */
+export type InitMessage = {
+  type: "init";
+  storage_root: string;
+  custody_lock_root: string;
+  oplog_key: Uint8Array;
+  results_key: Uint8Array;
+};
+
 export type ParentMessage =
-  | { type: "init"; storage_root: string; oplog_key: Uint8Array; results_key: Uint8Array }
+  | InitMessage
+  | LocalTaskJob
   | AuthorityReply
   | { type: "shutdown" };
 
@@ -139,10 +168,13 @@ export function parseParentMessage(value: unknown): ParentMessage | null {
   if (message.type === "shutdown") return exactKeys(message, ["type"]) ? { type: "shutdown" } : null;
   if (message.type === "init") {
     if (
-      !exactKeys(message, ["type", "storage_root", "oplog_key", "results_key"]) ||
+      !exactKeys(message, ["type", "storage_root", "custody_lock_root", "oplog_key", "results_key"]) ||
       typeof message.storage_root !== "string" ||
       message.storage_root.length > STORAGE_ROOT_MAX_LENGTH ||
       !isAbsolute(message.storage_root) ||
+      typeof message.custody_lock_root !== "string" ||
+      !isAbsolute(message.custody_lock_root) ||
+      !custodyLockRootFits(message.custody_lock_root) ||
       !isStoreKey(message.oplog_key) ||
       !isStoreKey(message.results_key)
     ) {
@@ -151,11 +183,13 @@ export function parseParentMessage(value: unknown): ParentMessage | null {
     return {
       type: "init",
       storage_root: message.storage_root,
+      custody_lock_root: message.custody_lock_root,
       oplog_key: message.oplog_key,
       results_key: message.results_key,
     };
   }
   if (message.type === "authority_reply") return parseAuthorityReply(message);
+  if (message.type === "job") return parseJob(message);
   return null;
 }
 
@@ -195,6 +229,29 @@ function isWriterRow(value: unknown): value is WriterKeyRow {
     row.public_keys.length <= WRITER_KEYS_PER_ROW_MAX &&
     row.public_keys.every((key) => key instanceof Uint8Array && key.length === WRITER_PUBLIC_KEY_BYTES)
   );
+}
+
+function parseJob(message: Record<string, unknown>): LocalTaskJob | null {
+  if (
+    !exactKeys(message, ["type", "request_id", "seat", "kind", "refs", "instruction"]) ||
+    !isRequestId(message.request_id) ||
+    typeof message.seat !== "string" ||
+    message.seat.length === 0 ||
+    message.seat.length > SEAT_MAX_CHARS ||
+    !LOCAL_TASK_KINDS.some((kind) => kind === message.kind) ||
+    !isRefList(message.refs) ||
+    !isInstructionText(message.instruction)
+  ) {
+    return null;
+  }
+  return {
+    type: "job",
+    request_id: message.request_id,
+    seat: message.seat,
+    kind: message.kind as LocalTaskKind,
+    refs: message.refs.map((ref) => ({ namespace: ref.namespace, key: ref.key })),
+    instruction: message.instruction,
+  };
 }
 
 function parseAuthorityReply(message: Record<string, unknown>): AuthorityReply | null {
