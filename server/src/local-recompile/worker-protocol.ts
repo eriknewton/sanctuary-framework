@@ -11,7 +11,8 @@ import { serialize } from "node:v8";
 import { isAbsolute } from "node:path";
 import { CROSS_PROCESS_LOCK_TIMEOUT_MS, custodyLockRootFits } from "../storage/cross-process-lock.js";
 import { parseBindingDescriptor, type LocalBindingDescriptor } from "./binding.js";
-import { INSTRUCTION_MAX_CHARS, SOURCE_REFS_MAX } from "./limits.js";
+import { INSTRUCTION_MAX_CHARS, JOB_DEADLINE_MS, SOURCE_REFS_MAX } from "./limits.js";
+import { LOCAL_CALL_TIMEOUT_MS } from "../intelligence/sensitive-generation-client.js";
 import { KIB, LOCAL_STORE_KEY_BYTES, SECOND_MS, isRequestId } from "./store-record.js";
 
 // A 1b job record is at most 32 refs, a 500-character instruction and 32
@@ -119,7 +120,39 @@ export type InitMessage = {
   custody_lock_root: string;
   oplog_key: Uint8Array;
   results_key: Uint8Array;
+  /** Present only from the test seam; each value can only shorten its production bound. */
+  limits?: WorkerLimits;
 };
+
+/** Shortened job bounds for fault tests; must not exceed LOCAL_CALL_TIMEOUT_MS and JOB_DEADLINE_MS. */
+export interface WorkerLimits {
+  call_timeout_ms: number;
+  job_deadline_ms: number;
+}
+
+/** Named job states, in order; must match the state handlers in summarize-job.ts. */
+export const JOB_STATES = [
+  "state_QUEUED",
+  "state_AUTHORITY",
+  "state_DIGEST",
+  "state_READ",
+  "state_GENERATE",
+  "state_COMMIT",
+  "state_DONE",
+  "state_REFUSED",
+] as const;
+export type JobState = (typeof JOB_STATES)[number];
+
+function isWorkerLimits(value: unknown): value is WorkerLimits {
+  const limits = record(value);
+  const bounded = (n: unknown, max: number) => typeof n === "number" && Number.isSafeInteger(n) && n > 0 && n <= max;
+  return (
+    limits !== null &&
+    exactKeys(limits, ["call_timeout_ms", "job_deadline_ms"]) &&
+    bounded(limits.call_timeout_ms, LOCAL_CALL_TIMEOUT_MS) &&
+    bounded(limits.job_deadline_ms, JOB_DEADLINE_MS)
+  );
+}
 
 export type ParentMessage =
   | InitMessage
@@ -130,6 +163,7 @@ export type ParentMessage =
 export type WorkerMessage =
   | { type: "ready" }
   | { type: "authority_request"; request_id: string }
+  | { type: "job_state"; request_id: string; state: JobState }
   | { type: "status"; state: WorkerState; env_names: string[]; exec_argv: string[]; queue_depth: number }
   | { type: "fault"; kind: WorkerFaultKind };
 
@@ -167,8 +201,12 @@ export function parseParentMessage(value: unknown): ParentMessage | null {
   if (message === null) return null;
   if (message.type === "shutdown") return exactKeys(message, ["type"]) ? { type: "shutdown" } : null;
   if (message.type === "init") {
+    const withLimits = Object.hasOwn(message, "limits");
     if (
-      !exactKeys(message, ["type", "storage_root", "custody_lock_root", "oplog_key", "results_key"]) ||
+      !exactKeys(message, withLimits
+        ? ["type", "storage_root", "custody_lock_root", "oplog_key", "results_key", "limits"]
+        : ["type", "storage_root", "custody_lock_root", "oplog_key", "results_key"]) ||
+      (withLimits && !isWorkerLimits(message.limits)) ||
       typeof message.storage_root !== "string" ||
       message.storage_root.length > STORAGE_ROOT_MAX_LENGTH ||
       !isAbsolute(message.storage_root) ||
@@ -186,6 +224,7 @@ export function parseParentMessage(value: unknown): ParentMessage | null {
       custody_lock_root: message.custody_lock_root,
       oplog_key: message.oplog_key,
       results_key: message.results_key,
+      ...(withLimits ? { limits: { ...(message.limits as WorkerLimits) } } : {}),
     };
   }
   if (message.type === "authority_reply") return parseAuthorityReply(message);
@@ -292,6 +331,11 @@ export function parseWorkerMessage(value: unknown): WorkerMessage | null {
   switch (message.type) {
     case "ready":
       return exactKeys(message, ["type"]) ? { type: "ready" } : null;
+    case "job_state":
+      return exactKeys(message, ["type", "request_id", "state"]) && isRequestId(message.request_id) &&
+        JOB_STATES.some((state) => state === message.state)
+        ? { type: "job_state", request_id: message.request_id, state: message.state as JobState }
+        : null;
     case "authority_request":
       return exactKeys(message, ["type", "request_id"]) && isRequestId(message.request_id)
         ? { type: "authority_request", request_id: message.request_id }

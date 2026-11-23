@@ -8,13 +8,21 @@
  * Built as dist/local-recompile-worker.js; must match the entry in
  * server/tsup.config.ts and the row in server/scripts/sealed-cli-runtime-entries.mjs.
  */
+import { LOCAL_CALL_TIMEOUT_MS, SensitiveGenerationClient } from "../intelligence/sensitive-generation-client.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { LocalOplog } from "./oplog.js";
+import { LocalJobQueue } from "./job-queue.js";
+import { JOB_DEADLINE_MS } from "./limits.js";
+import { LocalOplog, type OplogAppendKind, type OplogBodies } from "./oplog.js";
 import { HOUSEKEEPING_INTERVAL_MS, LocalResultsStore } from "./results-store.js";
+import { runSummarizeJob } from "./summarize-job.js";
 import {
+  WORKER_READY_TIMEOUT_MS,
   acceptMessage,
   assertSendable,
+  type AuthorityReply,
+  type LocalTaskJob,
   type WorkerFaultKind,
+  type WorkerLimits,
   type WorkerMessage,
   type WorkerState,
 } from "./worker-protocol.js";
@@ -27,6 +35,91 @@ let oplog: LocalOplog | undefined;
 let results: LocalResultsStore | undefined;
 let housekeeping: ReturnType<typeof setInterval> | undefined;
 let sweeping = false;
+let storage: FilesystemStorage | undefined;
+let queue: LocalJobQueue | undefined;
+let limits: { callTimeoutMs: number; jobDeadlineMs: number } = { callTimeoutMs: LOCAL_CALL_TIMEOUT_MS, jobDeadlineMs: JOB_DEADLINE_MS };
+// Every operator-log append from this process runs in call order, so a job's rows appear in the order it wrote them.
+let appendChain: Promise<unknown> = Promise.resolve();
+// Authority requests awaiting the server's reply, one per running job; bounded by the one running job.
+const awaitingAuthority = new Map<string, (reply: AuthorityReply | null) => void>();
+
+function appendRow<K extends OplogAppendKind>(kind: K, body: OplogBodies[K]): Promise<unknown> {
+  const log = oplog;
+  const next = appendChain.then(() => {
+    if (log === undefined || terminal()) throw new Error("operator log closed");
+    return log.append(kind, body);
+  });
+  appendChain = next.catch(() => undefined);
+  return next;
+}
+
+function requestAuthority(requestId: string): Promise<AuthorityReply | null> {
+  return new Promise((resolve) => {
+    // A server that never answers ends the job as refused rather than holding the queue.
+    const timer = setTimeout(() => settle(null), WORKER_READY_TIMEOUT_MS);
+    const settle = (reply: AuthorityReply | null) => {
+      clearTimeout(timer);
+      awaitingAuthority.delete(requestId);
+      resolve(reply);
+    };
+    awaitingAuthority.set(requestId, settle);
+    try {
+      send({ type: "authority_request", request_id: requestId });
+    } catch {
+      settle(null);
+    }
+  });
+}
+
+function acceptAuthorityReply(reply: AuthorityReply): void {
+  const waiting = awaitingAuthority.get(reply.request_id);
+  if (waiting === undefined) {
+    // An unsolicited or late reply's key bytes are zeroed unused.
+    if (reply.outcome === "granted") for (const key of reply.keys) key.fill(0);
+    return;
+  }
+  waiting(reply);
+}
+
+function acceptJob(job: LocalTaskJob): void {
+  const jobs = queue;
+  if (jobs === undefined || state !== "state_READY") return;
+  const offered = jobs.offer(job);
+  // A full queue or seat drops the job on the operator side only; the agent was answered long ago.
+  if (!offered.queued) {
+    appendRow("job_dropped", { request_id: job.request_id, cause: offered.cause }).catch(() => undefined);
+    return;
+  }
+  appendRow("job_queued", { request_id: job.request_id, queue_depth: offered.depth }).catch(() => undefined);
+}
+
+function startQueue(): void {
+  const store = storage;
+  const results_ = results;
+  if (store === undefined || results_ === undefined) return;
+  queue = new LocalJobQueue((entry) =>
+    runSummarizeJob(entry, {
+      readRecord: (namespace, key, maxBytes) => store.readBounded(namespace, key, maxBytes),
+      log: appendRow,
+      putPending: (input) => results_.putPending(input),
+      markCommitted: (requestId, body) => results_.markCommitted(requestId, body),
+      requestAuthority,
+      reportState: (requestId, jobState) => {
+        try {
+          send({ type: "job_state", request_id: requestId, state: jobState });
+        } catch {
+          // The live view is best effort; the operator log is the record.
+        }
+      },
+      // The only model client this job can build: the loopback transport over the descriptor's literal address.
+      makeClient: (target, timeoutMs) => new SensitiveGenerationClient(target, { timeoutMs }),
+      callTimeoutMs: limits.callTimeoutMs,
+      jobDeadlineMs: limits.jobDeadlineMs,
+      now: Date.now,
+      setTimer: (callback, ms) => setTimeout(callback, ms),
+      clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    }).then(() => undefined));
+}
 
 function terminal(): boolean {
   return state === "state_DEAD";
@@ -46,7 +139,7 @@ function status(): WorkerMessage {
     state,
     env_names: Object.keys(process.env).sort(),
     exec_argv: [...process.execArgv],
-    queue_depth: 0,
+    queue_depth: queue?.depth ?? 0,
   };
 }
 
@@ -94,7 +187,7 @@ async function sweep(): Promise<void> {
   }
 }
 
-async function init(storageRoot: string, lockRoot: string, oplogKey: Uint8Array, resultsKey: Uint8Array): Promise<void> {
+async function init(storageRoot: string, lockRoot: string, oplogKey: Uint8Array, resultsKey: Uint8Array, initLimits?: WorkerLimits): Promise<void> {
   if (oplog !== undefined) {
     // A second init's key bytes are zeroed before the fault, the same as the first's.
     oplogKey.fill(0);
@@ -103,7 +196,8 @@ async function init(storageRoot: string, lockRoot: string, oplogKey: Uint8Array,
     return;
   }
   try {
-    const storage = new FilesystemStorage(storageRoot);
+    if (initLimits !== undefined) limits = { callTimeoutMs: initLimits.call_timeout_ms, jobDeadlineMs: initLimits.job_deadline_ms };
+    storage = new FilesystemStorage(storageRoot);
     // Every store lock rendezvouses under the server's resolved root, so both processes take the same kernel lock.
     const log = new LocalOplog(storage, oplogKey, { runtimeRoot: lockRoot });
     const store = new LocalResultsStore(storage, resultsKey, log, { runtimeRoot: lockRoot });
@@ -122,6 +216,7 @@ async function init(storageRoot: string, lockRoot: string, oplogKey: Uint8Array,
     resultsKey.fill(0);
   }
   if (terminal()) return;
+  startQueue();
   state = "state_READY";
   send({ type: "ready" });
   await sweep();
@@ -149,15 +244,14 @@ process.on("message", (raw: unknown) => {
     return;
   }
   if (message.type === "authority_reply") {
-    // No job is waiting on an authority reply yet; its key bytes are zeroed unused.
-    if (message.outcome === "granted") for (const key of message.keys) key.fill(0);
+    acceptAuthorityReply(message);
     return;
   }
   if (message.type === "job") {
-    // Job dispatch lands with the job queue; until then an accepted job is not acted on.
+    acceptJob(message);
     return;
   }
-  init(message.storage_root, message.custody_lock_root, message.oplog_key, message.results_key).catch(() => fault("uncaught"));
+  init(message.storage_root, message.custody_lock_root, message.oplog_key, message.results_key, message.limits).catch(() => fault("uncaught"));
 });
 
 // The worker never outlives its parent: a closed channel ends the process.

@@ -20,7 +20,9 @@ import {
   acceptMessage,
   assertSendable,
   type AuthorityReply,
+  type JobState,
   type ParentMessage,
+  type WorkerLimits,
   type WorkerFaultKind,
   type WorkerMessage,
   type WorkerState,
@@ -37,7 +39,8 @@ export type WorkerClientEvent =
   | { type: "state"; state: WorkerState | "state_CLOSED"; pid?: number }
   | { type: "status"; status: Extract<WorkerMessage, { type: "status" }> }
   | { type: "fault"; kind: WorkerFaultKind }
-  | { type: "respawn_scheduled"; delay_ms: number };
+  | { type: "respawn_scheduled"; delay_ms: number }
+  | { type: "job_state"; request_id: string; state: JobState };
 
 export interface LocalWorkerClientOptions {
   /** Fortress storage root the worker opens; required. */
@@ -48,6 +51,8 @@ export interface LocalWorkerClientOptions {
   oplogKey: Uint8Array;
   /** Derived results-store key; required. */
   resultsKey: Uint8Array;
+  /** Test seam only: shortened job bounds the worker applies; each must not exceed its production value. */
+  limits?: WorkerLimits;
   timers?: WorkerTimers;
   spawn?: WorkerSpawn;
   onEvent?: (event: WorkerClientEvent) => void;
@@ -92,6 +97,7 @@ export class LocalWorkerClient {
   private readonly resultsKey: Uint8Array;
   private readonly storageRoot: string;
   private readonly custodyLockRoot: string;
+  private readonly limits: WorkerLimits | undefined;
   private readonly timers: WorkerTimers;
   private readonly spawnWorker: WorkerSpawn;
   private readonly onEvent: (event: WorkerClientEvent) => void;
@@ -117,6 +123,7 @@ export class LocalWorkerClient {
     }
     this.storageRoot = options.storageRoot;
     this.custodyLockRoot = options.custodyLockRoot;
+    this.limits = options.limits === undefined ? undefined : { ...options.limits };
     // Required, exactly 32 bytes each, copied so the caller can zero its own.
     let oplogKey: Uint8Array | undefined;
     let resultsKey: Uint8Array | undefined;
@@ -226,6 +233,7 @@ export class LocalWorkerClient {
       custody_lock_root: this.custodyLockRoot,
       oplog_key: oplogKey,
       results_key: resultsKey,
+      ...(this.limits === undefined ? {} : { limits: this.limits }),
     };
   }
 
@@ -305,6 +313,8 @@ export class LocalWorkerClient {
       }, WORKER_RESPAWN_MAX_MS);
     } else if (message.type === "status") {
       this.onEvent({ type: "status", status: message });
+    } else if (message.type === "job_state") {
+      this.onEvent({ type: "job_state", request_id: message.request_id, state: message.state });
     } else if (message.type === "authority_request") {
       // Answered on a later turn of the event loop, so it never shares a turn with an agent call.
       setImmediate(() => this.replyAuthority(child, message.request_id));

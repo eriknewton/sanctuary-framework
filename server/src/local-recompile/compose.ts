@@ -24,7 +24,7 @@ import {
   type LocalTaskHandlerState,
 } from "./tool.js";
 import { LocalWorkerClient, type WorkerClientEvent, type WorkerSpawn } from "./worker-client.js";
-import { WORKER_READY_TIMEOUT_MS } from "./worker-protocol.js";
+import { WORKER_READY_TIMEOUT_MS, type WorkerLimits } from "./worker-protocol.js";
 import type { LocalStoreBackend } from "./store-record.js";
 
 /** Test-only composition seams; index.ts honours them only when process.env.VITEST is set. */
@@ -34,6 +34,8 @@ export interface LocalTaskTestSeams {
   idSource?: () => string;
   clock?: () => number;
   callHook?: (state: LocalTaskHandlerState) => void;
+  /** Shortened per-call timeout and job deadline for fault tests; the protocol refuses longer values. */
+  workerLimits?: WorkerLimits;
 }
 
 export interface LocalTaskStatus {
@@ -137,6 +139,7 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
       oplogKey: keys.oplogKey,
       resultsKey: keys.resultsKey,
       ...(spawn ? { spawn } : {}),
+      ...(test?.workerLimits ? { limits: test.workerLimits } : {}),
       answerAuthority: (requestId) => authority.reply(requestId),
       onEvent: (event) => {
         if (event.type === "status") queueDepth = event.status.queue_depth;

@@ -71,3 +71,5 @@ export { LOCAL_TASK_DISARM_CAUSES, LOCAL_TASK_HANDLER_STATES, LOCAL_REQUEST_SUBM
 export { LOCAL_TASK_DESCRIPTION, LOCAL_TASK_TOOL_NAME } from "./responses.js";
 export { LocalAuthority, LOCAL_TASK_DECOY_KEY_LABEL } from "./authority.js";
 export * from "./limits.js";
+export { JOB_DROP_CAUSES, JOB_FAILURE_CAUSES, JOB_REFUSAL_CAUSES } from "./oplog.js";
+export { RECORD_STORED_MAX_BYTES } from "./summarize-job.js";
