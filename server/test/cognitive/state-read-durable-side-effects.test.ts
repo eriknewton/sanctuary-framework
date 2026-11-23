@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * A read that did not verify must not mutate durable state
  * (STATE-READ-MIGRATE-01, STATE-READ-ANCHOR-01).
@@ -323,7 +324,7 @@ describe("read-path durable side effects require a verified read", () => {
         `ALLOW=v${version}`,
         identity.identity_id,
         identity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
     const anchorRecord = await rawBytes(storage, ANCHORS_NAMESPACE, ANCHORS_KEY);
@@ -366,7 +367,7 @@ describe("read-path durable side effects require a verified read", () => {
         `ALLOW=v${version}`,
         identity.identity_id,
         identity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
     const genuineEntry = await rawBytes(storage, "memories", "policy");

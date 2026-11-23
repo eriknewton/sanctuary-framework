@@ -68,6 +68,20 @@ describe("memory-class classification (deterministic, no ML)", () => {
     ).toBe("shared_entangled");
   });
 
+  it("unattributed classifies shared_entangled from its origin alone, whatever its edges", () => {
+    for (const derived_from of [
+      undefined,
+      [],
+      [{ lineage_id: "op", memory_class: "operator_owned" as const }],
+      [{ lineage_id: "ag", memory_class: "agent_owned" as const }],
+      [{ lineage_id: "sh", memory_class: "shared_entangled" as const }],
+    ]) {
+      expect(
+        classifyMemoryClass({ origin_actor: "unattributed", origin_ref: "u", lineage_id: "l1", derived_from }),
+      ).toBe("shared_entangled");
+    }
+  });
+
   it("a class cannot be injected — the agent's only influence is derived_from", () => {
     // There is no input field through which a caller declares the class; the
     // minter computes it. An agent that wants agent_owned can only succeed by
@@ -109,6 +123,23 @@ describe("sealed minter (anti-forgery)", () => {
     // ...but the JSON form is NOT a sealed credential.
     expect(isSealedStamp(plain)).toBe(false);
     expect(isSealedStamp(JSON.parse(JSON.stringify(plain)))).toBe(false);
+  });
+
+  it("an unattributed stamp with lineage cannot be minted", () => {
+    for (const memory_class of ["operator_owned", "agent_owned", "shared_entangled"] as const) {
+      expect(() =>
+        mintProvenanceStamp({
+          origin_actor: "unattributed",
+          origin_ref: "u",
+          lineage_id: "l1",
+          derived_from: [{ lineage_id: "l0", memory_class }],
+        }),
+      ).toThrow(MemoryClassError);
+    }
+    const stamp = mintProvenanceStamp({ origin_actor: "unattributed", origin_ref: "u", lineage_id: "l1" });
+    expect(isSealedStamp(stamp)).toBe(true);
+    expect(serializeStamp(stamp)).toMatchObject({ origin_actor: "unattributed", memory_class: "shared_entangled", derived_from: [] });
+    expect(Object.hasOwn(serializeStamp(stamp), "derived_from_edges")).toBe(false);
   });
 
   it("rejects invalid origin actor and empty refs", () => {

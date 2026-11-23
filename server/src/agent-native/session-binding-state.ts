@@ -1,3 +1,4 @@
+/** Every state must be classified by UNBOUND_BINDING_STAMPS_OPERATOR in cognitive/tools.ts, which stamps a write's origin. */
 export type SessionBindingState =
   | "state_BOUND_NAMED"
   | "state_BOUND_SOLE_IDENTITY"

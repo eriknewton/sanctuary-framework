@@ -4,10 +4,8 @@ import type { SessionBindingState, SessionBindingBootState } from "./session-bin
 export type { SessionBindingState } from "./session-binding-state.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { fingerprintIdentityId, UNBOUND_SESSION, type SessionBinding } from "./safety-base.js";
-import { assertSoleBoundWriteNotHeld, type IdentityLoadEvidence, IdentityManager } from "../cognitive/tools.js";
+import { type IdentityLoadEvidence, IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
-import type { ToolDefinition } from "../router.js";
-import { COOPERATIVE_TOOL_NAMES } from "./tool-names.js";
 import { FORTRESS_CONFIG_LOCK } from "../config.js";
 
 export interface SoleProofInputs {
@@ -128,34 +126,6 @@ export function bootRowEvidence(evidence: IdentityLoadEvidence): Record<keyof Id
     key_mismatches: evidence.key_mismatches,
     decrypted_keys: evidence.decrypted_keys.length,
   };
-}
-
-/**
- * Give every cooperative tool that reaches the state_write handler the same
- * pre-gate sole-write hold as state_write's own argument builder (must match
- * assertSoleBoundWriteNotHeld in cognitive/tools.ts). Which tools reach it must
- * match the sanctuary_remember registration (approval target state_write) and
- * compoundStepPrimitive's remember arm in cooperative-surface.ts.
- */
-export function holdSoleBoundCooperativeWrites(tools: ToolDefinition[], bootState: SessionBindingBootState): ToolDefinition[] {
-  const reachesStateWrite = (tool: ToolDefinition, args: Record<string, unknown>): boolean => {
-    if (tool.approvalTargetToolName === "state_write") return true;
-    if (tool.name !== COOPERATIVE_TOOL_NAMES.compoundExecute || !Array.isArray(args.steps)) return false;
-    return args.steps.some(step => step !== null && typeof step === "object"
-      && String((step as { tool?: unknown }).tool ?? "") === COOPERATIVE_TOOL_NAMES.remember);
-  };
-  return tools.map(tool => {
-    if (tool.approvalTargetToolName !== "state_write" && tool.name !== COOPERATIVE_TOOL_NAMES.compoundExecute) return tool;
-    const build = tool.approvalTargetArgs;
-    return {
-      ...tool,
-      approvalTargetArgs: async (args: Record<string, unknown>) => {
-        // The hold runs before the tool's own builder, so a held write raises no approval and records no attempt.
-        if (reachesStateWrite(tool, args)) assertSoleBoundWriteNotHeld(bootState);
-        return (await build?.(args)) ?? args;
-      },
-    };
-  });
 }
 
 /** Install one boot decision and preserve per-call launch selection outside a sole boot. */

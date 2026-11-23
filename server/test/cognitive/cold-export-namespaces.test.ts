@@ -1,4 +1,4 @@
-// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Full exports discover durable state and bind its scope before approval.
  * LEGACY-BUG-001
@@ -48,7 +48,7 @@ async function fixture(sessionScoped = false, ambiguousOwner = false, restart = 
   if (sessionScoped) namespaces.push(owned, foreign);
   if (ambiguousOwner) namespaces.push("mem_unknown");
   for (const ns of namespaces) {
-    await seed.write(ns, "note", ns, identity.identity_id, identity.encrypted_private_key, encKey);
+    await seed.write(ns, "note", ns, identity.identity_id, identity.encrypted_private_key, encKey, { provenance: { origin_actor: "operator" } });
   }
   const reopened = new FilesystemStorage(path);
   const cold = new StateStore(reopened, masterKey);

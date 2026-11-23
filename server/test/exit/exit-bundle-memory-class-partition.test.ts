@@ -1,4 +1,4 @@
-// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
+// fail-before-exempt: operator writes in the fixture now come from an unbound session, because a state write must establish its origin; asserts no new behaviour.
 /**
  * Exit machinery Slice 1 — conservative partition wired into the real exit
  * bundle export.
@@ -76,7 +76,10 @@ async function buildSource() {
     "passphrase",
     auditLog,
     {
-      sessionBindingBootState: () => "state_BOUND_NAMED",
+      // Each write models its own session: an agent write is a launch-variable session bound to the source
+      // identity, and an operator write is a session the server booted unbound (flag off). A named boot decision
+      // with no binding cannot say who wrote, so the origin resolver refuses it; this fixture never builds that pair.
+      sessionBindingBootState: () => (sessionIdentityId ? "state_BOUND_NAMED" : "state_UNBOUND_FLAG_OFF"),
       currentSessionBinding: () =>
         sessionIdentityId
           ? {

@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Checkpoint commands capture durable state across restarts.
  * LEGACY-BUG-001
@@ -68,7 +69,7 @@ async function fixture() {
   const { storedIdentity: identity } = createIdentity("checkpoint", encKey, "recovery-key");
   await persistStoredIdentity(storage, masterKey, identity);
   const write = (ns: string, value: string, key = "note") => stateStore.write(
-    ns, key, value, identity.identity_id, identity.encrypted_private_key, encKey,
+    ns, key, value, identity.identity_id, identity.encrypted_private_key, encKey, { provenance: { origin_actor: "operator" } },
   );
   await write("alpha", "original");
   await write("beta", "original");
@@ -275,7 +276,7 @@ describe("cold checkpoint CLI", () => {
       "post-rotation-added",
       updatedIdentity.identity_id,
       updatedIdentity.encrypted_private_key,
-      identityEncKey,
+      identityEncKey, { provenance: { origin_actor: "operator" } },
     );
 
     const result = await coldRestore(f, checkpoint!.id);

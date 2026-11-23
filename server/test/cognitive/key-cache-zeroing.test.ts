@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Crypto-hygiene: derived namespace keys are zeroed on cache eviction / clear.
  *
@@ -56,7 +57,7 @@ describe("namespace key cache zeroing (crypto hygiene)", () => {
   it("invalidateKeyCache() still re-derives a correct key for a subsequent read", async () => {
     const { store, identity, idKey } = await buildStore();
 
-    await store.write("notes", "k1", "hello sovereign world", KID, identity.encrypted_private_key, idKey);
+    await store.write("notes", "k1", "hello sovereign world", KID, identity.encrypted_private_key, idKey, { provenance: { origin_actor: "operator" } });
 
     // Populate the cache, then clear it (which zeros the cached key bytes).
     const before = await store.read("notes", "k1");

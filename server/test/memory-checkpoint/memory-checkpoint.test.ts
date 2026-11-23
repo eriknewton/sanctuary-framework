@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Memory Checkpoint tests.
  *
@@ -97,7 +98,7 @@ async function writeEntry(
     value,
     fixture.identity.storedIdentity.identity_id,
     fixture.identity.storedIdentity.encrypted_private_key,
-    fixture.identityEncKey,
+    fixture.identityEncKey, { provenance: { origin_actor: "operator" } },
   );
 }
 

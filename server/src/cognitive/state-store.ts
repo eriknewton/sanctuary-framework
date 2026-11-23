@@ -70,6 +70,8 @@ import {
 // `errors/untrusted-diagnostic.ts`.
 import { describeUntrusted } from "../errors/index.js";
 import {
+  assertOriginActor,
+  isOriginActor,
   mintProvenanceStamp,
   serializeStamp,
   type DerivedFromEdge,
@@ -845,21 +847,25 @@ async function runRawWriteObserver(
   }
 }
 
+/** The provenance a StateStore.write caller declares; its origin is decided by the caller, never by the store. */
+export interface WriteProvenance {
+  origin_actor: OriginActor;
+  origin_ref?: string;
+  lineage_id?: string;
+  derived_from?: readonly DerivedFromEdge[];
+}
+
 /** Options for state write */
 export interface WriteOptions {
   content_type?: string;
   ttl_seconds?: number;
   tags?: string[];
-  provenance?: {
-    /**
-     * Internal, derived actor signal. `agent` is passed only from the existing
-     * session-identity path; absent/unknown fails closed to operator.
-     */
-    origin_actor?: OriginActor;
-    origin_ref?: string;
-    lineage_id?: string;
-    derived_from?: readonly DerivedFromEdge[];
-  };
+  /**
+   * The write's provenance. Every caller names `origin_actor` explicitly; it is
+   * never defaulted, and an absent or unknown value fails the write before any
+   * storage write.
+   */
+  provenance: WriteProvenance;
   /**
    * N4 (coordinator gate, 2026-08-22): a scoped opt-out of the
    * pending-exit-import write refusal below, for the one call path that
@@ -1036,27 +1042,24 @@ function entryBinding(namespace: string, key: string): string {
   return `${namespace}/${key}`;
 }
 
-function resolveWriteOriginActor(actor: OriginActor | undefined): OriginActor {
-  return actor === "agent" || actor === "system" ? actor : "operator";
-}
-
 function mintSerializedWriteStamp(args: {
   namespace: string;
   key: string;
   identityId: string;
   writtenAt: string;
   version: number;
-  provenance?: WriteOptions["provenance"];
+  provenance: WriteProvenance;
 }): ProvenanceStamp {
   const stamp = mintProvenanceStamp({
-    origin_actor: resolveWriteOriginActor(args.provenance?.origin_actor),
-    origin_ref: args.provenance?.origin_ref ?? args.identityId,
+    // A write's origin comes from its caller and is never defaulted; the minter's origin check throws on an absent or unknown value.
+    origin_actor: args.provenance.origin_actor,
+    origin_ref: args.provenance.origin_ref ?? args.identityId,
     lineage_id:
-      args.provenance?.lineage_id ??
+      args.provenance.lineage_id ??
       `state:${entryBinding(args.namespace, args.key)}:v${args.version}`,
     written_at: args.writtenAt,
     entry_binding: entryBinding(args.namespace, args.key),
-    ...(args.provenance?.derived_from !== undefined
+    ...(args.provenance.derived_from !== undefined
       ? { derived_from: args.provenance.derived_from }
       : {}),
   });
@@ -1071,10 +1074,6 @@ function isMemoryClass(value: unknown): value is ProvenanceStamp["memory_class"]
   );
 }
 
-function isOriginActor(value: unknown): value is OriginActor {
-  return value === "operator" || value === "agent" || value === "system";
-}
-
 function isStringArray(value: unknown): value is readonly string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
@@ -1082,6 +1081,15 @@ function isStringArray(value: unknown): value is readonly string[] {
 function normalizeDerivedEdgesForRemint(
   stamp: ProvenanceStamp
 ): readonly DerivedFromEdge[] | null {
+  if (stamp.origin_actor === "unattributed") {
+    // An empty lineage is canonical only for an unattributed origin, and it is that origin's one sealable shape:
+    // shared_entangled, no derived_from, no derived_from_edges key (must match mintProvenanceStamp in exit/memory-class.ts).
+    return stamp.memory_class === "shared_entangled" &&
+      stamp.derived_from.length === 0 &&
+      stamp.derived_from_edges === undefined
+      ? []
+      : null;
+  }
   if (stamp.derived_from_edges !== undefined) {
     if (!Array.isArray(stamp.derived_from_edges)) return null;
     const edges: DerivedFromEdge[] = [];
@@ -1151,6 +1159,49 @@ function normalizePersistedProvenanceStamp(value: unknown): ProvenanceStamp | nu
     ...stamp,
     ...(edges.length > 0 ? { derived_from_edges: edges } : {}),
   };
+}
+
+/**
+ * Recompute a persisted provenance stamp's class through the sealed minter. A
+ * stamp is sealed only when its declared class equals the class the minter
+ * computes from its origin and lineage; any other shape is unsealed.
+ *
+ * Exported ONLY so `test/exit/unattributed-origin-round-trip.test.ts` pins the
+ * canonical and non-canonical shapes on hand-edited stamps, which a signed
+ * entry can never present: remintVerifiedProvenanceStampForExport verifies the
+ * envelope signature first and is this function's one production caller.
+ */
+export function remintDeclaredProvenanceStamp(
+  stamp: unknown
+):
+  | { status: "sealed"; declaredStamp: ProvenanceStamp; sealedStamp: SealedProvenanceStamp }
+  | { status: "unsealed"; declaredStamp?: ProvenanceStamp } {
+  const declaredStamp = normalizePersistedProvenanceStamp(stamp);
+  if (declaredStamp === null) {
+    return { status: "unsealed" };
+  }
+
+  const derivedEdges = normalizeDerivedEdgesForRemint(declaredStamp);
+  if (derivedEdges === null) {
+    return { status: "unsealed", declaredStamp };
+  }
+
+  const sealedStamp = mintProvenanceStamp({
+    origin_actor: declaredStamp.origin_actor,
+    origin_ref: declaredStamp.origin_ref,
+    lineage_id: declaredStamp.lineage_id,
+    written_at: declaredStamp.written_at,
+    ...(declaredStamp.entry_binding !== undefined
+      ? { entry_binding: declaredStamp.entry_binding }
+      : {}),
+    ...(derivedEdges.length > 0 ? { derived_from: derivedEdges } : {}),
+  });
+
+  if (sealedStamp.memory_class !== declaredStamp.memory_class) {
+    return { status: "unsealed", declaredStamp };
+  }
+
+  return { status: "sealed", declaredStamp, sealedStamp };
 }
 
 export class StateStore {
@@ -1879,7 +1930,8 @@ export class StateStore {
    * @param identityId - Identity performing the write
    * @param encryptedPrivateKey - Identity's encrypted private key (for signing)
    * @param identityEncryptionKey - Key to decrypt the identity's private key
-   * @param options - Optional metadata
+   * @param options - Metadata and the write's required provenance (the parameter name must match the options lookup in
+   *   test/structure/state-store-write-provenance.test.ts, which finds the argument by this name)
    */
   async write(
     namespace: string,
@@ -1888,8 +1940,12 @@ export class StateStore {
     identityId: string,
     encryptedPrivateKey: EncPayload,
     identityEncryptionKey: Uint8Array,
-    options: WriteOptions = {}
+    options: WriteOptions
   ): Promise<WriteResult> {
+    // A write must name its origin before anything is read or stored: a JS caller or a cast can omit options or
+    // provenance, and that is refused with the minter's own typed origin refusal (must match assertOriginActor in
+    // exit/memory-class.ts), never a raw TypeError from a later field read.
+    assertOriginActor((options as Partial<WriteOptions> | undefined)?.provenance?.origin_actor);
     return this.withStateMutationLock(async () => {
     // N4 (coordinator gate, 2026-08-22): while a durable exit-import
     // journal exists, refuse THIS write - F6 (coordinator gate,
@@ -2300,32 +2356,7 @@ export class StateStore {
       return { status: "unstamped" };
     }
 
-    const declaredStamp = normalizePersistedProvenanceStamp(entry.provenance_stamp);
-    if (declaredStamp === null) {
-      return { status: "unsealed" };
-    }
-
-    const derivedEdges = normalizeDerivedEdgesForRemint(declaredStamp);
-    if (derivedEdges === null) {
-      return { status: "unsealed", declaredStamp };
-    }
-
-    const sealedStamp = mintProvenanceStamp({
-      origin_actor: declaredStamp.origin_actor,
-      origin_ref: declaredStamp.origin_ref,
-      lineage_id: declaredStamp.lineage_id,
-      written_at: declaredStamp.written_at,
-      ...(declaredStamp.entry_binding !== undefined
-        ? { entry_binding: declaredStamp.entry_binding }
-        : {}),
-      ...(derivedEdges.length > 0 ? { derived_from: derivedEdges } : {}),
-    });
-
-    if (sealedStamp.memory_class !== declaredStamp.memory_class) {
-      return { status: "unsealed", declaredStamp };
-    }
-
-    return { status: "sealed", declaredStamp, sealedStamp };
+    return remintDeclaredProvenanceStamp(entry.provenance_stamp);
   }
 
   private async migrateLegacyEntryToSchema2(

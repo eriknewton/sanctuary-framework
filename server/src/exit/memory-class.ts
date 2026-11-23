@@ -70,8 +70,17 @@ const sealedStamps = new WeakSet<object>();
 /** The three exit dispositions, one-to-one with the three memory classes. */
 export type MemoryClass = "operator_owned" | "agent_owned" | "shared_entangled";
 
-/** Who authored the write. Reuses the SDW actor vocabulary. */
-export type OriginActor = "operator" | "agent" | "system";
+/**
+ * Who authored the write. `operator`, `agent` and `system` reuse the SDW actor
+ * vocabulary; `unattributed` is a write whose session names no author (a sole
+ * binding), so neither the operator nor the agent may claim it alone.
+ */
+export type OriginActor = "operator" | "agent" | "system" | "unattributed";
+
+/** The one origin vocabulary check; StateStore's persisted-stamp reader uses this same predicate. */
+export function isOriginActor(value: unknown): value is OriginActor {
+  return value === "operator" || value === "agent" || value === "system" || value === "unattributed";
+}
 
 /**
  * The append-only ownership stamp, written at the same moment as the secrecy
@@ -160,6 +169,7 @@ export class MemoryClassError extends Error {
  *   - origin_actor === "operator"  → operator_owned
  *   - origin_actor === "system"    → operator_owned (system bookkeeping stays
  *                                     with the fortress; never travels)
+ *   - origin_actor === "unattributed" → shared_entangled, whatever its edges
  *   - origin_actor === "agent" with NO operator-derived edge → agent_owned
  *   - origin_actor === "agent" WITH an operator_owned/shared_entangled edge
  *                                  → shared_entangled
@@ -179,6 +189,8 @@ export function classifyMemoryClass(input: MintStampInput): MemoryClass {
   assertOriginActor(input.origin_actor);
   if (input.origin_actor === "operator") return "operator_owned";
   if (input.origin_actor === "system") return "operator_owned";
+  // An unattributed write never inherits operator trust and never travels without operator consent.
+  if (input.origin_actor === "unattributed") return "shared_entangled";
   // origin_actor === "agent"
   const edges = input.derived_from ?? [];
   for (const edge of edges) {
@@ -200,6 +212,10 @@ export function mintProvenanceStamp(input: MintStampInput): SealedProvenanceStam
   assertOriginActor(input.origin_actor);
   assertNonEmpty(input.origin_ref, "origin_ref");
   assertNonEmpty(input.lineage_id, "lineage_id");
+  // The minter never produces an unattributed stamp with lineage, because only an empty lineage remints sealed for that origin.
+  if (input.origin_actor === "unattributed" && (input.derived_from?.length ?? 0) > 0) {
+    throw new MemoryClassError("invalid_derived_from", "an unattributed origin carries no lineage");
+  }
   const memory_class = classifyMemoryClass(input);
   const derived_from_edges = Object.freeze(
     (input.derived_from ?? []).map((edge) => {
@@ -520,9 +536,13 @@ function decideOne(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function assertOriginActor(actor: unknown): asserts actor is OriginActor {
-  if (actor !== "operator" && actor !== "agent" && actor !== "system") {
-    throw new MemoryClassError("invalid_origin_actor", "origin_actor must be operator|agent|system");
+/**
+ * The one origin refusal: the minter and StateStore.write's provenance check both throw this same typed
+ * MemoryClassError, so a missing or unknown origin is refused the same way at either site.
+ */
+export function assertOriginActor(actor: unknown): asserts actor is OriginActor {
+  if (!isOriginActor(actor)) {
+    throw new MemoryClassError("invalid_origin_actor", "origin_actor must be operator|agent|system|unattributed");
   }
 }
 
