@@ -1,6 +1,6 @@
 /** Automatic default binding requires this invocation's directory creation and identity seed. */
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runInit, type InitOptions } from "../../src/wrap/init.js";
 import { runWrap, __processShutdownCleanupCountForTest } from "../../src/wrap/cli.js";
@@ -168,4 +168,58 @@ it("a failed flag write at wrap still unregisters the no-dashboard audit flush",
   const cleanupsBefore = __processShutdownCleanupCountForTest();
   await runWrap({ claudeCode: true, noOpen: true, noDashboard: true }, wrapDeps);
   expect(__processShutdownCleanupCountForTest()).toBe(cleanupsBefore);
+});
+
+// The operator notes, written out byte for byte and never imported.
+const UNCONFIRMED_NOTE = "Note: default session binding could not be confirmed; check with `sanctuary session-binding status`.";
+const realWriteSoleBinding = config.writeSoleBindingForFreshFortress;
+const runWrapCommand = () => runWrap({ claudeCode: true, noOpen: true, noDashboard: true }, wrapDeps);
+
+it.each([
+  ["init", () => init()],
+  ["wrap", runWrapCommand],
+] as const)("%s does not say not enabled when the flag was written and only the lock cleanup failed", async (_command, run) => {
+  const stderr = vi.spyOn(console, "error");
+  // The fault lands after the flag write commits.
+  vi.spyOn(config, "writeSoleBindingForFreshFortress").mockImplementation(async (token, configFilePath) => {
+    await realWriteSoleBinding(token, configFilePath);
+    throw new Error("lock cleanup failed");
+  });
+  // The command completes; only its note follows the flag on disk.
+  await run();
+  expect(await flag()).toEqual({ sole_identity: true });
+  const text = stderr.mock.calls.flat().join("\n");
+  expect(text).not.toContain("not enabled");
+  expect(text).not.toContain(UNCONFIRMED_NOTE);
+  expect(text).not.toContain(enableCommand);
+});
+
+it.each([
+  ["init", () => init()],
+  ["wrap", runWrapCommand],
+] as const)("%s fails when the fresh fortress evidence does not match the config directory", async (_command, run) => {
+  const other = join(home.home, "other-directory");
+  await mkdir(other);
+  // The real writer is handed another directory, so its own evidence check refuses.
+  vi.spyOn(config, "writeSoleBindingForFreshFortress").mockImplementation(async (token) =>
+    realWriteSoleBinding(token, join(other, "sanctuary.json")));
+  await expect(run()).rejects.toThrow("Fresh fortress evidence does not match the config directory");
+  expect(await flag()).toBeUndefined();
+});
+
+it.each([
+  ["init", () => init()],
+  ["wrap", runWrapCommand],
+] as const)("%s says default binding could not be confirmed when the flag cannot be read back", async (_command, run) => {
+  const stderr = vi.spyOn(console, "error");
+  vi.spyOn(config, "writeSoleBindingForFreshFortress").mockImplementation(async (_token, configFilePath) => {
+    // The config is left unparseable, so neither state can be read back.
+    await writeFile(configFilePath, "{");
+    throw new Error("config writer unavailable");
+  });
+  // The command completes; only its note follows the flag on disk.
+  await run();
+  const text = stderr.mock.calls.flat().join("\n");
+  expect(text).toContain(UNCONFIRMED_NOTE);
+  expect(text).not.toContain("not enabled");
 });

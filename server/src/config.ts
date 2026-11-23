@@ -1480,11 +1480,47 @@ export async function createFreshFortress(path: string): Promise<FreshFortress |
 }
 
 /** Creation evidence must match the seed-success callers in wrap/init.ts and wrap/cli.ts. */
+/**
+ * Creation evidence that names another directory. Init and wrap rethrow it, so
+ * the command fails instead of finishing with the flag off; must match the
+ * rethrow in enableFreshSessionBindingForInit (wrap/init.ts) and
+ * enableFreshSessionBindingForWrap (wrap/cli.ts).
+ */
+export class FreshFortressEvidenceMismatchError extends Error {
+  constructor() {
+    super("Fresh fortress evidence does not match the config directory");
+    this.name = "FreshFortressEvidenceMismatchError";
+  }
+}
+
+/** The default-binding flag as read back after a failed write. */
+export type SoleBindingFlagReadBack = "flag_ENABLED" | "flag_DISABLED" | "flag_UNREADABLE";
+
+/**
+ * Read the default-binding flag back after its write reported a failure, so
+ * the operator note says what is on disk: a write whose flag committed before
+ * a later step failed reads enabled, and a config that cannot be read claims
+ * neither state.
+ */
+export async function readSoleBindingFlagBack(configFilePath: string): Promise<SoleBindingFlagReadBack> {
+  try {
+    const disk = await readFortressConfig(configFilePath);
+    return (disk.session_binding as { sole_identity?: boolean } | undefined)?.sole_identity === true
+      ? "flag_ENABLED" : "flag_DISABLED";
+  } catch {
+    return "flag_UNREADABLE";
+  }
+}
+
+/** The note printed when the flag cannot be read back; must match the init and wrap tests in test/wrap/fresh-session-binding.test.ts. */
+export const SOLE_BINDING_UNCONFIRMED_NOTE =
+  "  Note: default session binding could not be confirmed; check with `sanctuary session-binding status`.";
+
 export async function writeSoleBindingForFreshFortress(token: FreshFortress, configFilePath: string): Promise<void> {
   const directory = await stat(dirname(configFilePath));
   // Directory identity binds the creation evidence to the destination, including a held directory descriptor path.
   if (directory.dev !== token[FRESH_FORTRESS].dev || directory.ino !== token[FRESH_FORTRESS].ino) {
-    throw new Error("Fresh fortress evidence does not match the config directory");
+    throw new FreshFortressEvidenceMismatchError();
   }
   await updateFortressConfig(configFilePath, "session_binding", () => ({ session_binding: { sole_identity: true } }));
 }

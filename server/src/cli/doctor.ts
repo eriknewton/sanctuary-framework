@@ -200,7 +200,7 @@ export async function runDoctorChecks(opts: {
   const masterKey = session?.masterKey ?? null;
   const check = async () => {
     checks.push(await checkIdentity(opts.storagePath, masterKey));
-    checks.push(await checkSessionBinding(opts.storagePath, opts.env, masterKey));
+    checks.push(await checkSessionBinding(opts.storagePath, opts.env, masterKey, opts.hermesConfigPath));
     checks.push(await checkPolicy(opts.storagePath));
     checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
     checks.push(await checkCustodyFactors(opts.storagePath));
@@ -1179,6 +1179,7 @@ export async function checkSessionBinding(
   storagePath: string,
   env: NodeJS.ProcessEnv,
   masterKey: Uint8Array | null,
+  hermesConfigPath: string = hermesConfigYamlPath(),
 ): Promise<DoctorCheck> {
   const configFilePath = resolve(storagePath, "sanctuary.json");
   let flag: boolean | undefined;
@@ -1218,7 +1219,7 @@ export async function checkSessionBinding(
       lines.push(`${FORTRESS_CONFIG_LOCK} could not be inspected; remove only when no Sanctuary process is running`);
     }
   }
-  lines.push(...await sessionBindingLaunchEntries(storagePath));
+  lines.push(...await sessionBindingLaunchEntries(storagePath, hermesConfigPath));
   return { name: "session binding", status: lockPresent || !masterKey ? "WARN" : "OK",
     message: lines.join("\n"), hint: "This predicts the next start from this shell's environment; a running server keeps its boot decision until it exits." };
 }
@@ -1244,7 +1245,7 @@ export async function sessionBindingStatus(storagePath: string, env: NodeJS.Proc
   }
 }
 
-async function sessionBindingLaunchEntries(storagePath: string): Promise<string[]> {
+async function sessionBindingLaunchEntries(storagePath: string, hermesConfigPath: string): Promise<string[]> {
   const lines: string[] = [];
   for (const paths of Object.values(getPlatformPaths())) {
     for (const path of paths) {
@@ -1268,5 +1269,40 @@ async function sessionBindingLaunchEntries(storagePath: string): Promise<string[
       }
     }
   }
+  lines.push(...await hermesSessionBindingEntry(hermesConfigPath));
   return lines;
+}
+
+/**
+ * The Hermes launch entry, read from its config.yaml through the wrap
+ * writer's own block scanner (must match hermesSanctuaryEntryEnvValue in
+ * wrap/hermes-yaml.ts). Bound: only the `sanctuary` entry is read, and an
+ * empty value cannot be told apart from an absent one, because the helper
+ * returns null for both; both are reported as "not set or empty". A missing or
+ * unreadable file reports nothing and creates nothing.
+ */
+async function hermesSessionBindingEntry(hermesConfigPath: string): Promise<string[]> {
+  let yaml: string | null;
+  try {
+    yaml = await readFile(hermesConfigPath, "utf-8");
+  } catch {
+    return [];
+  }
+  let identity: string | null | undefined;
+  let fortress: string | null | undefined;
+  try {
+    identity = hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_SESSION_IDENTITY_ID");
+    // Launch-path alias precedence must match main in cli.ts.
+    fortress = hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_STORAGE_PATH")
+      ?? hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_FORTRESS_PATH");
+  } catch {
+    return [];
+  }
+  // No sanctuary entry: Hermes is not wrapped with this server.
+  if (identity === undefined) return [];
+  const path = resolve(hermesConfigPath);
+  return [
+    `Hermes entry sanctuary (${path}): fortress path ${fortress ? resolve(fortress) : "not set or empty"}`,
+    `Hermes entry sanctuary (${path}): SANCTUARY_SESSION_IDENTITY_ID ${identity === null ? "not set or empty" : "set"}`,
+  ];
 }

@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 // fail-before-exempt: new session-binding CLI module has no base implementation; config validation and boot persistence have separate behavioral witnesses.
 /** The operator can explicitly choose default binding for an existing fortress. */
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -14,6 +15,7 @@ import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 import * as harnessPaths from "../../src/wrap/config-reader.js";
 import { runSessionBindingCommand } from "../../src/cli/session-binding.js";
 import { createTempFortress, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 let fortress: Awaited<ReturnType<typeof createTempFortress>>;
 let path: string;
 beforeEach(async () => {
@@ -162,7 +164,7 @@ it("doctor and status share every next-start prediction alternative", async () =
       await writeFile(path, JSON.stringify({ session_binding: { sole_identity: alternative.flag } }));
       const env = { SANCTUARY_PASSPHRASE: TEST_PASSPHRASE, SANCTUARY_SESSION_IDENTITY_ID: alternative.named };
       prediction.mockClear();
-      const check = (await runDoctorChecks({ storagePath, env, platform: "linux" })).find(row => row.name === "session binding");
+      const check = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath, env, platform: "linux" })).find(row => row.name === "session binding");
       expect(prediction).toHaveBeenCalledOnce();
       doctorLines.push(check!.message.split("\n").find(line => line.startsWith("A server started now"))!);
       prediction.mockClear();

@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 /**
  * `sanctuary init`: recovery-key custody, doctor agreement, honest failure,
  * and a pre-existing machine-wide Castle Wall pin.
@@ -48,6 +49,7 @@ import { agentGuidedRecoveryOutputPath } from "../../src/wrap/custody-flow.js";
 import { runDoctorChecks } from "../../src/cli/doctor.js";
 import { PRINCIPAL_POLICY_FILENAME } from "../../src/principal-policy/loader.js";
 import type { ExecResult } from "../../src/wrap/passphrase.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 /**
  * In-memory stand-in for the macOS `security` binary. The whole point is that
@@ -248,7 +250,7 @@ describe("sanctuary init: what init writes is what doctor checks", () => {
     // sanctuary init" as the remedy for a fortress init had just built). A
     // file-existence check placed ahead of it would short-circuit and report
     // a bare ENOENT instead of the operator-visible symptom.
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       env: {},
       storagePath: fortressPath,
       platform: process.platform,
@@ -394,7 +396,7 @@ describe("sanctuary init: an existing principal policy is reported, and a plante
     await writeFile(outside, "version: 1\ntiers: {}\n", { mode: 0o600 });
     await symlink(outside, join(fortressPath, PRINCIPAL_POLICY_FILENAME));
 
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       env: {},
       storagePath: fortressPath,
       platform: process.platform,

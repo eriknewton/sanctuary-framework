@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 // fail-before-exempt: current change only initializes custody for the existing confirmed-gate fixture, preserving its unchanged helper-call assertion. Enrolled-custody re-pin behavior is covered by castle-wall-repin-custody.test.ts.
 /**
  * The vault-level Castle Wall state, and the confirmation gate on the one verb
@@ -39,6 +40,7 @@ import { runDoctorChecks } from "../../src/cli/doctor.js";
 import { renderTable } from "../../src/cli/status.js";
 import { classifyMetaKey } from "../../src/core/master-rotation.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 /** Collect a CLI writable's output. */
 function capture(chunks: string[]): Writable {
@@ -137,7 +139,7 @@ describe("the vault-level wall state is readable, and never guessed", () => {
     // on no wall at all.
     const activated = () =>
       "ai.sanctuaryprotocol.macos.castle-wall (1.0/42)\tCastle Wall\t[activated enabled]";
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortressPath,
       env: {},
       platform: "darwin",
@@ -149,7 +151,7 @@ describe("the vault-level wall state is readable, and never guessed", () => {
     expect(wall!.message).toContain(CASTLE_WALL_NOT_YET_WALLED);
 
     // A fortress that makes no claim is judged exactly as it was before.
-    const unclaimed = await runDoctorChecks({
+    const unclaimed = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: join(tmp, "no-claim"),
       env: {},
       platform: "darwin",
@@ -186,7 +188,7 @@ describe("the vault-level wall state is readable, and never guessed", () => {
         state: "unreadable",
       });
 
-      const checks = await runDoctorChecks({
+      const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
         storagePath: fortressPath,
         env: {},
         platform: "darwin",
@@ -204,7 +206,7 @@ describe("the vault-level wall state is readable, and never guessed", () => {
     // neither half of the `walled` pair, so the machine's own extension state
     // is all it may report. The OK line therefore has to SAY that, or a reader
     // takes a green line about a system extension as an answer about a vault.
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: join(tmp, "no-claim-at-all"),
       env: {},
       platform: "darwin",

@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 // fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /** Audit log operational witnesses, set R. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +24,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { exportExitBundle, verifyExitBundle } from "../../src/exit/index.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 const CAP = 2; // Fixture capacity (maxEntries).
 const INTERVAL = 100; // Production checkpoint cadence.
@@ -180,7 +182,7 @@ describe("audit log witnesses R", () => {
       expect(report.verdict).toBe("PASS");
       expect(report.signatures_verified).toBe(2); // Initial seal and the later seal.
       const env = { HOME: testHome, SANCTUARY_STORAGE_PATH: testHome, SANCTUARY_PASSPHRASE: passphrase };
-      const checks = await runDoctorChecks({ storagePath: testHome, env, platform: "linux" });
+      const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: testHome, env, platform: "linux" });
       expect(checks.find(check => check.name === "audit chain")).toMatchObject({
         status: "WARN", message: "checkpoint signatures were not verified against a pinned public key",
       });

@@ -266,15 +266,19 @@ it("a cooperative call refuses when the bound identity is gone from the manager"
     return armed && lookup === id ? undefined : realGet.call(this, lookup);
   });
   const ledger = vi.spyOn(DenialLedger.prototype, "record");
-  const before = (await b.gateRows()).length;
-  armed = true;
-  const result = await b.call("sanctuary_remember", { key: "gone", value: "v" });
-  armed = false;
-  expect(result).toEqual(expectedRefusal());
-  const rows = (await b.gateRows()).slice(before);
-  expect(rows.map((row) => row.operation)).toEqual([expect.stringMatching(/^gate_deny:/)]);
-  expect(rows[0]!.details).toMatchObject({ decided_by: "pre_gate" });
-  expect(ledger.mock.calls).toEqual([["pre_gate_argument_refused", expect.objectContaining({ tool: "sanctuary_remember" })]]);
+  // Remember also reads the manager through its namespace handle; the event cursor reads it only through the session predicate.
+  for (const [tool, args] of [["sanctuary_remember", { key: "gone", value: "v" }], ["sanctuary_events_open_cursor", {}]] as const) {
+    const before = (await b.gateRows()).length;
+    ledger.mockClear();
+    armed = true;
+    const result = await b.call(tool, args);
+    armed = false;
+    expect(result, tool).toEqual(expectedRefusal());
+    const rows = (await b.gateRows()).slice(before);
+    expect(rows.map((row) => row.operation), tool).toEqual([expect.stringMatching(/^gate_deny:/)]);
+    expect(rows[0]!.details, tool).toMatchObject({ decided_by: "pre_gate" });
+    expect(ledger.mock.calls, tool).toEqual([["pre_gate_argument_refused", expect.objectContaining({ tool })]]);
+  }
   expect(b.deny).not.toHaveBeenCalled();
 });
 
