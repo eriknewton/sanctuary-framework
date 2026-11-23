@@ -76,7 +76,10 @@ async function buildSource() {
     "passphrase",
     auditLog,
     {
-      sessionBindingBootState: () => "state_BOUND_NAMED",
+      // Each write models its own session: an agent write is a launch-variable session bound to the source
+      // identity, and an operator write is a session the server booted unbound (flag off). A named boot decision
+      // with no binding cannot say who wrote, so the origin resolver refuses it; this fixture never builds that pair.
+      sessionBindingBootState: () => (sessionIdentityId ? "state_BOUND_NAMED" : "state_UNBOUND_FLAG_OFF"),
       currentSessionBinding: () =>
         sessionIdentityId
           ? {
