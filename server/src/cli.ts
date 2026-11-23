@@ -425,6 +425,18 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "results") {
+    const { runResultsCommand } = await import("./cli/local-results.js");
+    const code = await runResultsCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "local") {
+    const { runLocalCommand } = await import("./cli/local-results.js");
+    const code = await runLocalCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "memory_ingest") {
     const { runMemoryIngestCommand } = await import("./cli/memory-file.js");
     const code = await runMemoryIngestCommand({ argv: args.slice(1) });

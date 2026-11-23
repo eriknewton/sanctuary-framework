@@ -83,6 +83,7 @@ export const OPLOG_KINDS = [
   "job_committed",
   "job_failed",
   "job_indeterminate",
+  "oplog_exported",
 ] as const;
 export type OplogKind = (typeof OPLOG_KINDS)[number];
 
@@ -179,6 +180,8 @@ export interface OplogBodies {
   job_committed: { request_id: string; chunks: number; output_bytes: number; truncated: boolean; duration_ms: number };
   job_failed: { request_id: string; cause: JobFailureCause };
   job_indeterminate: { request_id: string };
+  /** The operator exported the log; written before the file, naming the head it covers. */
+  oplog_exported: { head_seq: number };
 }
 export type OplogAppendKind = Exclude<OplogKind, "genesis">;
 
@@ -262,6 +265,10 @@ export function validateOplogBody<K extends OplogKind>(kind: K, input: unknown):
       ) {
         throw new LocalStoreError("invalid_record");
       }
+      break;
+    case "oplog_exported":
+      requireExactFields(body, ["head_seq"]);
+      if (!isSeq(body.head_seq)) throw new LocalStoreError("invalid_record");
       break;
     case "prune_blocked":
       requireExactFields(body, ["base_seq"]);

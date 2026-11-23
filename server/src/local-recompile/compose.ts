@@ -12,9 +12,11 @@ import type { PrincipalPolicy } from "../principal-policy/types.js";
 import type { ToolDefinition } from "../router.js";
 import { resolveCustodyLockRoot } from "../storage/cross-process-lock.js";
 import { LocalAuthority } from "./authority.js";
-import type { LocalBindingSource } from "./binding.js";
+import { LOCAL_TASK_SURFACE, type LocalBindingSource } from "./binding.js";
+import type { LocalDashboardSurface } from "./dashboard-routes.js";
 import { ensureLocalStores } from "./ensure-stores.js";
 import { LocalOplog } from "./oplog.js";
+import { LocalOperatorStores } from "./operator-surface.js";
 import { deriveLocalStoreKeys } from "./store-keys.js";
 import {
   createLocalTaskTool,
@@ -49,6 +51,8 @@ export interface LocalTaskStatus {
 export interface ComposedLocalTask {
   tool: ToolDefinition;
   status: LocalTaskStatus;
+  /** Operator-only surface for the dashboard; never handed to an agent-facing path. */
+  operator: LocalDashboardSurface;
   /** Stop the worker and zero the server's copies of the store keys; safe to call more than once. */
   close(): Promise<void>;
 }
@@ -67,13 +71,29 @@ export interface ComposeLocalTaskInput {
   test?: LocalTaskTestSeams;
 }
 
-function disarmed(cause: LocalTaskDisarmCause, test?: LocalTaskTestSeams): ComposedLocalTask {
+function modelTagOf(binding: LocalBindingSource): () => string | null {
+  return () => {
+    const described = binding.describeVerifiedLocalBinding(LOCAL_TASK_SURFACE);
+    return described.ok ? described.descriptor.runtime_tag : null;
+  };
+}
+
+function disarmed(
+  cause: LocalTaskDisarmCause,
+  binding: LocalBindingSource,
+  test?: LocalTaskTestSeams,
+  stores: LocalOperatorStores | null = null,
+): ComposedLocalTask {
   // Operator-side only: the agent sees the fixed unavailable response whatever the cause.
   process.stderr.write(`Sanctuary local tasks disarmed: ${cause}\n`);
+  const status: LocalTaskStatus = { armed: false, cause, workerPid: () => undefined, workerState: () => "state_CLOSED", queueDepth: () => 0 };
   return {
     tool: createLocalTaskTool({ armed: false, cause }, test?.callHook ? { callHook: test.callHook } : {}),
-    status: { armed: false, cause, workerPid: () => undefined, workerState: () => "state_CLOSED", queueDepth: () => 0 },
-    close: async () => undefined,
+    status,
+    operator: { status, modelTag: modelTagOf(binding), stores },
+    close: async () => {
+      stores?.close();
+    },
   };
 }
 
@@ -97,10 +117,10 @@ function awaitReady(subscribe: (listener: (event: WorkerClientEvent) => void) =>
 
 export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<ComposedLocalTask> {
   const test = input.test;
-  if (!input.bootOwnsStorage) return disarmed("storage_injected", test);
+  if (!input.bootOwnsStorage) return disarmed("storage_injected", input.binding, test);
   // Under Vitest the worker starts only on an explicit opt-in, so an ordinary test server never forks one.
-  if (input.underVitest && test?.spawnWorker === undefined) return disarmed("test_runtime", test);
-  if (input.underVitest && test?.spawnWorker === false) return disarmed("test_runtime", test);
+  if (input.underVitest && test?.spawnWorker === undefined) return disarmed("test_runtime", input.binding, test);
+  if (input.underVitest && test?.spawnWorker === false) return disarmed("test_runtime", input.binding, test);
 
   let lockRoot: string;
   try {
@@ -108,18 +128,21 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
     // The server's own lock root, resolved once; the worker is handed exactly this root.
     lockRoot = resolveCustodyLockRoot(process.getuid(), { env: process.env, platform: platform() });
   } catch {
-    return disarmed("lock_root_unavailable", test);
+    return disarmed("lock_root_unavailable", input.binding, test);
   }
 
   const keys = deriveLocalStoreKeys(input.masterKey);
   let client: LocalWorkerClient | undefined;
   let dropLog: LocalOplog | undefined;
+  let operatorStores: LocalOperatorStores | undefined;
   try {
     const ensured = await ensureLocalStores(input.storage, keys, {
       oplog: { runtimeRoot: lockRoot },
       results: { runtimeRoot: lockRoot },
     });
-    if (!ensured.ok) return disarmed("stores_unavailable", test);
+    if (!ensured.ok) return disarmed("stores_unavailable", input.binding, test);
+    // The operator surface reads the verified stores even when the worker later fails to start.
+    operatorStores = new LocalOperatorStores(input.storage, keys, { runtimeRoot: lockRoot });
 
     const authority = new LocalAuthority({
       binding: input.binding,
@@ -155,6 +178,7 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
 
     const armedClient = client;
     const armedDropLog = dropLog;
+    const armedOperatorStores = operatorStores;
     let closed = false;
     const tool = createLocalTaskTool(
       {
@@ -171,15 +195,17 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
       },
       test?.callHook ? { callHook: test.callHook } : {},
     );
+    const status: LocalTaskStatus = {
+      armed: true,
+      cause: null,
+      workerPid: () => armedClient.pid,
+      workerState: () => armedClient.state,
+      queueDepth: () => queueDepth,
+    };
     return {
       tool,
-      status: {
-        armed: true,
-        cause: null,
-        workerPid: () => armedClient.pid,
-        workerState: () => armedClient.state,
-        queueDepth: () => queueDepth,
-      },
+      status,
+      operator: { status, modelTag: modelTagOf(input.binding), stores: armedOperatorStores },
       close: async () => {
         if (closed) return;
         closed = true;
@@ -187,13 +213,14 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
           await armedClient.close();
         } finally {
           armedDropLog.close();
+          armedOperatorStores.close();
         }
       },
     };
   } catch {
     await client?.close().catch(() => undefined);
     dropLog?.close();
-    return disarmed("worker_unavailable", test);
+    return disarmed("worker_unavailable", input.binding, test, operatorStores ?? null);
   } finally {
     // The client and the drop log hold their own copies; the derived bytes are zeroed here.
     keys.oplogKey.fill(0);

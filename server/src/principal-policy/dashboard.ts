@@ -275,6 +275,12 @@ import {
   SENTINEL_API_PREFIX,
   handleSentinelRoute,
 } from "../sentinel/sentinel-routes.js";
+import {
+  handleLocalRoute,
+  LOCAL_API_PREFIX,
+  LOCAL_PAGE_PATH,
+  type LocalDashboardSurface,
+} from "../local-recompile/dashboard-routes.js";
 import type { DistressInbox } from "../distress/inbox.js";
 import {
   DISTRESS_API_PREFIX,
@@ -1474,6 +1480,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * local listener (127.0.0.1:8741) populates. No write/delete surface.
    */
   private distressInbox: DistressInbox | null = null;
+  private localSurface: LocalDashboardSurface | null = null;
 
   /**
    * v1.3 WP-V1.3-3 Omega-1 Coordination Handoff Visualization.
@@ -1794,6 +1801,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Bind the local task operator surface. Once set, `/local` and
+   * `/api/local/*` route through `handleLocalRoute`. Pass `null` to detach.
+   */
+  setLocalSurface(surface: LocalDashboardSurface | null): void {
+    this.localSurface = surface;
+  }
+
+  /**
    * v1.3 WP-V1.3-3 Omega-1: bind the Coordination handoff log +
    * event bridge + audit log + operator id. Once set, requests to
    * `/api/coordination/*` route through `handleCoordinationRoute`.
@@ -2075,6 +2090,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
     if (!this.checkAuth(req, url, res, { allowSession: true })) return true;
     return handleDistressRoute({ inbox: this.distressInbox }, req, res);
+  }
+
+  private async dispatchLocal(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (!this.localSurface) return false;
+    // Operator-only: the same checkAuth gate as `/api/audit-log`, bearer token or login session;
+    // checkAuth writes the 401 itself when it fails.
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+    if (!this.checkAuth(req, url, res, { allowSession: true })) return true;
+    return handleLocalRoute(this.localSurface, req, res);
   }
 
   private async dispatchSentinel(
@@ -6778,6 +6805,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname.startsWith(SENTINEL_API_PREFIX)
     ) {
       this.dispatchSentinel(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    // Local task operator surface at `/local` and `/api/local/*`; must match
+    // LOCAL_DASHBOARD_ROUTES in local-recompile/dashboard-routes.ts.
+    if (
+      this.localSurface &&
+      (url.pathname === LOCAL_PAGE_PATH || url.pathname.startsWith(LOCAL_API_PREFIX))
+    ) {
+      this.dispatchLocal(req, res)
         .then((handled) => {
           if (handled) return;
           this.handleLegacyRequest(req, res, url, method);

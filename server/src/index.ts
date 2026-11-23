@@ -2332,6 +2332,8 @@ export async function createSanctuaryServer(options?: {
     ...(testLocalTask ? { test: testLocalTask } : {}),
   });
   startupLocalTask = localTask;
+  // The operator-only local task routes; the dashboard authenticates them before they run.
+  dashboard?.setLocalSurface(localTask.operator);
 
   // 17. Assemble all tools
   let allTools: ToolDefinition[] = [
