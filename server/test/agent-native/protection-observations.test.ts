@@ -144,7 +144,10 @@ it("protection surfaces share every observed layer", async () => {
     expect(observeProtections(f.runtime, panels).identityLoaded).toBe(false);
     get.mockImplementation(() => { throw new Error("identity unavailable"); });
     expect(observeProtections(f.runtime, panels).identityLoaded).toBeUndefined();
-    expect(status((await f.readTool()).layers, "identity")).toBe("unknown");
+    // The tool's session read fails for a reason other than identity, so it gives the fixed denial.
+    const faulted = await f.readTool() as { denied?: unknown; layers?: unknown };
+    expect(faulted.denied).toBe(true);
+    expect(faulted.layers).toBeUndefined();
     get.mockRestore();
     expect(observeProtections({ ...f.runtime, stateStore: undefined }, panels).encryptedStateStoreConstructed).toBeUndefined();
     const failedScreen = observeProtections({ ...f.runtime, responseScreen: { assertReady() { throw new Error("not ready"); } } }, panels);

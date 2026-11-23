@@ -1,6 +1,7 @@
+// fail-before-exempt: the synthetic help owner now reads as a loaded identity, because a cooperative session is confirmed against the identity manager; the help assertions are unchanged.
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 // fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool (e.g. state_export) is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -927,6 +928,8 @@ describe("agent-native Phase 2 cooperative surface", () => {
     const auditLog = new AuditLog(storage, key);
     const { tools, identityManager, namespaceRegistry } = createL1Tools(new StateStore(storage, key), storage, key, "recovery-key", auditLog);
     let binding: SessionBinding | undefined = session("help-owner");
+    // Test-only manager: the synthetic owner is a loaded identity, so its binding is a confirmed session.
+    vi.spyOn(identityManager, "get").mockImplementation((id: string) => ({ identity_id: id }) as ReturnType<typeof identityManager.get>);
     const facade = createAgentNativeCooperativeTools({ identityManager, namespaceRegistry, auditLog,
       primitiveTools: tools, currentSessionBinding: () => binding,
     }).tools;

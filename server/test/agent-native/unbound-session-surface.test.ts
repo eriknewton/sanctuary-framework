@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createSanctuaryServer } from "../../src/index.js";
 import { DenialLedger } from "../../src/agent-native/denial-ledger.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
@@ -164,14 +165,7 @@ it("who-am-I in a session with no identity answers bound false with the operator
 });
 
 it("who-am-I in a sole-bound session reports the default binding", async () => {
-  const first = await boot("approve");
-  await first.create();
-  await first.app.cleanup();
-  cleanups.pop();
-  const configPath = join(home.defaultFortressPath, "sanctuary.json");
-  const config = JSON.parse(await readFile(configPath, "utf8"));
-  await writeFile(configPath, JSON.stringify({ ...config, session_binding: { sole_identity: true } }));
-  const b = await boot("deny", first.storage);
+  const b = await soleBoot();
   const answer = body(await b.call("sanctuary_who_am_i"));
   expect(answer).toMatchObject({ bound: true, binding_source: "sole_identity", did: expect.any(String) });
 });
@@ -185,14 +179,7 @@ it("active protections answers in a session with no identity and reports the ide
 });
 
 it("active protections in a sole-bound session does not report the identity layer unknown", async () => {
-  const first = await boot("approve");
-  await first.create();
-  await first.app.cleanup();
-  cleanups.pop();
-  const configPath = join(home.defaultFortressPath, "sanctuary.json");
-  const config = JSON.parse(await readFile(configPath, "utf8"));
-  await writeFile(configPath, JSON.stringify({ ...config, session_binding: { sole_identity: true } }));
-  const b = await boot("deny", first.storage);
+  const b = await soleBoot();
   const answer = body(await b.call("sanctuary_active_protections"));
   expect(status(answer.layers, "identity")).toBe("on");
 });
@@ -226,7 +213,7 @@ async function direct(binding: () => SessionBinding | undefined) {
     identityManager, namespaceRegistry, auditLog, currentSessionBinding: binding, primitiveTools: l1Tools, storage, stateStore,
   });
   const call = async (name: string) => body(await tools.find((tool) => tool.name === name)!.handler({}));
-  return { id, call };
+  return { id, call, identityManager };
 }
 
 it("who-am-I, capabilities and active protections give the fixed denial when the session read fails for a reason other than identity", async () => {
@@ -255,4 +242,58 @@ it("who-am-I, capabilities and active protections agree that an expired binding 
   expect(protections.denied).toBeUndefined();
   expect(status(protections.layers, "identity")).toBe("unknown");
   expect(JSON.stringify(protections)).not.toContain(f.id);
+});
+
+async function soleBoot() {
+  const first = await boot("approve");
+  const id = await first.create();
+  await first.app.cleanup();
+  cleanups.pop();
+  const configPath = join(home.defaultFortressPath, "sanctuary.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  await writeFile(configPath, JSON.stringify({ ...config, session_binding: { sole_identity: true } }));
+  return { ...(await boot("deny", first.storage)), id };
+}
+
+it("a cooperative call refuses when the bound identity is gone from the manager", async () => {
+  // A sole binding is frozen at boot, so only the cooperative session read consults the manager on each call.
+  const b = await soleBoot();
+  const id = b.id;
+  // Test-only manager: the bound identity reads as gone once armed; every other lookup is the real one.
+  const realGet = IdentityManager.prototype.get;
+  let armed = false;
+  vi.spyOn(IdentityManager.prototype, "get").mockImplementation(function (this: IdentityManager, lookup: string) {
+    return armed && lookup === id ? undefined : realGet.call(this, lookup);
+  });
+  const ledger = vi.spyOn(DenialLedger.prototype, "record");
+  const before = (await b.gateRows()).length;
+  armed = true;
+  const result = await b.call("sanctuary_remember", { key: "gone", value: "v" });
+  armed = false;
+  expect(result).toEqual(expectedRefusal());
+  const rows = (await b.gateRows()).slice(before);
+  expect(rows.map((row) => row.operation)).toEqual([expect.stringMatching(/^gate_deny:/)]);
+  expect(rows[0]!.details).toMatchObject({ decided_by: "pre_gate" });
+  expect(ledger.mock.calls).toEqual([["pre_gate_argument_refused", expect.objectContaining({ tool: "sanctuary_remember" })]]);
+  expect(b.deny).not.toHaveBeenCalled();
+});
+
+it("who-am-I, capabilities and active protections agree when the bound identity is gone from the manager", async () => {
+  let binding: SessionBinding | undefined;
+  const f = await direct(() => binding);
+  binding = { identity_id: f.id, requester_identity_fingerprint: fingerprintIdentityId(f.id), binding_source: "launch_variable" };
+  // Test-only manager: the bound identity reads as gone; every other lookup is the real one.
+  const realGet = f.identityManager.get.bind(f.identityManager);
+  vi.spyOn(f.identityManager, "get").mockImplementation((lookup: string) => (lookup === f.id ? undefined : realGet(lookup)));
+  const who = await f.call("sanctuary_who_am_i");
+  expect(Object.keys(who).sort()).toEqual(["audit_ref", "bound", "operator_action"]);
+  expect(who).toMatchObject({ bound: false, operator_action: UNCONFIRMED_SENTENCE });
+  const capabilities = await f.call("sanctuary_capabilities");
+  expect(capabilities.session).toEqual({ bound: false, operator_action: UNCONFIRMED_SENTENCE });
+  for (const entry of capabilities.capabilities as Array<{ tool: string; available: boolean }>) {
+    expect(entry.available, entry.tool).toBe(ANSWERING_CATALOG.has(entry.tool));
+  }
+  const protections = await f.call("sanctuary_active_protections");
+  expect(protections.denied).toBeUndefined();
+  expect(status(protections.layers, "identity")).toBe("unknown");
 });

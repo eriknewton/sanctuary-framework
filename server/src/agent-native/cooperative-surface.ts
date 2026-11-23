@@ -7,6 +7,7 @@ import {
   redactAuditEntryForAgent,
 } from "../operational/agent-audit-redaction.js";
 import type { IdentityManager } from "../cognitive/tools.js";
+import type { StoredIdentity } from "../core/identity.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { StateStore } from "../cognitive/state-store.js";
@@ -57,7 +58,7 @@ const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 
 /** One read of the session, named by what it establishes. */
 type SessionView =
-  | { state: "session_BOUND"; identity: ActiveSessionIdentity; binding: SessionBinding; binding_source: SessionBinding["binding_source"] }
+  | { state: "session_BOUND"; identity: ActiveSessionIdentity; record: StoredIdentity; binding: SessionBinding; binding_source: SessionBinding["binding_source"] }
   | { state: "session_NOT_BOUND"; error: SessionIdentityError }
   | { state: "session_UNCONFIRMED"; error: SessionIdentityError };
 
@@ -147,7 +148,11 @@ export function createAgentNativeCooperativeTools(
     const binding = options.currentSessionBinding();
     try {
       const identity = resolveActiveSessionIdentity(binding);
-      return { state: "session_BOUND", identity, binding: binding!, binding_source: binding!.binding_source };
+      // A binding whose identity has left the manager is not an identity. No production path removes one today
+      // (IdentityManager in cognitive/tools.ts has no remove method), so this arm is defence in depth.
+      const record = options.identityManager.get(identity.identity_id);
+      if (!record) return { state: "session_UNCONFIRMED", error: new SessionIdentityError() };
+      return { state: "session_BOUND", identity, record, binding: binding!, binding_source: binding!.binding_source };
     } catch (error) {
       if (error instanceof SessionNotBoundError) return { state: "session_NOT_BOUND", error };
       if (error instanceof SessionIdentityError) return { state: "session_UNCONFIRMED", error };
@@ -876,10 +881,9 @@ export function createAgentNativeCooperativeTools(
             const auditRef = await audit("sanctuary_who_am_i");
             return toolResult({ bound: false, operator_action: operatorActionFor(view), audit_ref: auditRef });
           }
-          // arm_BOUND: every fact comes from the one session read above.
+          // arm_BOUND: every fact comes from the one session read above, including its manager record.
           const activeIdentity = view.identity;
-          const identity = options.identityManager.get(activeIdentity.identity_id);
-          if (!identity) return deny("audit:sanctuary_who_am_i");
+          const identity = view.record;
           const auditRef = await audit("sanctuary_who_am_i");
           return toolResult({
             bound: true,
