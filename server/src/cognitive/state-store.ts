@@ -1930,7 +1930,8 @@ export class StateStore {
    * @param identityId - Identity performing the write
    * @param encryptedPrivateKey - Identity's encrypted private key (for signing)
    * @param identityEncryptionKey - Key to decrypt the identity's private key
-   * @param options - Metadata and the write's required provenance
+   * @param options - Metadata and the write's required provenance (the parameter name must match the options lookup in
+   *   test/structure/state-store-write-provenance.test.ts, which finds the argument by this name)
    */
   async write(
     namespace: string,

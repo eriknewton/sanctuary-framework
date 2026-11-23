@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import ts from "typescript";
 import { createSanctuaryServer } from "../../src/index.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -19,9 +19,6 @@ import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 const SERVER_DIR = join(import.meta.dirname, "../..");
 const SRC_DIR = join(SERVER_DIR, "src");
 const STATE_STORE_FILE = join(SRC_DIR, "cognitive", "state-store.ts");
-// The options parameter's zero-based position in StateStore.write: namespace, key, value, identityId,
-// encryptedPrivateKey, identityEncryptionKey, then options (must match StateStore.write in cognitive/state-store.ts).
-const WRITE_OPTIONS_ARGUMENT_INDEX = 6;
 // Two minutes: a whole-src program build measured at about a second, with headroom for a loaded machine.
 const PROGRAM_BUILD_TIMEOUT_MS = 2 * 60 * 1000;
 
@@ -34,8 +31,8 @@ function propertyInitializer(literal: ts.ObjectLiteralExpression, name: string):
 }
 
 /** Whether a write call's options literal carries provenance with an explicit origin_actor. */
-function namesOrigin(call: ts.CallExpression): boolean {
-  const options = call.arguments[WRITE_OPTIONS_ARGUMENT_INDEX];
+function namesOrigin(call: ts.CallExpression, optionsIndex: number): boolean {
+  const options = call.arguments[optionsIndex];
   if (options === undefined || !ts.isObjectLiteralExpression(options)) return false;
   const provenance = propertyInitializer(options, "provenance");
   return provenance !== undefined && ts.isObjectLiteralExpression(provenance)
@@ -43,9 +40,12 @@ function namesOrigin(call: ts.CallExpression): boolean {
 }
 
 /**
- * Every reference to StateStore.write in src, found through the type checker so a receiver of any name (or a
- * Pick of the class) is matched, and a match inside a comment or string is impossible. Program build cost is the
- * same as the other ts.createProgram structure tests in this directory.
+ * Every dot property access `<receiver>.write` in src whose symbol is StateStore.write, or whose receiver is typed
+ * StateStore, found through the type checker: a receiver of any name (or a Pick of the class) is matched, and a
+ * match inside a comment or string is impossible. A matched access that is the callee of a call is a call site; any
+ * other matched access (for example `const w = store.write`) is reported as a non-call. Bracket access and
+ * destructuring are not visited; the required options parameter and StateStore.write's own provenance check cover
+ * those shapes. Program build cost is the same as the other ts.createProgram structure tests in this directory.
  */
 function stateStoreWriteReferences(): { calls: Array<{ path: string; namesOrigin: boolean }>; nonCalls: string[] } {
   const configFile = ts.readConfigFile(join(SERVER_DIR, "tsconfig.json"), ts.sys.readFile);
@@ -63,10 +63,13 @@ function stateStoreWriteReferences(): { calls: Array<{ path: string; namesOrigin
       ts.isMethodDeclaration(member) && member.name.getText() === "write");
   }
   expect(writeDeclaration, "StateStore.write not found").toBeDefined();
+  // The options argument's position is read from the declaration itself, so the check follows any parameter change.
+  const optionsIndex = writeDeclaration!.parameters.findIndex((parameter) => parameter.name.getText() === "options");
+  expect(optionsIndex, "StateStore.write has no options parameter").toBeGreaterThanOrEqual(0);
   const calls: Array<{ path: string; namesOrigin: boolean }> = [];
   const nonCalls: string[] = [];
   for (const sourceFile of program.getSourceFiles()) {
-    if (sourceFile.isDeclarationFile || !sourceFile.fileName.startsWith(SRC_DIR) || sourceFile === storeSource) continue;
+    if (sourceFile.isDeclarationFile || !sourceFile.fileName.startsWith(SRC_DIR + sep) || sourceFile === storeSource) continue;
     const path = relative(SRC_DIR, sourceFile.fileName);
     const visit = (node: ts.Node): void => {
       if (ts.isPropertyAccessExpression(node) && node.name.text === "write") {
@@ -77,7 +80,7 @@ function stateStoreWriteReferences(): { calls: Array<{ path: string; namesOrigin
             || (receiver.isUnion() && receiver.types.some((type) => type.getSymbol() === classSymbol))));
         if (isStoreWrite) {
           const parent = node.parent;
-          if (ts.isCallExpression(parent) && parent.expression === node) calls.push({ path, namesOrigin: namesOrigin(parent) });
+          if (ts.isCallExpression(parent) && parent.expression === node) calls.push({ path, namesOrigin: namesOrigin(parent, optionsIndex) });
           else nonCalls.push(`${path}:${sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1}`);
         }
       }
@@ -100,7 +103,7 @@ afterEach(async () => {
 describe("state write provenance", () => {
   it("every StateStore.write call site in src passes an explicit origin_actor", () => {
     const { calls, nonCalls } = stateStoreWriteReferences();
-    // The method is only ever called directly, so no aliased reference can drop the options argument.
+    // Every matched dot access is a direct call, so no aliased reference taken through one can drop the options argument.
     expect(nonCalls).toEqual([]);
     const counts: Record<string, number> = {};
     for (const call of calls) {

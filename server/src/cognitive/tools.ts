@@ -1087,6 +1087,32 @@ export function pairStateWriteOriginBinding(bootState: unknown, binding: unknown
 }
 
 /**
+ * Admit a binding to the named arms by its source, as an exhaustive allowlist: a
+ * new binding_source value does not compile until it is classified here, and at
+ * runtime an unknown value refuses. The cases must match SessionBinding's
+ * binding_source in agent-native/safety-base.ts.
+ */
+function assertNamedArmBindingSource(source: SessionBinding["binding_source"]): void {
+  switch (source) {
+    // A launch-variable binding, or one built without a source, names its identity only through the evidence
+    // resolveActiveSessionIdentity has already checked, so it may continue to the named arms.
+    case undefined:
+    case "launch_variable":
+      return;
+    // The boot decision is not the sole state whenever this runs, so a sole source contradicts it; a sole binding
+    // must never reach agent or operator.
+    case "sole_identity":
+      throw new OriginUnresolvedError();
+    default: {
+      // A value outside the union names no arm, so no origin is claimed for it.
+      const unknownSource: never = source;
+      void unknownSource;
+      throw new OriginUnresolvedError();
+    }
+  }
+}
+
+/**
  * Decide a state write's origin from the frozen boot decision and the per-call
  * binding. No arm reaches operator through a catch. Exactly two input
  * combinations stamp operator without a named binding: no binding accessors at
@@ -1140,9 +1166,8 @@ export function resolveStateWriteOrigin(input: StateWriteOriginBinding & { ident
     // arm_NAMED_UNRESOLVED: a binding without valid identity evidence names no one, so no origin is claimed for it.
     throw new OriginUnresolvedError({ cause });
   }
-  // arm_SOLE_SOURCE_MISMATCH: the boot decision here is not the sole state, so a binding that claims a sole source
-  // contradicts it; a sole binding must never reach agent or operator, so the write refuses.
-  if (binding.binding_source === "sole_identity") throw new OriginUnresolvedError();
+  // arm_SOLE_SOURCE_MISMATCH: only an allowed source continues to the named arms; a sole or unknown source refuses.
+  assertNamedArmBindingSource(binding.binding_source);
   // arm_NAMED_OWN_AGENT: the launch-variable session's own write is the agent's.
   if (activeIdentityId === input.identityId) return "agent";
   // arm_NAMED_OTHER_OPERATOR: a write signed by an identity other than the bound one stays the operator's.

@@ -165,6 +165,8 @@ const BINDINGS: Array<[string, (() => SessionBinding | undefined) | undefined, E
   ["named other", () => boundTo(OTHER, "launch_variable"), "operator"],
   ["sole-sourced own", () => boundTo(OWN, "sole_identity"), "unresolved"],
   ["sole-sourced other", () => boundTo(OTHER, "sole_identity"), "unresolved"],
+  // A source value outside the SessionBinding union, as a JS caller or a cast could supply.
+  ["unknown-sourced own", () => ({ ...boundTo(OWN), binding_source: "source_NOT_KNOWN" as unknown as SessionBinding["binding_source"] }), "unresolved"],
   ["unresolved", () => ({ identity_id: OWN }), "unresolved"],
   ["expired", () => ({ ...boundTo(OWN, "launch_variable"), expires_at: new Date(Date.now() - 1000).toISOString() }), "unresolved"],
   ["throwing", () => { throw new Error("binding read failed"); }, "unresolved"],
@@ -243,6 +245,10 @@ describe("a write whose binding cannot be paired with its boot decision refuses"
       resolveStateWriteOrigin({ binding, identityId: OWN });
       // @ts-expect-error a boot decision supplied without its binding does not type-check
       resolveStateWriteOrigin({ bootState, identityId: OWN });
+      // @ts-expect-error an explicitly undefined boot decision beside a binding does not type-check
+      resolveStateWriteOrigin({ bootState: undefined, binding, identityId: OWN });
+      // @ts-expect-error an explicitly undefined binding beside a boot decision does not type-check
+      resolveStateWriteOrigin({ bootState, binding: undefined, identityId: OWN });
     };
     expect(typeof typeOnly).toBe("function");
   });
