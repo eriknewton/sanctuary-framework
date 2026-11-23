@@ -100,7 +100,8 @@ export async function bootLocalTaskServer(options: {
 
 /** The worker pid as the runtime's local task status reports it. */
 export function localTaskPid(runtime: Awaited<ReturnType<typeof createSanctuaryServer>>): number | undefined {
-  return runtime.localTask.workerPid();
+  // Optional so a wired-consumer test run against a base without the tool fails on its assertion, not here.
+  return (runtime as Partial<typeof runtime>).localTask?.workerPid();
 }
 
 export const VALID_ARGS = {
