@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * CAPABILITY (STATE-DISCLOSE-UNATTRIB-01), MCP half: the unattributed
  * disclosure is reachable through a WIRED tool built by the production
@@ -208,7 +209,7 @@ describe("the unattributed-disclosure MCP tool", () => {
       "routine-value",
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const payload = parseToolResult(

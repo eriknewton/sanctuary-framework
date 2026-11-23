@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * CAPABILITY (STATE-READ-REFUSE-01): the enforcing read path returns a value
  * only when signature verification established who wrote the entry. An entry
@@ -172,7 +173,7 @@ describe("the enforcing read path refuses a value it cannot attribute", () => {
       "routine-value",
       identity.identity_id,
       identity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const read = await stateStore.read(NAMESPACE, "attributable");
@@ -210,7 +211,7 @@ describe("the enforcing read path refuses a value it cannot attribute", () => {
         `ALLOW=v${version}`,
         identity.identity_id,
         identity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
     const anchors = await storage.read(ANCHORS_NAMESPACE, ANCHORS_KEY);

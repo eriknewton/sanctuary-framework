@@ -3545,6 +3545,8 @@ async function rekeyState(
               ]
             : []),
         ],
+        // An exit import is a Tier 1 operator-approved operation, so its entries are the operator's; no bundle field supplies this origin.
+        provenance: { origin_actor: "operator" },
         // N4 (coordinator gate, 2026-08-22): THIS import's own journal is
         // present on disk for the entire duration of this call (written
         // before staging, deleted only after full activation) - see

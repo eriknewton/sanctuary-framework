@@ -1,4 +1,4 @@
-// fail-before-exempt: pins that every content tool refuses or skips the local store names before storage access.
+// fail-before-exempt: passes the origin every state write now requires; still pins that every content tool refuses or skips the local store names before storage access.
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -169,7 +169,7 @@ beforeAll(async () => {
     for (const namespace of [...AGENT_DISCOVERY_SKIPPED_NAMESPACES, "_identities", ORDINARY_NAMESPACE]) {
       const source = new MemoryStorage();
       const state = new StateStore(source, runtime.masterKey);
-      await state.write(namespace, "one", "fixture", identity.identity_id, identity.encrypted_private_key, key);
+      await state.write(namespace, "one", "fixture", identity.identity_id, identity.encrypted_private_key, key, { provenance: { origin_actor: "operator" } });
       const opened = await state.read(namespace, "one", fromBase64url(identity.public_key));
       expect(opened).toMatchObject({ value: "fixture", signature_verified: true, integrity_verified: true });
       const entry = JSON.parse(Buffer.from((await source.read(namespace, "one"))!).toString());

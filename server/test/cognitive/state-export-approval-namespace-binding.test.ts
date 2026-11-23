@@ -1,4 +1,4 @@
-// fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * State export executes exactly the namespace set bound to each Tier-1 approval.
  * LEGACY-BUG-001
@@ -109,7 +109,7 @@ describe("state_export approval namespace binding", () => {
         value,
         identity.storedIdentity.identity_id,
         identity.storedIdentity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
 
@@ -202,7 +202,7 @@ describe("state_export approval namespace binding", () => {
       // While approval is pending, create durable state outside its scope.
       await seedingStore.write(
         "C", "k", "charlie", identity.storedIdentity.identity_id,
-        identity.storedIdentity.encrypted_private_key, identityEncKey,
+        identity.storedIdentity.encrypted_private_key, identityEncKey, { provenance: { origin_actor: "operator" } },
       );
       await client.callTool({
         name: "state_list",
@@ -257,7 +257,7 @@ describe("state_export approval namespace binding", () => {
         value,
         identity.storedIdentity.identity_id,
         identity.storedIdentity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
 
@@ -345,7 +345,7 @@ describe("state_export approval namespace binding", () => {
       // Widen durable storage WHILE export 1's approval is still pending.
       await seedingStore.write(
         "C", "k", "charlie", identity.storedIdentity.identity_id,
-        identity.storedIdentity.encrypted_private_key, identityEncKey,
+        identity.storedIdentity.encrypted_private_key, identityEncKey, { provenance: { origin_actor: "operator" } },
       );
       await client.callTool({
         name: "state_list",
@@ -430,7 +430,7 @@ describe("state_export approval namespace binding", () => {
         value,
         identity.storedIdentity.identity_id,
         identity.storedIdentity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
 
@@ -509,7 +509,7 @@ describe("state_export approval namespace binding", () => {
       // Widen durable storage WHILE the session-bound approval is pending.
       await seedingStore.write(
         "F", "k", "foxtrot", identity.storedIdentity.identity_id,
-        identity.storedIdentity.encrypted_private_key, identityEncKey,
+        identity.storedIdentity.encrypted_private_key, identityEncKey, { provenance: { origin_actor: "operator" } },
       );
       await client.callTool({
         name: "state_list",
@@ -572,7 +572,7 @@ describe("state_export approval namespace binding", () => {
       "alpha",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await seedingStore.write(
       "B",
@@ -580,7 +580,7 @@ describe("state_export approval namespace binding", () => {
       "bravo",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const stateStore = new StateStore(storage, masterKey);
@@ -727,7 +727,7 @@ describe("state_export approval namespace binding", () => {
       "alpha",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const stateStore = new StateStore(storage, masterKey);

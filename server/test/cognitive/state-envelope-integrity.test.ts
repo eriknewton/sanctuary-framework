@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 import { describe, expect, it } from "vitest";
 import { encrypt } from "../../src/core/encryption.js";
 import {
@@ -196,7 +197,7 @@ describe("state envelope integrity", () => {
       "locally retained value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     const { updatedIdentity } = rotateKeys(
       identity.storedIdentity,
@@ -222,7 +223,7 @@ describe("state envelope integrity", () => {
       "trusted value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const read = await stateStore.read("memory", "profile");
@@ -241,7 +242,7 @@ describe("state envelope integrity", () => {
       "trusted value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const entry = await readEntry(storage, "memory", "profile");
@@ -268,7 +269,7 @@ describe("state envelope integrity", () => {
       "trusted value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const entry = await readEntry(storage, "memory", "profile");
@@ -298,7 +299,7 @@ describe("state envelope integrity", () => {
       "trusted value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const entry = await readEntry(storage, "memory", "profile");
@@ -323,7 +324,7 @@ describe("state envelope integrity", () => {
       "v1",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     const versionOne = await storage.read("memory", "profile");
 
@@ -333,7 +334,7 @@ describe("state envelope integrity", () => {
       "v2",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     await storage.write("memory", "profile", versionOne!);
@@ -356,7 +357,7 @@ describe("state envelope integrity", () => {
       "trusted value",
       victimKid,
       rogueIdentity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     expect(await storage.read("_identities", victimKid)).toBeNull();
 
@@ -517,7 +518,7 @@ describe("state envelope integrity", () => {
       "current-v2",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await stateStore.read("memory", "balance"); // persists the version anchor
 
@@ -593,7 +594,7 @@ describe("state envelope integrity", () => {
       "v2-a",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await stateStore.write(
       "memory",
@@ -601,7 +602,7 @@ describe("state envelope integrity", () => {
       "v2-b",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await stateStore.read("memory", "balance"); // persists the MAC'd anchor (=2)
 
@@ -632,7 +633,7 @@ describe("state envelope integrity", () => {
       "v2-a",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     await seed.write(
       "memory",
@@ -640,7 +641,7 @@ describe("state envelope integrity", () => {
       "v2-b",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     // Attacker strips the marker and writes a BOGUS inflated floor (99), trying
@@ -662,7 +663,7 @@ describe("state envelope integrity", () => {
       "v2-c",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     expect(result.version).toBe(3);
   });
@@ -677,7 +678,7 @@ describe("state envelope integrity", () => {
         v,
         identity.storedIdentity.identity_id,
         identity.storedIdentity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
     // Downgrade the anchor record to the legacy bare format (pre-F1 fortress).
@@ -701,7 +702,7 @@ describe("state envelope integrity", () => {
       "d",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
     expect(result.version).toBe(4);
   });
@@ -717,7 +718,7 @@ describe("state envelope integrity", () => {
       "trusted value",
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     const entry = await readEntry(storage, "memory", "profile");

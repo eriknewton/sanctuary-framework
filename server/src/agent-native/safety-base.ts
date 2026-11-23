@@ -212,6 +212,7 @@ export class ApprovalProofStore {
 }
 
 export interface SessionBinding {
+  // Every source must be classified by assertNamedArmBindingSource in cognitive/tools.ts, which stamps a write's origin.
   binding_source?: "launch_variable" | "sole_identity";
   identity_id?: string;
   requester_identity_fingerprint?: `sha256:${string}`;

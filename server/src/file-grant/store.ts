@@ -101,7 +101,12 @@ export class FileGrantStore {
       this.identity.identityId,
       this.identity.encryptedPrivateKey,
       this.identity.identityEncryptionKey,
-      { content_type: "application/json", tags: ["file-grant"] }
+      {
+        content_type: "application/json",
+        tags: ["file-grant"],
+        // Records of this store are operator-owned at exit, the value this write carried before provenance was required.
+        provenance: { origin_actor: "operator" },
+      }
     );
   }
 

@@ -122,7 +122,8 @@ async function seedSchema2Entry(
     value,
     target.identity.identity_id,
     target.identity.encrypted_private_key,
-    target.identityEncKey
+    target.identityEncKey,
+    { provenance: { origin_actor: "operator" } }
   );
 }
 

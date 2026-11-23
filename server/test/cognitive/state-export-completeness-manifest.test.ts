@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 import { describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -160,7 +161,7 @@ async function writeEntry(
     value,
     identity.storedIdentity.identity_id,
     identity.storedIdentity.encrypted_private_key,
-    identityEncKey
+    identityEncKey, { provenance: { origin_actor: "operator" } }
   );
 }
 

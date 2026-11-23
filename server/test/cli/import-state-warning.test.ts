@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -304,7 +305,7 @@ describe("exit import state warning", () => {
       "durable state survives CLI import",
       source.identity.identity_id,
       source.identity.encrypted_private_key,
-      source.identityEncryptionKey,
+      source.identityEncryptionKey, { provenance: { origin_actor: "operator" } },
     );
     const bundleDir = await exportBundle(source, ["agent-memory"]);
 
@@ -376,7 +377,7 @@ describe("exit import state warning", () => {
       "no false rollback freeze on legitimate import",
       source.identity.identity_id,
       source.identity.encrypted_private_key,
-      source.identityEncryptionKey,
+      source.identityEncryptionKey, { provenance: { origin_actor: "operator" } },
     );
     const bundleDir = await exportBundle(source, ["agent-memory"]);
 
@@ -433,7 +434,7 @@ describe("exit import state warning", () => {
       "partial imports must not look successful",
       source.identity.identity_id,
       source.identity.encrypted_private_key,
-      source.identityEncryptionKey,
+      source.identityEncryptionKey, { provenance: { origin_actor: "operator" } },
     );
     const bundleDir = await exportBundle(source, ["agent-memory"]);
     await addReservedStateEntryAndResign(bundleDir, source);
@@ -496,7 +497,7 @@ describe("exit import state warning", () => {
       "partial imports must not look successful",
       source.identity.identity_id,
       source.identity.encrypted_private_key,
-      source.identityEncryptionKey,
+      source.identityEncryptionKey, { provenance: { origin_actor: "operator" } },
     );
     const bundleDir = await exportBundle(source, ["agent-memory"]);
     await addUnknownKidStateEntryAndResign(bundleDir, source);
@@ -553,7 +554,7 @@ describe("exit import state warning", () => {
       "rotation history cannot be silently dropped",
       source.identity.identity_id,
       source.identity.encrypted_private_key,
-      source.identityEncryptionKey,
+      source.identityEncryptionKey, { provenance: { origin_actor: "operator" } },
     );
     const bundleDir = await exportBundle(source, ["agent-memory"]);
     await addRotationHistoryAndResign(bundleDir, source);

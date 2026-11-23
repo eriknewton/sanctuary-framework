@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Task coordination -- a task listing stays available across a row it cannot
  * read (FG-RECONCILE-SIBLINGS-01).
@@ -98,7 +99,7 @@ describe("TaskService.list: one unread row never empties the listing", () => {
       storedIdentity.identity_id,
       storedIdentity.encrypted_private_key,
       derivePurposeKey(masterKey, "identity-encryption"),
-      { content_type: "application/json", tags: ["task"] },
+      { provenance: { origin_actor: "operator" }, content_type: "application/json", tags: ["task"] },
     );
 
     const listed = await service.list();

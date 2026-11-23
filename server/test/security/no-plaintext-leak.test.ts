@@ -1,4 +1,4 @@
-// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Security Test: No Plaintext Leak
  *
@@ -40,7 +40,7 @@ describe("No Plaintext Leak", () => {
       sensitiveValue,
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     // Scan all stored data for the plaintext value
@@ -70,7 +70,7 @@ describe("No Plaintext Leak", () => {
         secrets[i]!,
         identity.storedIdentity.identity_id,
         identity.storedIdentity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
 
@@ -95,7 +95,7 @@ describe("No Plaintext Leak", () => {
       value,
       identity.storedIdentity.identity_id,
       identity.storedIdentity.encrypted_private_key,
-      identityEncKey
+      identityEncKey, { provenance: { origin_actor: "operator" } }
     );
 
     // Read through the StateStore should return the original value

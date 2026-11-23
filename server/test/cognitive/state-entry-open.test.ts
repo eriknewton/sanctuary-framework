@@ -1,4 +1,4 @@
-// fail-before-exempt: new state-entry opener module, no base behaviour; the state store's read is the parity reference.
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour beyond the opener parity it already pinned.
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { encrypt } from "../../src/core/encryption.js";
@@ -73,7 +73,7 @@ function classification(promise: Promise<unknown>): Promise<string | undefined> 
 describe("state entry opener", () => {
   it("a record opened through the extracted function equals the state store's read", async () => {
     const { storage, stateStore, identity, identityEncKey, resolveWriterKeys } = await makeRig();
-    await stateStore.write(NAMESPACE, "entry", "a routine value", identity.identity_id, identity.encrypted_private_key, identityEncKey);
+    await stateStore.write(NAMESPACE, "entry", "a routine value", identity.identity_id, identity.encrypted_private_key, identityEncKey, { provenance: { origin_actor: "operator" } });
 
     const opened = await openStateEntry(await rawEntry(storage, "entry"), {
       namespace: NAMESPACE,
@@ -89,7 +89,7 @@ describe("state entry opener", () => {
 
   it("a record whose signature does not verify is refused as the state store refuses it", async () => {
     const { storage, stateStore, identity, identityEncKey, resolveWriterKeys } = await makeRig();
-    await stateStore.write(NAMESPACE, "entry", "a routine value", identity.identity_id, identity.encrypted_private_key, identityEncKey);
+    await stateStore.write(NAMESPACE, "entry", "a routine value", identity.identity_id, identity.encrypted_private_key, identityEncKey, { provenance: { origin_actor: "operator" } });
     const entry = JSON.parse(new TextDecoder().decode(await rawEntry(storage, "entry"))) as StateEntry;
     entry.sig = toBase64url(ed25519.sign(Buffer.from(entry.payload.ct, "base64url"), OTHER_PRIVATE_KEY));
     await storage.write(NAMESPACE, "entry", stringToBytes(JSON.stringify(entry)));
@@ -122,7 +122,7 @@ describe("state entry opener", () => {
 
   it("a record opened under the wrong namespace key is refused", async () => {
     const { storage, stateStore, identity, identityEncKey, resolveWriterKeys } = await makeRig();
-    await stateStore.write(NAMESPACE, "entry", "a routine value", identity.identity_id, identity.encrypted_private_key, identityEncKey);
+    await stateStore.write(NAMESPACE, "entry", "a routine value", identity.identity_id, identity.encrypted_private_key, identityEncKey, { provenance: { origin_actor: "operator" } });
 
     await expect(
       openStateEntry(await rawEntry(storage, "entry"), {

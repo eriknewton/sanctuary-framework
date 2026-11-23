@@ -1,3 +1,4 @@
+// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
 /**
  * Security Test: SEC-005 - Import Verifies Ed25519 Signatures
  *
@@ -63,7 +64,7 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
         value,
         identity.storedIdentity.identity_id,
         identity.storedIdentity.encrypted_private_key,
-        identityEncKey
+        identityEncKey, { provenance: { origin_actor: "operator" } }
       );
     }
 
