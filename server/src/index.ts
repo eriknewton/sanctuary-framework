@@ -2769,8 +2769,9 @@ function instructionsSessionFor(state: SessionBindingState): InstructionsSession
     case "state_NAMED_UNRESOLVED":
       return "unbound";
     default: {
+      // An unmapped state throws at boot, so no state the switch does not name can render the bound lead.
       const exhaustive: never = state;
-      return exhaustive;
+      throw new Error(`Unmapped session binding state for instructions: ${String(exhaustive)}`);
     }
   }
 }

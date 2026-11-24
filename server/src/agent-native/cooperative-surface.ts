@@ -45,7 +45,8 @@ import {
   type CompoundExecutableToolName,
 } from "./tool-names.js";
 
-// The catalog half must match UNBOUND_CATALOG_TOOLS in capabilities-catalog.ts.
+// Must match UNBOUND_CATALOG_TOOLS in capabilities-catalog.ts: this set is that catalog set plus
+// sanctuary_capabilities, which answers unbound but has no catalog row.
 const UNBOUND_COOPERATIVE_TOOLS = new Set<string>([
   COOPERATIVE_TOOL_NAMES.help, COOPERATIVE_TOOL_NAMES.capabilities,
   COOPERATIVE_TOOL_NAMES.whoAmI, COOPERATIVE_TOOL_NAMES.activeProtections,

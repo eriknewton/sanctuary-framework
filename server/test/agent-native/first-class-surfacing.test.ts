@@ -349,6 +349,25 @@ describe("instructions follow the boot decision", () => {
     expect(instructions).not.toContain("\u2014");
   });
 
+  it("in an unbound session the catalog tools the instructions leave unmarked are exactly the ones capabilities marks available, and capabilities answers with no catalog row", async () => {
+    const { storage } = await fortress();
+    const b = await boot(storage);
+    const catalogLines = lines(b.client.getInstructions()!).flatMap((line) => {
+      const match = /^- (sanctuary_\w+): /.exec(line);
+      return match ? [{ tool: match[1]!, marked: line.endsWith(NEEDS_IDENTITY) }] : [];
+    });
+    const unmarked = new Set(catalogLines.filter((entry) => !entry.marked).map((entry) => entry.tool));
+    const capabilities = await b.call("sanctuary_capabilities");
+    const entries = capabilities.capabilities as Array<{ tool: string; available: boolean }>;
+    const available = new Set(entries.filter((entry) => entry.available).map((entry) => entry.tool));
+    // Set equality holds in both directions: no unmarked line is unavailable and no available tool is marked.
+    expect(available).toEqual(unmarked);
+    expect(new Set(entries.map((entry) => entry.tool))).toEqual(new Set(catalogLines.map((entry) => entry.tool)));
+    // The answering surface is the catalog's answering set plus capabilities, which has no catalog row.
+    expect(entries.map((entry) => entry.tool)).not.toContain("sanctuary_capabilities");
+    expect(new Set([...available, "sanctuary_capabilities"])).toEqual(new Set(["sanctuary_help", "sanctuary_capabilities", "sanctuary_who_am_i", "sanctuary_active_protections"]));
+  });
+
   it("sole-bound instructions name default binding and unattributed notes, and make no claim about other processes", async () => {
     const { home, storage } = await fortress();
     await createIdentity(storage);

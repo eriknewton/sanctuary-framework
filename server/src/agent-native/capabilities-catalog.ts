@@ -372,7 +372,8 @@ const SESSION_LINES: Record<InstructionsSession, string> = {
   unbound: `Session: no identity. ${COOPERATIVE_TOOL_NAMES.help}, ${COOPERATIVE_TOOL_NAMES.capabilities}, ${COOPERATIVE_TOOL_NAMES.whoAmI} and ${COOPERATIVE_TOOL_NAMES.activeProtections} answer; the other cooperative tools refuse. ${COOPERATIVE_TOOL_NAMES.whoAmI} says what to tell your operator.`,
 };
 
-// Catalog tools that answer in a session with no identity; must match UNBOUND_COOPERATIVE_TOOLS in cooperative-surface.ts.
+// Catalog tools that answer in a session with no identity. Must match UNBOUND_COOPERATIVE_TOOLS in
+// cooperative-surface.ts: that set is this one plus sanctuary_capabilities, which has no catalog row.
 const UNBOUND_CATALOG_TOOLS: ReadonlySet<string> = new Set([
   COOPERATIVE_TOOL_NAMES.help, COOPERATIVE_TOOL_NAMES.whoAmI, COOPERATIVE_TOOL_NAMES.activeProtections,
 ]);
