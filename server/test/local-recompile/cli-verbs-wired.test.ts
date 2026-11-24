@@ -22,6 +22,11 @@ const VERBS: Array<[verb: string, argv: string[], usage: string]> = [
   ["local", ["local", "--help"], "Usage: sanctuary local log <command> [options]"],
   ["local", ["local"], "Usage: sanctuary local log <command> [options]"],
 ];
+// Must match the results and local lines of printHelp in src/cli.ts.
+const TOP_LEVEL_HELP_LINES = [
+  "  sanctuary results <cmd> [opts]          # Local model task results",
+  "  sanctuary local log <cmd> [opts]        # Local task operator log",
+];
 // The CLI waits on nothing for a help form; this bounds a hang.
 const CLI_TIMEOUT_MS = 60_000;
 
@@ -38,6 +43,15 @@ describe("the results and local verbs in the built CLI", () => {
     const result = await run(process.execPath, [CLI, ...argv], { env, timeout: CLI_TIMEOUT_MS }).catch((error: { stdout?: string; stderr?: string; code?: number }) => error);
     expect(result.stdout ?? "").toContain(usage);
     expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).not.toMatch(/unknown command/i);
+  });
+
+  it("the top-level help lists both verbs", async () => {
+    const home = await mkdtemp(join(tmpdir(), "local-verbs-"));
+    temps.push(home);
+    const env = { PATH: process.env.PATH ?? "", HOME: home, SANCTUARY_STORAGE_PATH: join(home, ".sanctuary"), NO_COLOR: "1" };
+    const result = await run(process.execPath, [CLI, "--help"], { env, timeout: CLI_TIMEOUT_MS });
+    const lines = result.stdout.split("\n");
+    for (const line of TOP_LEVEL_HELP_LINES) expect(lines).toContain(line);
   });
 
   it("both verbs are listed and completed", async () => {

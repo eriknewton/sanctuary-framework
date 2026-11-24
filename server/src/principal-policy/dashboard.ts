@@ -900,7 +900,9 @@ function isFleetPostureReadRoute(method: string, path: string): boolean {
  * carries the same rule, but it is gated in {@link dispatchApprovalInbox}
  * instead, because `handleRequest` routes that prefix to its own router BEFORE
  * `handleLegacyRequest` runs, so a path added here would never be evaluated for
- * it. Adding one would be dead code that reads like coverage.
+ * it. Adding one would be dead code that reads like coverage. The local task
+ * surface (`/local`, `/api/local/*`) is routed the same way and carries the same
+ * rule in {@link dispatchLocal}.
  */
 export function isOperatorOnlyReadRoute(method: string, path: string): boolean {
   return (
@@ -2097,10 +2099,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     res: ServerResponse,
   ): Promise<boolean> {
     if (!this.localSurface) return false;
-    // Operator-only: the same checkAuth gate as `/api/audit-log`, bearer token or login session;
+    // Invariant: loopback position is not operator identity, because the agent can share the
+    // loopback interface. Every route in LOCAL_DASHBOARD_ROUTES, the page included, admits only an
+    // operator-derived credential (the bearer, or a session or cookie minted from it). This is the
+    // one gate for the prefix: handleRequest routes it here before handleLegacyRequest's gate runs.
     // checkAuth writes the 401 itself when it fails.
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
-    if (!this.checkAuth(req, url, res, { allowSession: true })) return true;
+    if (!this.checkAuth(req, url, res, { allowSession: true, denyLoopbackAutoAuth: true })) return true;
     return handleLocalRoute(this.localSurface, req, res);
   }
 

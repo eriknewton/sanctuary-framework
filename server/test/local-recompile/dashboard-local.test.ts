@@ -30,7 +30,7 @@ afterEach(async () => {
   for (const step of cleanups.splice(0).reverse()) await step();
 });
 
-async function start(options: { stores?: boolean; armed?: boolean } = {}) {
+async function start(options: { stores?: boolean; armed?: boolean; loopbackAutoAuth?: boolean } = {}) {
   const fixture: OperatorFixture = await operatorFixture();
   cleanups.push(() => fixture.close());
   const keys = deriveLocalStoreKeys(fixture.masterKey);
@@ -50,13 +50,15 @@ async function start(options: { stores?: boolean; armed?: boolean } = {}) {
   const port = await getFreePort();
   const dashboard = new DashboardApprovalChannel({ port, host: "127.0.0.1", timeout_seconds: 30, auth_token: authToken, auto_open: false });
   dashboard.setLocalSurface(surface);
+  if (options.loopbackAutoAuth) dashboard.setAutoAuthLocalhost(true);
   await dashboard.start();
   cleanups.push(() => dashboard.stop());
   const call = async (method: string, path: string) => {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { Authorization: `Bearer ${authToken}` } });
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
   };
-  return { fixture, call };
+  const tokenless = async (method: string, path: string) => (await fetch(`http://127.0.0.1:${port}${path}`, { method })).status;
+  return { fixture, call, tokenless };
 }
 
 describe("local task dashboard", () => {
@@ -127,5 +129,16 @@ describe("local task dashboard", () => {
     expect((await h.call("GET", "/api/local/results")).status).toBe(503);
     expect((await h.call("GET", "/api/local/log")).status).toBe(503);
     expect((await h.call("GET", "/api/local/status")).body.cause).toBe("worker_unavailable");
+  });
+
+  it("with loopback auto-auth on, a tokenless loopback request to every route is refused and writes no operator-log row", async () => {
+    const h = await start({ loopbackAutoAuth: true });
+    const id = await h.fixture.seed(1, "text");
+    const driven = LOCAL_DASHBOARD_ROUTES.map((route) => ({ ...route, url: route.path.replace(":id", id) }));
+    expect(new Set(driven.map((route) => `${route.method} ${route.path}`))).toEqual(new Set(LOCAL_DASHBOARD_ROUTES.map((route) => `${route.method} ${route.path}`)));
+    const before = await h.fixture.rows();
+    for (const route of driven) expect(await h.tokenless(route.method, route.url), `${route.method} ${route.path}`).toBe(401);
+    expect(await h.fixture.rows()).toEqual(before);
+    expect(await h.fixture.hasResult(id)).toBe(true);
   });
 });

@@ -159,7 +159,14 @@ export const LOCAL_PAGE_HTML = `<!doctype html>
 <script>
 const NOTICE = ${JSON.stringify(LOCAL_SUMMARY_NOTICE)};
 const el = (id) => document.getElementById(id);
-async function get(path, init) { const res = await fetch(path, { credentials: "same-origin", ...init }); return res.json(); }
+// The routes refuse loopback position alone, so the page passes on the session it was opened with.
+const SESSION = new URLSearchParams(location.search).get("session");
+function withSession(path) { return SESSION ? path + (path.includes("?") ? "&" : "?") + "session=" + encodeURIComponent(SESSION) : path; }
+async function get(path, init) {
+  const res = await fetch(withSession(path), { credentials: "same-origin", ...init });
+  if (res.status === 401) { el("status").textContent = "Sign in to the Sanctuary dashboard to see local tasks."; throw new Error("unauthenticated"); }
+  return res.json();
+}
 async function refresh() {
   const status = await get("/api/local/status");
   el("status").textContent = status.armed ? "Local tasks are on." : "Local tasks are off (" + status.cause + ").";

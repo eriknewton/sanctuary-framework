@@ -1067,6 +1067,8 @@ Usage:
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
+  sanctuary results <cmd> [opts]          # Local model task results
+  sanctuary local log <cmd> [opts]        # Local task operator log
   sanctuary memory_ingest [opts]          # Mirror harness memory into SDW
   sanctuary memory_emit [opts]            # Emit harness memory from SDW
   sanctuary memory_archive_export [opts]  # Export one SDW archive through Exit V2
