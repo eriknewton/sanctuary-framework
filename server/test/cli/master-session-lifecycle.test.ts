@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 import { describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -57,6 +58,7 @@ import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import * as isolation from "../../src/sdw/memory-isolation.js";
 import * as brokerOpen from "../../src/disclosure/broker/open.js";
 import { SURROGATE_WIRE_VERSION } from "../../src/credential-surrogate/wire.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 const passphrase = "consumer-session-fixture-passphrase";
 const supported = locks.kernelBackedCrossProcessLockPlatformSupported(process.platform);
@@ -292,7 +294,7 @@ describe.skipIf(!supported)("CLI consuming finalization", () => {
   it("doctor propagates establishment release failure instead of continuing without a key", async () => {
     const releaseError = new Error("establishment release rejected");
     await fixture(true, async (f) => {
-      await expect(runDoctorChecks({ storagePath: f.root, platform: process.platform,
+      await expect(runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: f.root, platform: process.platform,
         env: { ...f.env, SANCTUARY_PASSPHRASE: "wrong-passphrase" },
       })).rejects.toMatchObject({ errors: expect.arrayContaining([releaseError]) });
       await released(f);

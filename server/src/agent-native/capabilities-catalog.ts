@@ -51,7 +51,7 @@ export const COOPERATIVE_CAPABILITIES: readonly CapabilityEntry[] = [
   },
   {
     tool: COOPERATIVE_TOOL_NAMES.whoAmI,
-    does: "Returns the disclosable identity facts for this session (label, did, identity fingerprint, memory namespace handle). Never returns private keys.",
+    does: "Returns whether this session has an identity and how it was bound, with the disclosable identity facts when it does (label, did, identity fingerprint, memory namespace handle). Never returns private keys.",
     when: "You need to confirm which sovereign identity you are operating as.",
   },
   {
@@ -341,6 +341,44 @@ export const REFUSAL_INSTRUCTION_LINE =
   "A refusal does not say why. If a call is refused, do not repeat it as it is: change the request, or tell your operator what you were trying to do." as const;
 
 /**
+ * What to tell the operator when the session has no identity. Must match
+ * operatorActionFor in agent-native/cooperative-surface.ts (who-am-I and
+ * capabilities) and the literal asserted in
+ * test/agent-native/operator-sentences.test.ts.
+ */
+export const UNBOUND_OPERATOR_ACTION =
+  "This session has no Sanctuary identity. Tell your operator; they can enable default binding with sanctuary session-binding enable or name an identity with SANCTUARY_SESSION_IDENTITY_ID, then restart this server." as const;
+
+/**
+ * What to tell the operator when the session's binding names an identity that
+ * cannot be confirmed (expired, mismatched, or gone from the manager). Must
+ * match operatorActionFor in agent-native/cooperative-surface.ts and the
+ * literal asserted in test/agent-native/operator-sentences.test.ts.
+ */
+export const UNCONFIRMED_OPERATOR_ACTION =
+  "This session's identity could not be confirmed. Tell your operator and restart this server." as const;
+
+/**
+ * The instructions variant for one process, from its frozen boot decision.
+ * Must match the boot-state switch at the createServer call in index.ts,
+ * which maps every SessionBindingState in session-binding-state.ts.
+ */
+export type InstructionsSession = "named" | "sole" | "unbound";
+
+// The lines reflect the frozen boot decision; sanctuary_who_am_i is the live answer.
+const SESSION_LINES: Record<InstructionsSession, string> = {
+  named: `Session: bound to the identity your operator named at launch. Call ${COOPERATIVE_TOOL_NAMES.whoAmI} to see it.`,
+  sole: `Session: bound by default to this fortress's only identity, because your operator enabled default binding. Notes you save are marked unattributed. Call ${COOPERATIVE_TOOL_NAMES.whoAmI} to see it.`,
+  unbound: `Session: no identity. ${COOPERATIVE_TOOL_NAMES.help}, ${COOPERATIVE_TOOL_NAMES.capabilities}, ${COOPERATIVE_TOOL_NAMES.whoAmI} and ${COOPERATIVE_TOOL_NAMES.activeProtections} answer; the other cooperative tools refuse. ${COOPERATIVE_TOOL_NAMES.whoAmI} says what to tell your operator.`,
+};
+
+// Catalog tools that answer in a session with no identity. Must match UNBOUND_COOPERATIVE_TOOLS in
+// cooperative-surface.ts: that set is this one plus sanctuary_capabilities, which has no catalog row.
+const UNBOUND_CATALOG_TOOLS: ReadonlySet<string> = new Set([
+  COOPERATIVE_TOOL_NAMES.help, COOPERATIVE_TOOL_NAMES.whoAmI, COOPERATIVE_TOOL_NAMES.activeProtections,
+]);
+
+/**
  * Build the agent-facing MCP `instructions` string from the catalog.
  *
  * This is what a harness reads at connect time. It is a concise "start here"
@@ -350,10 +388,18 @@ export const REFUSAL_INSTRUCTION_LINE =
  * no enforcement claim the cooperative layer cannot back on its own; the
  * bounds paragraph is copied from the README bound, never strengthened.
  */
-export function buildServerInstructions(): string {
+export function buildServerInstructions(session: InstructionsSession): string {
+  const unbound = session === "unbound";
+  const lead = unbound
+    ? ["Sanctuary offers encrypted, audited working memory and identity tools. This session has no identity yet, so most of them are not available."]
+    : [
+      "Sanctuary gives you sovereign, encrypted, audited working memory and identity tools.",
+      "Route memory and identity work through these cooperative tools rather than ad-hoc state: they encrypt at rest, bind to your identity, and write an append-only audit trail you can query.",
+    ];
   const lines: string[] = [
-    "Sanctuary gives you sovereign, encrypted, audited working memory and identity tools.",
-    "Route memory and identity work through these cooperative tools rather than ad-hoc state: they encrypt at rest, bind to your identity, and write an append-only audit trail you can query.",
+    ...lead,
+    "",
+    SESSION_LINES[session],
     "",
     "Start here:",
     `- Unsure which tool fits? Call ${COOPERATIVE_TOOL_NAMES.help} with a free-text intent.`,
@@ -362,7 +408,8 @@ export function buildServerInstructions(): string {
     "Cooperative tools:",
   ];
   for (const entry of COOPERATIVE_CAPABILITIES) {
-    lines.push(`- ${entry.tool}: ${entry.does} Use when: ${entry.when}`);
+    const suffix = unbound && !UNBOUND_CATALOG_TOOLS.has(entry.tool) ? " Needs a session identity." : "";
+    lines.push(`- ${entry.tool}: ${entry.does} Use when: ${entry.when}${suffix}`);
   }
   lines.push("", REFUSAL_INSTRUCTION_LINE);
   // Bounds come last and are never omitted: an agent that reads only the
