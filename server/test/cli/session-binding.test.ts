@@ -65,6 +65,12 @@ it("status reports the absolute path without writing", async () => {
   expect(await runSessionBindingCommand({ argv: ["status", "--fortress", fortress.storagePath], out, err: out })).toBe(0);
   expect(text).toContain(path);
   expect(text).toContain("absent (off)");
+  // The temp fortress moved HOME, so status reads the Hermes entry under the temp home only.
+  const hermesConfigPath = join(fortress.home, ".hermes", "config.yaml");
+  expect(text.split("\n").filter(line => line.startsWith("Hermes entry"))).toEqual([
+    `Hermes entry sanctuary (${hermesConfigPath}): fortress path not set or empty`,
+    `Hermes entry sanctuary (${hermesConfigPath}): SANCTUARY_SESSION_IDENTITY_ID not set or empty`,
+  ]);
   expect(await readdir(fortress.storagePath)).toEqual([]);
 });
 

@@ -5,7 +5,7 @@
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as custodyLocks from "../../src/storage/cross-process-lock.js";
 import * as harnessPaths from "../../src/wrap/config-reader.js";
 import { CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME } from "../../src/core/master-custody.js";
@@ -65,6 +65,16 @@ describe("sanctuary doctor", () => {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
+
+  // Doctor reads the Hermes config under HOME when no path is passed, so every
+  // test here starts with HOME at its own empty temp directory and never opens
+  // the operator's Hermes file; a test that stubs HOME itself overrides this.
+  beforeEach(async () => {
+    const home = await mkdtemp(join(tmpdir(), "sanctuary-doctor-home-"));
+    tempDirs.push(home);
+    vi.stubEnv("HOME", home);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
 
   async function makeFortress(opts: {
     identity?: boolean;
@@ -306,10 +316,41 @@ approval_channel:
       const check = (await runDoctorChecks({ hermesConfigPath, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
       expect(check!.message).toContain(`Hermes entry sanctuary (${hermesConfigPath}): fortress path not set or empty`);
       expect(check!.message).toContain(`Hermes entry sanctuary (${hermesConfigPath}): SANCTUARY_SESSION_IDENTITY_ID not set or empty`);
-      // An absent Hermes file reports no Hermes entry and creates nothing.
+      // An absent Hermes file reads as an entry with no variables and creates nothing.
       const absent = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
-      expect(absent!.message).not.toContain("Hermes entry");
+      expect(absent!.message.split("\n").filter(line => line.startsWith("Hermes entry"))).toEqual([
+        `Hermes entry sanctuary (${ABSENT_HERMES_CONFIG}): fortress path not set or empty`,
+        `Hermes entry sanctuary (${ABSENT_HERMES_CONFIG}): SANCTUARY_SESSION_IDENTITY_ID not set or empty`,
+      ]);
       await expect(access(ABSENT_HERMES_CONFIG)).rejects.toThrow();
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it.each([
+    ["a missing file", "missing"],
+    ["an unreadable file", "unreadable"],
+    ["an unparseable file", "unparseable"],
+    ["a file without a sanctuary entry", "no-entry"],
+  ] as const)("doctor reports %s as a Hermes entry with every variable not set or empty and creates nothing", async (_label, shape) => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    const hermesDir = join(fortress, "hermes");
+    const hermesConfigPath = join(hermesDir, "config.yaml");
+    try {
+      if (shape !== "missing") await mkdir(hermesDir, { recursive: true });
+      // A directory at the config path is a file doctor cannot read on every platform and user.
+      if (shape === "unreadable") await mkdir(hermesConfigPath);
+      if (shape === "unparseable") await writeFile(hermesConfigPath, "mcp_servers: [sanctuary]\n");
+      if (shape === "no-entry") await writeFile(hermesConfigPath, ["mcp_servers:", "  weather:", "    command: weather", ""].join("\n"));
+      const before = shape === "missing" ? null : await readdir(hermesDir, { recursive: true });
+      const check = (await runDoctorChecks({ hermesConfigPath, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check!.message.split("\n").slice(-2)).toEqual([
+        `Hermes entry sanctuary (${hermesConfigPath}): fortress path not set or empty`,
+        `Hermes entry sanctuary (${hermesConfigPath}): SANCTUARY_SESSION_IDENTITY_ID not set or empty`,
+      ]);
+      if (shape === "missing") await expect(access(hermesDir)).rejects.toThrow();
+      else expect(await readdir(hermesDir, { recursive: true })).toEqual(before);
     } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
   });
 

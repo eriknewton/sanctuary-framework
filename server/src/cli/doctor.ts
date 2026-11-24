@@ -1278,31 +1278,28 @@ async function sessionBindingLaunchEntries(storagePath: string, hermesConfigPath
  * writer's own block scanner (must match hermesSanctuaryEntryEnvValue in
  * wrap/hermes-yaml.ts). Bound: only the `sanctuary` entry is read, and an
  * empty value cannot be told apart from an absent one, because the helper
- * returns null for both; both are reported as "not set or empty". A missing or
- * unreadable file reports nothing and creates nothing.
+ * returns null for both; both are reported as "not set or empty". A missing,
+ * unreadable or unparseable file, or one with no `sanctuary` entry, reports
+ * both variables as "not set or empty" and creates nothing.
  */
 async function hermesSessionBindingEntry(hermesConfigPath: string): Promise<string[]> {
-  let yaml: string | null;
-  try {
-    yaml = await readFile(hermesConfigPath, "utf-8");
-  } catch {
-    return [];
-  }
   let identity: string | null | undefined;
   let fortress: string | null | undefined;
   try {
+    const yaml = await readFile(hermesConfigPath, "utf-8");
     identity = hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_SESSION_IDENTITY_ID");
     // Launch-path alias precedence must match main in cli.ts.
     fortress = hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_STORAGE_PATH")
       ?? hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_FORTRESS_PATH");
   } catch {
-    return [];
+    // A file doctor cannot read or parse sets no variable doctor can see, so it
+    // reads the same as an entry without them; doctor never repairs or creates it.
+    identity = undefined;
+    fortress = undefined;
   }
-  // No sanctuary entry: Hermes is not wrapped with this server.
-  if (identity === undefined) return [];
   const path = resolve(hermesConfigPath);
   return [
     `Hermes entry sanctuary (${path}): fortress path ${fortress ? resolve(fortress) : "not set or empty"}`,
-    `Hermes entry sanctuary (${path}): SANCTUARY_SESSION_IDENTITY_ID ${identity === null ? "not set or empty" : "set"}`,
+    `Hermes entry sanctuary (${path}): SANCTUARY_SESSION_IDENTITY_ID ${typeof identity === "string" ? "set" : "not set or empty"}`,
   ];
 }
