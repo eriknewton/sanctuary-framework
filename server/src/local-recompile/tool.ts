@@ -28,6 +28,9 @@ import { STORAGE_NAME_MAX_CHARS, type LocalTaskJob, type LocalTaskRef } from "./
 /** The shared-log operation of an accepted submission; must match the reorg-surface manifest row. */
 export const LOCAL_REQUEST_SUBMITTED_OPERATION = "local_request_submitted";
 
+/** The UTF-16 length above which an instruction surely exceeds INSTRUCTION_MAX_CHARS code points. */
+const INSTRUCTION_MAX_UTF16_UNITS = 2 * INSTRUCTION_MAX_CHARS;
+
 /** Request ids are 16 random bytes, 32 lowercase hex digits; must match isRequestId in store-record.ts. */
 const REQUEST_ID_BYTES = 16;
 
@@ -158,11 +161,19 @@ export function parseLocalTaskArgs(args: Record<string, unknown>): { refs: Local
     if (ref === null || !hasExactKeys(ref, ["namespace", "key"])) return null;
     const { namespace, key } = ref;
     if (typeof namespace !== "string" || typeof key !== "string" || namespace.length === 0 || key.length === 0) return null;
+    // Bounded work before any encoding or round trip: a stored name's encoding is never shorter than
+    // its UTF-16 length, so a name over STORAGE_NAME_MAX_CHARS UTF-16 units can never fit, and is
+    // refused in O(1) before the O(n) checks below run.
+    if (namespace.length > STORAGE_NAME_MAX_CHARS || key.length > STORAGE_NAME_MAX_CHARS) return null;
     if (!validNamespace(namespace) || !validStorageKey(key)) return null;
     parsed.push({ namespace, key });
   }
   const instruction = top.instruction;
   if (typeof instruction !== "string") return null;
+  // Bounded work before the rate limit: a code point is at most two UTF-16 units, so a string longer
+  // than 2 x INSTRUCTION_MAX_CHARS units has more than INSTRUCTION_MAX_CHARS code points. That O(1)
+  // check runs before the O(n) count, which then only ever sees a string of bounded length.
+  if (instruction.length > INSTRUCTION_MAX_UTF16_UNITS) return null;
   if (Array.from(instruction).length > INSTRUCTION_MAX_CHARS || FORBIDDEN_CONTROL.test(instruction)) return null;
   return { refs: parsed, instruction };
 }

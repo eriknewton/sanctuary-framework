@@ -45,3 +45,16 @@ describe("local task status", () => {
     expect(await status(null, false)).toMatchObject({ armed: false, ready: false, cause: "worker_unavailable" });
   });
 });
+
+describe("worker liveness on the status route", () => {
+  it.each([[0], [-1], [1.5]])("process id %s is never reported alive", async (pid) => {
+    const routes = (await import("../../src/local-recompile/dashboard-routes.js")) as { isPidAlive?: (pid: number | undefined) => boolean };
+    expect(typeof routes.isPidAlive).toBe("function");
+    expect(routes.isPidAlive!(pid)).toBe(false);
+  });
+
+  it("this process is reported alive", async () => {
+    const routes = (await import("../../src/local-recompile/dashboard-routes.js")) as { isPidAlive?: (pid: number | undefined) => boolean };
+    expect(routes.isPidAlive?.(process.pid)).toBe(true);
+  });
+});

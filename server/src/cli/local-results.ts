@@ -8,7 +8,7 @@
  */
 
 import { constants } from "node:fs";
-import { open, rm, type FileHandle } from "node:fs/promises";
+import { lstat, open, rm, type FileHandle } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -103,11 +103,18 @@ function wantsHelp(argv: string[]): boolean {
   return argv.length === 0 || argv.includes("--help") || argv.includes("-h");
 }
 
+/**
+ * Every option these verbs read that takes a value, in one table: `positional` skips each one's value,
+ * so an option value is never read as a request id. Must match the flags named in RESULTS_USAGE and
+ * LOCAL_USAGE above, and every flagValue or consumeFlagValue call in this file.
+ */
+const VALUE_FLAGS: ReadonlySet<string> = new Set(["--fortress", "--passphrase", "--out", "--since", "--limit"]);
+
 function positional(argv: string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    if (arg === "--passphrase" || arg === "--out" || arg === "--since" || arg === "--limit") {
+    if (VALUE_FLAGS.has(arg)) {
       i++;
       continue;
     }
@@ -137,8 +144,6 @@ async function withOperatorStores(
     write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
     return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
-  if (consumedFortress.value !== undefined) process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
-
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
   if (!passphrase && !recoveryKey) {
@@ -149,10 +154,18 @@ async function withOperatorStores(
     write(err, "Error: local stores are not available on this platform.\n");
     return 1;
   }
-  // The same root the server resolves and hands the worker, so all three take one lock.
-  const runtimeRoot = resolveCustodyLockRoot(process.getuid(), { env: process.env, platform: platform() });
+  // The same root the server resolves and hands the worker, so all three take one lock. It is read
+  // from the caller's environment, the one every other setting here comes from.
+  let runtimeRoot: string;
+  try {
+    runtimeRoot = resolveCustodyLockRoot(process.getuid(), { env, platform: platform() });
+  } catch {
+    // An override the resolver refuses is reported, never replaced by a different root.
+    write(err, "Error: the custody lock root is not usable (check SANCTUARY_CUSTODY_LOCK_ROOT).\n");
+    return 1;
+  }
 
-  const config = await loadConfig();
+  const config = await loadConfigFor(consumedFortress.value ?? env.SANCTUARY_STORAGE_PATH);
   const storage = new FilesystemStorage(join(config.storage_path, FORTRESS_STATE_DIRECTORY));
   const session = await resolveCliMasterKey(storage, {
     ...(passphrase !== undefined ? { passphrase } : {}),
@@ -178,6 +191,37 @@ async function withOperatorStores(
       stores.close();
     }
   });
+}
+
+/**
+ * The configuration of the fortress at `storagePath`, or of the process's own fortress when undefined.
+ * The config loader reads the storage path from process.env, so a given path is set for the load only
+ * and restored after: this command leaves the process environment as it found it.
+ */
+async function loadConfigFor(storagePath: string | undefined): Promise<Awaited<ReturnType<typeof loadConfig>>> {
+  if (storagePath === undefined) return loadConfig();
+  const had = Object.hasOwn(process.env, "SANCTUARY_STORAGE_PATH");
+  const previous = process.env.SANCTUARY_STORAGE_PATH;
+  try {
+    process.env.SANCTUARY_STORAGE_PATH = storagePath;
+    return await loadConfig();
+  } finally {
+    if (had) process.env.SANCTUARY_STORAGE_PATH = previous;
+    else delete process.env.SANCTUARY_STORAGE_PATH;
+  }
+}
+
+/** Refuse a path that already exists, without touching it; checked before any row is written. */
+async function refuseIfPresent(path: string, err: Writable): Promise<boolean> {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    write(err, `Error: cannot create ${argvTokenForDisplay(path)}.\n`);
+    return true;
+  }
+  write(err, `Error: ${argvTokenForDisplay(path)} already exists.\n`);
+  return true;
 }
 
 /** Create a new file with mode 600; an existing path is refused, never overwritten. */
@@ -262,12 +306,16 @@ export async function runResultsCommand(args: LocalResultsCommandArgs): Promise<
       const path = flagValue(rest, "--out");
       if (id === undefined || path === undefined) return usage(err, RESULTS_USAGE);
       return withOperatorStores(rest, err, env, async (stores) => {
+        if (await refuseIfPresent(path, err)) return 1;
+        // The export row is written before the file exists, and a failed row creates no file. A crash
+        // or a failed create after the row leaves a row with no file: the safe direction, since the log
+        // never misses a file that holds result text.
+        const object = await stores.exportResult(id);
+        if (object === null) return notFound(err, id);
         const handle = await refuseExisting(path, err);
         if (handle === null) return 1;
         let written = false;
         try {
-          const object = await stores.exportResult(id);
-          if (object === null) return notFound(err, id);
           await handle.writeFile(`${JSON.stringify(object, null, 2)}\n`, "utf8");
           written = true;
           write(out, `Exported ${id} to ${argvTokenForDisplay(path)}.\n`);
@@ -335,20 +383,29 @@ export async function runLocalCommand(args: LocalResultsCommandArgs): Promise<nu
       const path = flagValue(rest, "--out");
       if (path === undefined) return usage(err, LOCAL_USAGE);
       return withOperatorStores(rest, err, env, async (stores) => {
-        const handle = await refuseExisting(path, err);
-        if (handle === null) return 1;
+        if (await refuseIfPresent(path, err)) return 1;
+        let handle: FileHandle | null = null;
         let written = false;
         try {
-          const verification = await stores.exportLog(async (rows) => {
-            await handle.write(rows.map((row) => `${JSON.stringify(row)}\n`).join(""));
+          // The export row is written before the file is created (exportLog calls `begin` after its
+          // row), and a failed row creates no file. A row with no file is the safe direction.
+          const verification = await stores.exportLog(async () => {
+            handle = await refuseExisting(path, err);
+            if (handle === null) return null;
+            const opened: FileHandle = handle;
+            // writeFile writes the whole page, looping over short writes; a single write may not.
+            return async (rows) => opened.writeFile(rows.map((row) => `${JSON.stringify(row)}\n`).join(""), "utf8");
           });
-          if (!verification.ok) return chainBroken(err, verification);
+          if (!verification.ok) return verification.reason === "export_file_unavailable" ? 1 : chainBroken(err, verification);
           written = true;
           write(out, `Exported log rows ${verification.base_seq} to ${verification.head_seq} to ${argvTokenForDisplay(path)}.\n`);
           return 0;
         } finally {
-          await handle.close();
-          if (!written) await removeQuietly(path);
+          const opened = handle as FileHandle | null;
+          if (opened !== null) {
+            await opened.close();
+            if (!written) await removeQuietly(path);
+          }
         }
       });
     }

@@ -1,7 +1,9 @@
 /**
- * Operator dashboard routes for local tasks. The dashboard authenticates
- * every route here with the same operator gate as `/api/audit-log` before
- * this file runs; nothing here is reachable from an agent-facing path.
+ * Operator dashboard routes for local tasks. principal-policy/dashboard.ts
+ * authenticates every route here in `dispatchLocal` before this file runs,
+ * with loopback auto-auth denied: only the operator bearer, or a session or
+ * cookie minted from it, is admitted. Nothing here is reachable from an
+ * agent-facing path.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { LocalOperatorStores, neutralizeControlText } from "./operator-surface.js";
@@ -61,8 +63,10 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-function isPidAlive(pid: number | undefined): boolean {
-  if (pid === undefined) return false;
+export function isPidAlive(pid: number | undefined): boolean {
+  // Only a real process id is signalled: 0 and negative ids name process groups, and signal 0 to
+  // them would report a group alive.
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;

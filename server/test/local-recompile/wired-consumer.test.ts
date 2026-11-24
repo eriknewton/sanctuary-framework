@@ -57,6 +57,8 @@ describe("the local task in the production graph", () => {
     await rm(spyFile, { force: true });
     delete process.env.SANCTUARY_DASHBOARD_PORT;
     process.env.SANCTUARY_DASHBOARD_HOST = "127.0.0.1";
+    // The local routes admit only an operator credential, so the operator configures a token.
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = `wired-${process.pid}-${Date.now()}`;
     const dashboards: DashboardApprovalChannel[] = [];
     const start = DashboardApprovalChannel.prototype.start;
     vi.spyOn(DashboardApprovalChannel.prototype, "start").mockImplementation(function (this: DashboardApprovalChannel, ...args) {
@@ -111,6 +113,8 @@ describe("the local task in the production graph", () => {
       headers: internals.authToken ? { Authorization: `Bearer ${internals.authToken}` } : {},
     });
     expect(status.status).toBe(200);
+    expect(internals.authToken).toBeDefined();
+    expect((await fetch(`http://127.0.0.1:${port}/api/local/status`)).status).toBe(401);
     expect(await status.json()).toMatchObject({ armed: true, cause: null, worker_alive: true, model_tag: "qwen2.5:1.5b" });
   }, WIRED_TIMEOUT_MS);
 });

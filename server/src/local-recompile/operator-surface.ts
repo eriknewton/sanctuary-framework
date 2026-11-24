@@ -60,6 +60,9 @@ export interface LocalOperatorStoresOptions {
   now?: () => number;
 }
 
+/** A log export's outcome: the chain's verification, or a destination that could not be created after the row. */
+export type LogExportOutcome = OplogVerification | { ok: false; seq: number; reason: "export_file_unavailable" };
+
 /** Both local stores opened for the operator; the caller closes it. */
 export class LocalOperatorStores {
   private readonly oplog: LocalOplog;
@@ -122,13 +125,17 @@ export class LocalOperatorStores {
   }
 
   /**
-   * Verify the chain, write the export row, then hand every retained row to
-   * `sink` in pages. The export row is the last row the export covers.
+   * Verify the chain, write the export row, then call `begin` for the sink and hand it every retained
+   * row in pages. The export row is the last row the export covers, and it is written before `begin`
+   * runs, so the destination never exists without its row. `begin` answering null (the destination
+   * could not be created) ends the export after the row: a row with no file, the safe direction.
    */
-  async exportLog(sink: (rows: OplogRow[]) => Promise<void>): Promise<OplogVerification> {
+  async exportLog(begin: () => Promise<((rows: OplogRow[]) => Promise<void>) | null>): Promise<LogExportOutcome> {
     const verification = await this.oplog.verifyChain();
     if (!verification.ok) return verification;
     const marker = await this.oplog.append("oplog_exported", { head_seq: verification.head_seq });
+    const sink = await begin();
+    if (sink === null) return { ok: false, seq: marker.seq, reason: "export_file_unavailable" };
     const status = await this.oplog.status();
     for (let seq = status.base_seq; seq <= marker.seq; ) {
       const rows = await this.oplog.readRows(seq, OPERATOR_LOG_PAGE_ROWS);

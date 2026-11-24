@@ -2103,9 +2103,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // loopback interface. Every route in LOCAL_DASHBOARD_ROUTES, the page included, admits only an
     // operator-derived credential (the bearer, or a session or cookie minted from it). This is the
     // one gate for the prefix: handleRequest routes it here before handleLegacyRequest's gate runs.
-    // checkAuth writes the 401 itself when it fails.
+    // A dashboard with no operator token has no operator credential to tell the operator from the agent,
+    // so its local routes refuse rather than fall back to "auth disabled".
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
-    if (!this.checkAuth(req, url, res, { allowSession: true, denyLoopbackAutoAuth: true })) return true;
+    const admission = this.resolveAuthAdmission(req, url, { allowSession: true, denyLoopbackAutoAuth: true });
+    if (admission !== "operator_credential") {
+      this.denyAuth(res);
+      return true;
+    }
+    // Invariant: SameSite=Lax treats another port on the same loopback host as the same site, so the
+    // browser alone does not stop a page on another local port from sending the operator's cookie.
+    // A request that changes state and was admitted by cookie or ?session= is served only when it
+    // shows it came from the dashboard's own origin; neither header present refuses. A bearer header
+    // cannot be set by a cross-origin page, so a bearer request is not checked. The refusal comes
+    // before handleLocalRoute, so it writes no operator-log row and touches no store.
+    const method = req.method ?? "GET";
+    if (method !== "GET" && method !== "HEAD" && !this.hasOperatorBearer(req) && !this.isOwnOriginRequest(req)) {
+      denyForbidden(res);
+      return true;
+    }
     return handleLocalRoute(this.localSurface, req, res);
   }
 
@@ -6166,6 +6182,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return false;
   }
 
+  /** True only when the request's Authorization header carries the configured operator bearer. */
+  private hasOperatorBearer(req: IncomingMessage): boolean {
+    const authHeader = req.headers.authorization;
+    const parts = authHeader?.split(" ");
+    return (
+      !!this.authToken &&
+      parts?.length === 2 &&
+      parts[0] === "Bearer" &&
+      constantTimeEquals(parts[1]!, this.authToken)
+    );
+  }
+
+  /**
+   * True when the browser says the request came from this dashboard's own origin: `Sec-Fetch-Site`
+   * is `same-origin`, or, when that header is absent, `Origin` equals the dashboard's own origin
+   * exactly (scheme, host and port). Neither header present is false.
+   */
+  private isOwnOriginRequest(req: IncomingMessage): boolean {
+    const site = req.headers["sec-fetch-site"];
+    if (site !== undefined) return site === "same-origin";
+    return req.headers.origin !== undefined && req.headers.origin === this.getBaseUrl();
+  }
+
   /**
    * Classify dashboard authentication without writing a response.
    *
@@ -6182,13 +6221,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       denyLoopbackAutoAuth?: boolean;
     },
   ): DashboardAuthAdmission | null {
-    const authHeader = req.headers.authorization;
-    const parts = authHeader?.split(" ");
-    const hasValidBearer =
-      !!this.authToken &&
-      parts?.length === 2 &&
-      parts[0] === "Bearer" &&
-      constantTimeEquals(parts[1]!, this.authToken);
+    const hasValidBearer = this.hasOperatorBearer(req);
 
     if (opts?.requireToken) {
       return hasValidBearer ? "operator_credential" : null;
