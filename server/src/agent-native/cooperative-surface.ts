@@ -145,8 +145,9 @@ export function createAgentNativeCooperativeTools(
 
   function sessionView(): SessionView {
     // The three session-reporting tools read one predicate, so none claims an identity the others deny.
-    const binding = options.currentSessionBinding();
     try {
+      // The binding read sits inside the classification, so an identity error it raises names the same state as one from resolution.
+      const binding = options.currentSessionBinding();
       const identity = resolveActiveSessionIdentity(binding);
       // A binding whose identity has left the manager is not an identity. No production path removes one today
       // (IdentityManager in cognitive/tools.ts has no remove method), so this arm is defence in depth.
@@ -911,7 +912,16 @@ export function createAgentNativeCooperativeTools(
           const view = sessionView();
           // A session with no confirmed identity is observed as unbound, so the identity layer reads unknown.
           const observedBinding = view.state === "session_BOUND" ? view.binding : UNBOUND_SESSION;
-          const auditRef = await audit("sanctuary_active_protections");
+          const boundRecord = view.state === "session_BOUND" ? view.record : undefined;
+          // The identity layer is decided by the session read above, so protections never reports a layer that
+          // who-am-I and capabilities, reading the same view, would deny; must match observeProtections in
+          // protection-observations.ts, which reads only get from the manager.
+          const readOnceIdentityManager: Pick<IdentityManager, "get"> = {
+            get: (identityId: string) => (boundRecord !== undefined && identityId === boundRecord.identity_id ? boundRecord : undefined),
+          };
+          // The audit row names the identity from the same read, so the manager is consulted once per call.
+          const auditRef = await audit("sanctuary_active_protections", {}, "success",
+            view.state === "session_BOUND" ? view.identity.identity_id : "system");
           // Must match the dashboard accessor: this key pins broker heartbeat signatures, not agent identity.
           const brokerKey = await Promise.resolve().then(() => options.resolveBrokerProducerKey?.()).catch(() => null);
           // Must match withDerivedKeyRestriction in posture-routes.ts: only observed presence or absence is conclusive.
@@ -931,9 +941,10 @@ export function createAgentNativeCooperativeTools(
             buildCustodyExitPanel({ auditLog: options.auditLog, originMachine: "local" }),
             options.auditLog.getAuditChainVerdict(),
           ]);
-          // Must match observeProtections in protection-observations.ts: supply raw consumers and qualified reads.
+          // Must match observeProtections in protection-observations.ts: supply raw consumers (the identity manager
+          // being the read-once view above) and qualified reads.
           const layers = composeProtectionLayers(observeProtections({
-            get identityManager() { return options.identityManager; },
+            identityManager: readOnceIdentityManager as IdentityManager,
             currentSessionBinding: () => observedBinding,
             get stateStore() { return options.stateStore; },
             get responseScreen() { return options.responseScreen; },

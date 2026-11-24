@@ -16,7 +16,7 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
-import { fingerprintIdentityId, type SessionBinding } from "../../src/agent-native/safety-base.js";
+import { fingerprintIdentityId, SessionIdentityError, SessionNotBoundError, type SessionBinding } from "../../src/agent-native/safety-base.js";
 import { COOPERATIVE_TOOL_NAMES } from "../../src/agent-native/tool-names.js";
 
 // The two operator sentences, written out byte for byte and never imported.
@@ -300,4 +300,74 @@ it("who-am-I, capabilities and active protections agree when the bound identity 
   const protections = await f.call("sanctuary_active_protections");
   expect(protections.denied).toBeUndefined();
   expect(status(protections.layers, "identity")).toBe("unknown");
+});
+
+it.each(["launch_variable", "sole_identity"] as const)("capabilities in a session bound by %s reports exactly that binding and marks every tool available", async (source) => {
+  let binding: SessionBinding | undefined;
+  const f = await direct(() => binding);
+  binding = { identity_id: f.id, requester_identity_fingerprint: fingerprintIdentityId(f.id), binding_source: source };
+  const capabilities = await f.call("sanctuary_capabilities");
+  expect(capabilities.session).toEqual({ bound: true, binding_source: source });
+  const entries = capabilities.capabilities as Array<{ tool: string; available: boolean }>;
+  expect(entries.length).toBeGreaterThan(0);
+  for (const entry of entries) expect(entry.available, entry.tool).toBe(true);
+});
+
+it("active protections reads the identity manager once per call in a bound session", async () => {
+  let binding: SessionBinding | undefined;
+  const f = await direct(() => binding);
+  binding = { identity_id: f.id, requester_identity_fingerprint: fingerprintIdentityId(f.id), binding_source: "launch_variable" };
+  const get = vi.spyOn(f.identityManager, "get");
+  for (let call = 1; call <= 2; call += 1) {
+    get.mockClear();
+    const protections = await f.call("sanctuary_active_protections");
+    expect(status(protections.layers, "identity"), `call ${call}`).toBe("on");
+    expect(get.mock.calls, `call ${call}`).toEqual([[f.id]]);
+  }
+});
+
+it("active protections reports the identity layer from the session read even when a later manager read would miss", async () => {
+  let binding: SessionBinding | undefined;
+  const f = await direct(() => binding);
+  binding = { identity_id: f.id, requester_identity_fingerprint: fingerprintIdentityId(f.id), binding_source: "launch_variable" };
+  // Test-only manager: the bound identity is present on the first read and gone on every read after it.
+  const realGet = f.identityManager.get.bind(f.identityManager);
+  let reads = 0;
+  vi.spyOn(f.identityManager, "get").mockImplementation((lookup: string) => {
+    reads += 1;
+    return reads === 1 ? realGet(lookup) : undefined;
+  });
+  const protections = await f.call("sanctuary_active_protections");
+  expect(protections.denied).toBeUndefined();
+  expect(status(protections.layers, "identity")).toBe("on");
+});
+
+it.each([
+  ["no identity", () => new SessionNotBoundError(), UNBOUND_SENTENCE],
+  ["an unconfirmed identity", () => new SessionIdentityError(), UNCONFIRMED_SENTENCE],
+  ["a non-identity fault", () => new Error("session read failed"), null],
+] as const)("who-am-I, capabilities and active protections agree on %s when the session read itself raises it", async (_label, raise, sentence) => {
+  const f = await direct(() => { throw raise(); });
+  const tools = ["sanctuary_who_am_i", "sanctuary_capabilities", "sanctuary_active_protections"] as const;
+  if (sentence === null) {
+    // A fault that is not an identity error is never reported as a session state.
+    for (const tool of tools) {
+      const answer = await f.call(tool);
+      expect(answer, tool).toEqual(expectedRefusalBody());
+      expect(answer.bound, tool).toBeUndefined();
+    }
+    return;
+  }
+  const who = await f.call("sanctuary_who_am_i");
+  expect(Object.keys(who).sort()).toEqual(["audit_ref", "bound", "operator_action"]);
+  expect(who).toMatchObject({ bound: false, operator_action: sentence });
+  const capabilities = await f.call("sanctuary_capabilities");
+  expect(capabilities.session).toEqual({ bound: false, operator_action: sentence });
+  for (const entry of capabilities.capabilities as Array<{ tool: string; available: boolean }>) {
+    expect(entry.available, entry.tool).toBe(ANSWERING_CATALOG.has(entry.tool));
+  }
+  const protections = await f.call("sanctuary_active_protections");
+  expect(protections.denied).toBeUndefined();
+  expect(status(protections.layers, "identity")).toBe("unknown");
+  expect(JSON.stringify(protections)).not.toContain(f.id);
 });
