@@ -24,6 +24,13 @@ export const LOCAL_DASHBOARD_ROUTES = [
   { method: "GET", path: "/api/local/log" },
 ] as const;
 
+/**
+ * Shown on the status route when the authority holds no armed binding. Must match the status
+ * assertions in test/local-recompile/dashboard-local.test.ts.
+ */
+export const LOCAL_AUTHORITY_NOTICE =
+  "Local tasks are not ready: the local model binding did not verify. A binding set up or changed after the server started needs a server restart.";
+
 /** One page of log rows for the dashboard view. */
 export const LOCAL_LOG_VIEW_ROWS = 200;
 
@@ -35,6 +42,8 @@ export const LOCAL_SUMMARY_NOTICE =
 export interface LocalSurfaceStatus {
   readonly armed: boolean;
   readonly cause: string | null;
+  /** Null when the authority would grant a valid job now; otherwise why every job is refused. */
+  authorityCause(): string | null;
   workerPid(): number | undefined;
   queueDepth(): number;
 }
@@ -80,9 +89,14 @@ export async function handleLocalRoute(surface: LocalDashboardSurface, req: Inco
   }
   if (method === "GET" && path === "/api/local/status") {
     const pid = surface.status.workerPid();
+    const authorityCause = surface.status.authorityCause();
+    // Ready only when the tool is armed and the authority would grant a valid job; otherwise the cause.
     json(res, 200, {
       armed: surface.status.armed,
+      ready: surface.status.armed && authorityCause === null,
       cause: surface.status.cause,
+      authority_cause: authorityCause,
+      ...(authorityCause === null ? {} : { notice: LOCAL_AUTHORITY_NOTICE }),
       queue_depth: surface.status.queueDepth(),
       worker_alive: isPidAlive(pid),
       model_tag: surface.modelTag(),

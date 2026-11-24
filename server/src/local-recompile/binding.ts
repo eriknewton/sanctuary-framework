@@ -1,10 +1,11 @@
 /**
  * The verified local binding as the local job needs it: the surface it reads,
- * the narrow source interface the server passes in, and the one shape check
- * both IPC sides apply to a descriptor.
+ * the narrow source interface the server passes in, and the worker-side parse
+ * of a descriptor under the shared shape rule in descriptor-shape.ts.
  */
 import type { LocalBindingDescription, LocalBindingDescriptor } from "../intelligence/selector.js";
 import type { Surface } from "../intelligence/surfaces.js";
+import { isLocalBindingDescriptorShape } from "./descriptor-shape.js";
 
 export type { LocalBindingDescription, LocalBindingDescriptor, LocalBindingRefusal } from "../intelligence/selector.js";
 
@@ -15,15 +16,6 @@ export const LOCAL_TASK_SURFACE: Surface = "concierge";
 export interface LocalBindingSource {
   describeVerifiedLocalBinding(surface: Surface, expectedEpoch?: number): LocalBindingDescription;
 }
-
-// The runtime tag is namespace/model:tag, three components of at most 64 characters with two separators.
-const RUNTIME_TAG_MAX_CHARS = 3 * 64 + 2;
-// SHA-256 is 256 bits: 64 lowercase hex digits.
-const MANIFEST_DIGEST = /^[0-9a-f]{64}$/;
-// An IPv6 literal is at most 45 characters.
-const ADDRESS_MAX_CHARS = 45;
-// TCP carries an unsigned 16-bit port.
-const MAX_TCP_PORT = 2 ** 16 - 1;
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Object.keys(value);
@@ -38,26 +30,20 @@ export function parseBindingDescriptor(value: unknown): LocalBindingDescriptor |
   const endpoint = record.endpoint;
   if (endpoint === null || typeof endpoint !== "object" || Array.isArray(endpoint)) return null;
   const target = endpoint as Record<string, unknown>;
+  // The same shape rule the server applied when it described the binding (descriptor-shape.ts).
   if (
     !exactKeys(target, ["address", "port"]) ||
-    typeof target.address !== "string" ||
-    target.address.length === 0 ||
-    target.address.length > ADDRESS_MAX_CHARS ||
-    typeof target.port !== "number" ||
-    !Number.isInteger(target.port) ||
-    target.port < 1 ||
-    target.port > MAX_TCP_PORT ||
-    typeof record.runtime_tag !== "string" ||
-    record.runtime_tag.length === 0 ||
-    record.runtime_tag.length > RUNTIME_TAG_MAX_CHARS ||
-    typeof record.manifest_digest !== "string" ||
-    !MANIFEST_DIGEST.test(record.manifest_digest)
+    !isLocalBindingDescriptorShape(record.runtime_tag, record.manifest_digest, target.address, target.port)
   ) {
     return null;
   }
+  const runtimeTag = record.runtime_tag as string;
+  const manifestDigest = record.manifest_digest as string;
+  const address = target.address as string;
+  const port = target.port as number;
   return Object.freeze({
-    runtime_tag: record.runtime_tag,
-    manifest_digest: record.manifest_digest,
-    endpoint: Object.freeze({ address: target.address, port: target.port }),
+    runtime_tag: runtimeTag,
+    manifest_digest: manifestDigest,
+    endpoint: Object.freeze({ address, port }),
   });
 }

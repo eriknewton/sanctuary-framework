@@ -54,7 +54,8 @@ export type LocalTaskDisarmCause = (typeof LOCAL_TASK_DISARM_CAUSES)[number];
 
 /** Everything an armed tool needs; every member is required, so no property is silently off. */
 export interface ArmedLocalTask {
-  workerClient: { send(message: LocalTaskJob): boolean };
+  /** Hands the job to the worker and watches it to a terminal state; must match LocalWorkerClient.submit. */
+  workerClient: { submit(message: LocalTaskJob): "sent" | "queue_full" | "unavailable" };
   auditLog: { appendCritical(entry: AuditEntryInput): Promise<void> };
   authority: { register(job: { request_id: string; refs: readonly LocalTaskRef[] }): void; forget(requestId: string): void };
   /** The server's own operator-log writer, used only for drops it observes itself. */
@@ -175,6 +176,7 @@ export function createLocalTaskTool(arming: LocalTaskArming, options: LocalTaskT
     let requestId: string | undefined;
     let rowSettled = false;
     let sent = false;
+    let dropCause: JobDropCause = "worker_unavailable";
     let bundle: ArmedLocalTask | undefined;
     // Every throw from here on is answered with a fixed response, so the router never records a
     // tool_error for this tool: A1 once the submission row is durable, A3 before it.
@@ -207,7 +209,7 @@ export function createLocalTaskTool(arming: LocalTaskArming, options: LocalTaskT
       hook("state_ENQUEUE");
       bundle.authority.register({ request_id: requestId, refs: parsed.refs });
       // Never awaited: a worker that is dead or backlogged refuses at once, and the caller is answered the same.
-      sent = bundle.workerClient.send({
+      const outcome = bundle.workerClient.submit({
         type: "job",
         request_id: requestId,
         seat,
@@ -215,13 +217,15 @@ export function createLocalTaskTool(arming: LocalTaskArming, options: LocalTaskT
         refs: parsed.refs,
         instruction: parsed.instruction,
       });
+      sent = outcome === "sent";
+      if (outcome === "queue_full") dropCause = "queue_full";
 
       hook("state_ACK");
       return submittedResponse(requestId);
     } catch {
       return rowSettled && requestId !== undefined ? submittedResponse(requestId) : unavailableResponse();
     } finally {
-      if (rowSettled && !sent && bundle !== undefined && requestId !== undefined) scheduleDrop(bundle, requestId);
+      if (rowSettled && !sent && bundle !== undefined && requestId !== undefined) scheduleDrop(bundle, requestId, dropCause);
     }
   };
 
@@ -239,9 +243,9 @@ export function createLocalTaskTool(arming: LocalTaskArming, options: LocalTaskT
  * The append is scheduled for after the response has gone, never before it, so
  * the agent's call takes the same time whether or not the worker took the job.
  */
-function scheduleDrop(bundle: ArmedLocalTask, requestId: string): void {
+function scheduleDrop(bundle: ArmedLocalTask, requestId: string, cause: JobDropCause): void {
   bundle.authority.forget(requestId);
   setImmediate(() => {
-    bundle.dropLog.append("job_dropped", { request_id: requestId, cause: "worker_unavailable" }).catch(() => undefined);
+    bundle.dropLog.append("job_dropped", { request_id: requestId, cause }).catch(() => undefined);
   });
 }

@@ -30,7 +30,7 @@ import {
 } from "./limits.js";
 import type { JobCallOutcome, JobFailureCause, JobRefusalCause, OplogAppendKind, OplogBodies } from "./oplog.js";
 import { chunkPrompt, combinePrompt, frameAndChunk, truncateUtf8 } from "./prompts.js";
-import type { LocalResultBody } from "./results-store.js";
+import { CommitDeadlineError, CommitIndeterminateError, type LocalResultBody } from "./results-store.js";
 import { LocalStoreError, SEAT_ID_HEX_LENGTH } from "./store-record.js";
 import type { AuthorityReply, JobState, WriterKeyRow } from "./worker-protocol.js";
 
@@ -69,7 +69,11 @@ export interface SummarizeJobDependencies {
   readRecord(namespace: string, key: string, maxBytes: number): Promise<Uint8Array | null>;
   log<K extends OplogAppendKind>(kind: K, body: OplogBodies[K]): Promise<unknown>;
   putPending(input: { request_id: string; seat: string; kind: "summarize"; deadline: number }): Promise<unknown>;
-  markCommitted(requestId: string, body: LocalResultBody): Promise<unknown>;
+  /**
+   * Commit the result; `committedRow` appends the job's job_committed row under the results lock,
+   * after the object is durable (results-store.ts markCommitted states the rollback rule).
+   */
+  markCommitted(requestId: string, body: LocalResultBody, committedRow: () => Promise<unknown>): Promise<unknown>;
   /** Ask the server for this job's authority; null when no reply arrives in time. */
   requestAuthority(requestId: string): Promise<AuthorityReply | null>;
   reportState(requestId: string, state: JobState): void;
@@ -92,6 +96,8 @@ class Failure extends Error {
     super(failure);
   }
 }
+/** The commit may have landed without its row; the job is logged indeterminate, never failed. */
+class Indeterminate extends Error {}
 
 function writerResolver(writers: readonly WriterKeyRow[]): (kid: string) => Promise<readonly Uint8Array[]> {
   const table = new Map(writers.map((row) => [row.kid, row.public_keys] as const));
@@ -115,9 +121,16 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
   let keys: Uint8Array[] = [];
   let generating = false;
   const state = (next: JobState) => deps.reportState(id, next);
+  // No work starts and nothing commits once the job's deadline has passed: this runs at entry and
+  // before every stage, and the results store checks it again under its lock at commit.
+  const beforeDeadline = () => {
+    if (deps.now() >= deadlineAt) throw new Failure("deadline");
+  };
   try {
+    beforeDeadline();
     await deps.log("job_started", { request_id: id, refs: job.refs.length });
 
+    beforeDeadline();
     state("state_AUTHORITY");
     const reply = await deps.requestAuthority(id);
     if (reply === null) throw new Refusal("authority_timeout");
@@ -125,6 +138,7 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
     keys = reply.keys;
     if (keys.length !== job.refs.length) throw new Refusal("request_unknown");
 
+    beforeDeadline();
     state("state_DIGEST");
     const { address, port } = reply.descriptor.endpoint;
     const host = address.includes(":") ? `[${address}]` : address;
@@ -139,11 +153,13 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
     if (!inspected.ok) throw new Refusal(inspected.state === "tags_model_absent" ? "model_unavailable" : "model_digest_mismatch");
     if (inspected.observedManifestDigest !== reply.descriptor.manifest_digest) throw new Refusal("model_digest_mismatch");
 
+    beforeDeadline();
     state("state_READ");
     const resolveWriterKeys = writerResolver(reply.writers);
     const texts: string[] = [];
     let total = 0;
     for (const [slot, ref] of job.refs.entries()) {
+      beforeDeadline();
       let raw: Uint8Array | null;
       try {
         raw = await deps.readRecord(ref.namespace, ref.key, RECORD_STORED_MAX_BYTES);
@@ -178,6 +194,7 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
     texts.length = 0;
     if (chunks === null) throw new Refusal("input_too_large");
 
+    beforeDeadline();
     state("state_GENERATE");
     generating = true;
     // A crash from here on leaves a pending object that the sweep marks indeterminate after the deadline.
@@ -193,6 +210,7 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
       let truncated = false;
       let callNumber = 0;
       const call = async (phase: "chunk" | "combine", prompt: string, numPredict: number, capBytes: number) => {
+        beforeDeadline();
         callNumber += 1;
         const callStarted = deps.now();
         // The transport refuses only a stream over its own total cap; the visible text is cut here at a
@@ -231,8 +249,9 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
         : summaries[0]!.text;
 
       state("state_COMMIT");
-      // Nothing commits once the deadline has passed: the check is the last step before the write.
+      // Nothing commits once the deadline has passed: checked here, and again by the store under its lock.
       if (abort.signal.aborted) throw new Failure("deadline");
+      beforeDeadline();
       const body: LocalResultBody = {
         summary,
         refs: job.refs.map((ref, index) => canonicalLocalJson({ n: index + 1, namespace: ref.namespace, key: ref.key })),
@@ -242,21 +261,25 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
         model_manifest_digest: reply.descriptor.manifest_digest,
         truncated: truncated ? "true" : "false",
       };
+      // The object and its job_committed row are written under the results lock then the operator-log
+      // lock. Invariant: a committed result never sits beside a job_failed row. A row that fails rolls
+      // the object back to pending (then job_failed is accurate, and the sweep marks it indeterminate);
+      // a rollback that also fails is logged job_indeterminate only.
       try {
-        await deps.markCommitted(id, body);
+        await deps.markCommitted(id, body, () =>
+          deps.log("job_committed", {
+            request_id: id,
+            chunks: summaries.length,
+            output_bytes: Buffer.byteLength(summary, "utf8"),
+            truncated,
+            duration_ms: Math.max(0, deps.now() - started),
+          }));
       } catch (error) {
+        if (error instanceof CommitDeadlineError) throw new Failure("deadline");
+        if (error instanceof CommitIndeterminateError) throw new Indeterminate();
         if (error instanceof LocalStoreError && error.kind === "capacity") throw new Failure("results_full");
-        // The object may or may not have committed; the sweep resolves a pending one later.
-        await deps.log("job_indeterminate", { request_id: id });
         throw new Failure("commit_failed");
       }
-      await deps.log("job_committed", {
-        request_id: id,
-        chunks: summaries.length,
-        output_bytes: Buffer.byteLength(summary, "utf8"),
-        truncated,
-        duration_ms: Math.max(0, deps.now() - started),
-      });
       state("state_DONE");
       return "state_DONE";
     } finally {
@@ -267,6 +290,10 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
     try {
       if (error instanceof Refusal) {
         await deps.log("job_refused", { request_id: id, cause: error.cause, slot: error.slot });
+      } else if (error instanceof Indeterminate) {
+        await deps.log("job_indeterminate", { request_id: id });
+      } else if (error instanceof Failure) {
+        await deps.log("job_failed", { request_id: id, cause: error.failure });
       } else {
         const cause: JobFailureCause = error instanceof Failure ? error.failure : generating ? "commit_failed" : "call_failed";
         if (generating) await deps.log("job_failed", { request_id: id, cause });

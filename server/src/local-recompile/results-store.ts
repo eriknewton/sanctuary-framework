@@ -127,6 +127,22 @@ export interface SweepSummary {
   repaired: number;
 }
 
+/** A commit refused because the job's deadline had passed when the results lock was held. Nothing was written. */
+export class CommitDeadlineError extends LocalStoreError {
+  constructor() {
+    super("conflict");
+    this.name = "CommitDeadlineError";
+  }
+}
+
+/** A commit whose row failed and whose rollback failed: the object may be committed without its row. */
+export class CommitIndeterminateError extends LocalStoreError {
+  constructor() {
+    super("io");
+    this.name = "CommitIndeterminateError";
+  }
+}
+
 export function objectKey(requestId: string): string {
   if (!isRequestId(requestId)) throw new LocalStoreError("invalid_record");
   return `obj/${requestId}`;
@@ -203,8 +219,22 @@ export class LocalResultsStore {
     });
   }
 
-  /** Commit a pending object with its body; an indeterminate, committed or overdue object refuses. */
-  async markCommitted(requestId: string, body: LocalResultBody): Promise<LocalResultObject> {
+  /**
+   * Commit a pending object with its body; an indeterminate, committed or overdue object refuses.
+   *
+   * `options.committedRow`, when given, is the caller's own operator-log row for the commit. It is
+   * appended under this results lock (the log takes its own lock inside, the usual order), after the
+   * committed object is durable. Invariant: a committed object always has its row. When the append
+   * fails, the object is rolled back to pending under the same lock, so the sweep later marks it
+   * indeterminate, and the append's error is rethrown. If the rollback fails too, the commit is
+   * reported as CommitIndeterminateError: the object may stand committed without its row, and the
+   * caller must not record the job as failed.
+   */
+  async markCommitted(
+    requestId: string,
+    body: LocalResultBody,
+    options: { committedRow?: () => Promise<unknown> } = {},
+  ): Promise<LocalResultObject> {
     const checkedBody = validateBody(body);
     return this.locked(async () => {
       const entries = await this.readIndex();
@@ -212,6 +242,9 @@ export class LocalResultsStore {
       // A completion that arrives after the object left pending is discarded, never resurrected.
       if (current.state !== "pending") throw new LocalStoreError("conflict");
       const now = this.clock();
+      // Nothing commits once the job's deadline has passed. The clock is read while this lock is held,
+      // so a lock or fsync wait that outlasts the deadline refuses here rather than committing late.
+      if (now >= current.deadline) throw new CommitDeadlineError();
       // Past its deadline plus grace a pending object is indeterminate by rule, whether or not a sweep has run yet.
       if (now >= current.expires_at) throw new LocalStoreError("conflict");
       const next = validateObject({
@@ -225,7 +258,19 @@ export class LocalResultsStore {
       // The committing entry stays in every index evictFor publishes, so its object is never unreachable.
       const kept = await this.evictFor(entries, bytes, 0, requestId);
       await this.log("result_committed", requestId);
-      await this.replaceObject(kept, next, bytes);
+      const updated = await this.replaceObject(kept, next, bytes);
+      if (options.committedRow !== undefined) {
+        try {
+          await options.committedRow();
+        } catch (error) {
+          try {
+            await this.replaceObject(updated, current, objectBytes(current));
+          } catch {
+            throw new CommitIndeterminateError();
+          }
+          throw error;
+        }
+      }
       return next;
     });
   }

@@ -9,7 +9,13 @@ import { deriveNamespaceKey } from "../core/key-derivation.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { isReservedNamespace, resolveAuthenticatedIdentityWriterPublicKeys } from "../cognitive/state-store.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
-import { LOCAL_TASK_SURFACE, type LocalBindingDescriptor, type LocalBindingSource } from "./binding.js";
+import {
+  LOCAL_TASK_SURFACE,
+  type LocalBindingDescription,
+  type LocalBindingDescriptor,
+  type LocalBindingRefusal,
+  type LocalBindingSource,
+} from "./binding.js";
 import { AUTHORITY_PENDING_MAX, SOURCE_REFS_MAX } from "./limits.js";
 import {
   IPC_MESSAGE_MAX_BYTES,
@@ -29,6 +35,9 @@ export const LOCAL_TASK_DECOY_KEY_LABEL = "local-recompile-decoy";
 
 /** The tool whose tier decides whether a ref's namespace is readable by the local task. */
 export const COVERAGE_OPERATION = "state_read";
+
+/** Why the authority refuses every job right now; operator-side only. Must match /api/local/status. */
+export type LocalAuthorityCause = LocalBindingRefusal;
 
 export interface AuthorityJob {
   request_id: string;
@@ -85,6 +94,25 @@ export class LocalAuthority {
     this.armedEpoch = described.ok ? described.epoch : undefined;
   }
 
+  /**
+   * The binding as a job would see it now. With no epoch armed at boot this reports the binding's own
+   * refusal, and a binding provisioned since boot still reads `unarmed`: it arms only on a restart, so
+   * a configuration the server did not verify at arming never grants a job (fail closed).
+   */
+  private describe(): LocalBindingDescription {
+    if (this.armedEpoch === undefined) {
+      const now = this.deps.binding.describeVerifiedLocalBinding(LOCAL_TASK_SURFACE);
+      return now.ok ? { ok: false, refusal: "unarmed" } : now;
+    }
+    return this.deps.binding.describeVerifiedLocalBinding(LOCAL_TASK_SURFACE, this.armedEpoch);
+  }
+
+  /** Null when a valid job can be granted now; otherwise the cause every job is refused with. */
+  readiness(): LocalAuthorityCause | null {
+    const described = this.describe();
+    return described.ok ? null : described.refusal;
+  }
+
   get pendingCount(): number {
     return this.pending.size;
   }
@@ -112,7 +140,7 @@ export class LocalAuthority {
     const job = this.pending.get(requestId);
     this.pending.delete(requestId);
     const refs = job?.refs ?? [];
-    const described = this.deps.binding.describeVerifiedLocalBinding(LOCAL_TASK_SURFACE, this.armedEpoch ?? -1);
+    const described = this.describe();
     const covered = refs.map((ref) => coveredNamespace(this.deps.policy, ref.namespace));
     // Exactly SOURCE_REFS_MAX derivations every time, one per slot, with the decoy label for every
     // empty or uncovered slot, so the work done never depends on what the refs name or whether they pass.

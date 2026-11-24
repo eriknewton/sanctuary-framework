@@ -30,7 +30,7 @@ afterEach(async () => {
 function standInSurface(storeCalls: string[]) {
   const result = { request_id: ID, seat: "a".repeat(32), kind: "summarize", state: "committed", created_at: 1, deadline: 2, expires_at: 3, state_changed_at: 1, body: { summary: "text" } };
   return {
-    status: { armed: false, cause: "test_runtime", workerPid: () => undefined, workerState: () => "state_CLOSED", queueDepth: () => 0 },
+    status: { armed: false, cause: "test_runtime", authorityCause: () => null, workerPid: () => undefined, workerState: () => "state_CLOSED", queueDepth: () => 0 },
     modelTag: () => null,
     stores: {
       listResults: async () => (storeCalls.push("listResults"), []),

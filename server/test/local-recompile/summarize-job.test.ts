@@ -254,7 +254,7 @@ describe("summarize job", () => {
       truncated: "false",
     });
     expect(r.events.filter((event) => event.type === "job_state").map((event) => (event as { state: string }).state))
-      .toEqual(["state_AUTHORITY", "state_DIGEST", "state_READ", "state_GENERATE", "state_COMMIT", "state_DONE"]);
+      .toEqual(["state_QUEUED", "state_AUTHORITY", "state_DIGEST", "state_READ", "state_GENERATE", "state_COMMIT", "state_DONE"]);
   }, 120_000);
 
   it("the happy path for a 100 KiB set: seven chunk calls and one combine", async () => {
@@ -385,14 +385,18 @@ describe("summarize job", () => {
     const fake = await startFake({ mode: "stall" });
     const r = await rig(f, fake);
     const seatIds = Array.from({ length: WORKER_QUEUE_PER_SEAT_MAX + 1 }, () => r.submit([{ namespace: "notes", key: "one" }], { seat: "agent:busy" }));
-    const others = Array.from({ length: WORKER_QUEUE_MAX - WORKER_QUEUE_PER_SEAT_MAX + 1 }, (_, i) =>
-      r.submit([{ namespace: "notes", key: "one" }], { seat: `agent:other-${i % 4}` }));
     const seatDrop = await r.waitForEnd(seatIds.at(-1)!);
     expect(seatDrop).toMatchObject({ kind: "job_dropped", body: { cause: "seat_full" } });
-    const queueDrop = await r.waitForEnd(others.at(-1)!);
-    expect(queueDrop).toMatchObject({ kind: "job_dropped", body: { cause: "queue_full" } });
+    // The seat's drop ended its watch, so the server tracks the queue's own cap and no more.
+    Array.from({ length: WORKER_QUEUE_MAX - WORKER_QUEUE_PER_SEAT_MAX }, (_, i) =>
+      r.submit([{ namespace: "notes", key: "one" }], { seat: `agent:other-${i % 4}` }));
+    expect(r.client.outstandingJobs).toBe(WORKER_QUEUE_MAX);
+    const overflow = requestId();
+    r.authority.register({ request_id: overflow, refs: [{ namespace: "notes", key: "one" }] });
+    expect(r.client.submit({ type: "job", request_id: overflow, seat: "agent:late", kind: "summarize", refs: [{ namespace: "notes", key: "one" }], instruction: "x" }))
+      .toBe("queue_full");
     const drops = (await r.rows()).filter((row) => row.kind === "job_dropped");
-    expect(drops).toHaveLength(2);
+    expect(drops).toHaveLength(1);
   }, 120_000);
 
   it("the worker crashing mid-job leaves a pending object the sweep later marks indeterminate", async () => {

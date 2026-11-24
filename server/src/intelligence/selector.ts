@@ -50,6 +50,8 @@ import { randomBytes } from "node:crypto";
 import { isLoopbackOllamaEndpoint } from "./loopback-endpoint.js";
 // The local job descriptor's literal connect target; must match resolveLoopbackConnectTarget in intelligence/loopback-endpoint.ts.
 import { resolveLoopbackConnectTarget } from "./loopback-endpoint.js";
+// The local job descriptor's shape rule; must match the worker-side parse in local-recompile/binding.ts.
+import { isLocalBindingDescriptorShape } from "../local-recompile/descriptor-shape.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
@@ -2476,7 +2478,8 @@ export class SubstrateSelector {
   describeVerifiedLocalBinding(surface: Surface, expectedEpoch?: number): LocalBindingDescription {
     if (this.config.version !== 2) return { ok: false, refusal: "unarmed" };
     const epoch = this.integrityConfigEpoch;
-    if (expectedEpoch !== undefined && expectedEpoch !== epoch) return { ok: false, refusal: "epoch_changed" };
+    // Presence, assurance, loopback and identity are checked before the epoch, so each refusal names
+    // its own cause; epoch_changed means only that a binding which would otherwise pass has changed.
     const binding = this.config.localIntegrityState.bindings[surface];
     if (binding === undefined) return { ok: false, refusal: "binding_absent" };
     const expectedAssurance = IMMUNE_SURFACE_SET.has(surface) ? "immune" : "light";
@@ -2491,6 +2494,11 @@ export class SubstrateSelector {
     if (binding.runtime_tag !== runtimeTag || typeof manifestDigest !== "string") {
       return { ok: false, refusal: "identity_mismatch" };
     }
+    // The worker applies this same shape rule to the descriptor it receives (local-recompile/binding.ts).
+    if (!isLocalBindingDescriptorShape(runtimeTag, manifestDigest, target.target.address, target.target.port)) {
+      return { ok: false, refusal: "identity_mismatch" };
+    }
+    if (expectedEpoch !== undefined && expectedEpoch !== epoch) return { ok: false, refusal: "epoch_changed" };
     if (!this.integrityAuthorityMatches(surface, binding, epoch)) return { ok: false, refusal: "assurance_mismatch" };
     return {
       ok: true,

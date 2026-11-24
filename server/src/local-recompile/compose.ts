@@ -11,7 +11,7 @@ import type { AuditEntryInput } from "../operational/audit-log.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
 import type { ToolDefinition } from "../router.js";
 import { resolveCustodyLockRoot } from "../storage/cross-process-lock.js";
-import { LocalAuthority } from "./authority.js";
+import { LocalAuthority, type LocalAuthorityCause } from "./authority.js";
 import { LOCAL_TASK_SURFACE, type LocalBindingSource } from "./binding.js";
 import type { LocalDashboardSurface } from "./dashboard-routes.js";
 import { ensureLocalStores } from "./ensure-stores.js";
@@ -43,6 +43,8 @@ export interface LocalTaskTestSeams {
 export interface LocalTaskStatus {
   readonly armed: boolean;
   readonly cause: LocalTaskDisarmCause | null;
+  /** Null when a valid job can be granted now; otherwise why the authority refuses every job. */
+  authorityCause(): LocalAuthorityCause | null;
   workerPid(): number | undefined;
   workerState(): string;
   queueDepth(): number;
@@ -86,7 +88,14 @@ function disarmed(
 ): ComposedLocalTask {
   // Operator-side only: the agent sees the fixed unavailable response whatever the cause.
   process.stderr.write(`Sanctuary local tasks disarmed: ${cause}\n`);
-  const status: LocalTaskStatus = { armed: false, cause, workerPid: () => undefined, workerState: () => "state_CLOSED", queueDepth: () => 0 };
+  const status: LocalTaskStatus = {
+    armed: false,
+    cause,
+    authorityCause: () => null,
+    workerPid: () => undefined,
+    workerState: () => "state_CLOSED",
+    queueDepth: () => 0,
+  };
   return {
     tool: createLocalTaskTool({ armed: false, cause }, test?.callHook ? { callHook: test.callHook } : {}),
     status,
@@ -155,6 +164,20 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
 
     const listeners = new Set<(event: WorkerClientEvent) => void>();
     let queueDepth = 0;
+    const lostDrops = new Set<Promise<unknown>>();
+    const lostLog = dropLog;
+    // A job the worker took and never ended (it died or was closed) is recorded as dropped. This runs
+    // from the worker's exit, after the fact, never on an agent call's response path.
+    const recordLost = (requestIds: readonly string[]) => {
+      for (const requestId of requestIds) {
+        authority.forget(requestId);
+        const append = lostLog
+          .append("job_dropped", { request_id: requestId, cause: "worker_unavailable" })
+          .catch(() => undefined)
+          .finally(() => lostDrops.delete(append));
+        lostDrops.add(append);
+      }
+    };
     const spawn: WorkerSpawn | undefined = typeof test?.spawnWorker === "function" ? test.spawnWorker : undefined;
     client = new LocalWorkerClient({
       storageRoot: input.storageRoot,
@@ -166,6 +189,9 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
       answerAuthority: (requestId) => authority.reply(requestId),
       onEvent: (event) => {
         if (event.type === "status") queueDepth = event.status.queue_depth;
+        // A worker that is not ready holds no queue: a dead, closed or respawning worker reports zero.
+        if (event.type === "state" && event.state !== "state_READY") queueDepth = 0;
+        if (event.type === "jobs_lost") recordLost(event.request_ids);
         for (const listener of listeners) listener(event);
       },
     });
@@ -198,6 +224,7 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
     const status: LocalTaskStatus = {
       armed: true,
       cause: null,
+      authorityCause: () => authority.readiness(),
       workerPid: () => armedClient.pid,
       workerState: () => armedClient.state,
       queueDepth: () => queueDepth,
@@ -212,6 +239,8 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
         try {
           await armedClient.close();
         } finally {
+          // The drops close released are written before the log closes.
+          await Promise.allSettled([...lostDrops]);
           armedDropLog.close();
           armedOperatorStores.close();
         }

@@ -40,6 +40,7 @@ async function start(options: { stores?: boolean; armed?: boolean; loopbackAutoA
     status: {
       armed: options.armed ?? true,
       cause: options.armed === false ? "worker_unavailable" : null,
+      authorityCause: () => null,
       workerPid: () => process.pid,
       queueDepth: () => 3,
     },
@@ -70,7 +71,7 @@ describe("local task dashboard", () => {
   it("status reports arming, queue depth, worker liveness and the model tag", async () => {
     const h = await start();
     const res = await h.call("GET", "/api/local/status");
-    expect(res.body).toEqual({ armed: true, cause: null, queue_depth: 3, worker_alive: true, model_tag: "qwen2.5:1.5b" });
+    expect(res.body).toEqual({ armed: true, ready: true, cause: null, authority_cause: null, queue_depth: 3, worker_alive: true, model_tag: "qwen2.5:1.5b" });
   });
 
   it("lists results and opens one, recording the view first", async () => {

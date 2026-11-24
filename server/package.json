@@ -66,6 +66,7 @@
     "test:conformance": "vitest run test/conformance",
     "test:zero-pii-regression": "vitest run test/query-anonymity/zero-pii-regression.test.ts",
     "test:qla-perf-budget": "vitest run test/query-anonymity/performance-budget.test.ts",
+    "test:timing": "SANCTUARY_TIMING_GATE=1 vitest run test/local-recompile/agent-timing.test.ts --maxWorkers=1",
     "test:mutation": "stryker run",
     "synthetic-coverage": "tsx ../scripts/synthetic-coverage/run.ts",
     "synthetic-coverage:parity": "tsx ../scripts/synthetic-coverage/parity-cli.ts",

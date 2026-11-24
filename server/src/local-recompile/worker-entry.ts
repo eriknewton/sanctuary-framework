@@ -20,6 +20,7 @@ import {
   acceptMessage,
   assertSendable,
   type AuthorityReply,
+  type JobState,
   type LocalTaskJob,
   type WorkerFaultKind,
   type WorkerLimits,
@@ -81,16 +82,39 @@ function acceptAuthorityReply(reply: AuthorityReply): void {
   waiting(reply);
 }
 
+/** Tell the server a job reached a state; a terminal state ends the server's watch for that job. */
+function reportJobState(requestId: string, jobState: JobState): void {
+  try {
+    send({ type: "job_state", request_id: requestId, state: jobState });
+  } catch {
+    // The live view is best effort; the operator log is the record.
+  }
+}
+
 function acceptJob(job: LocalTaskJob): void {
   const jobs = queue;
-  if (jobs === undefined || state !== "state_READY") return;
+  // Every job this worker reads ends with an operator row: one that arrives before the queue is open
+  // is dropped with a fixed cause, never ignored.
+  if (jobs === undefined || state !== "state_READY") {
+    appendRow("job_dropped", { request_id: job.request_id, cause: "worker_unavailable" }).catch(() => undefined);
+    reportJobState(job.request_id, "state_REFUSED");
+    return;
+  }
   const offered = jobs.offer(job);
   // A full queue or seat drops the job on the operator side only; the agent was answered long ago.
   if (!offered.queued) {
     appendRow("job_dropped", { request_id: job.request_id, cause: offered.cause }).catch(() => undefined);
+    reportJobState(job.request_id, "state_REFUSED");
     return;
   }
   appendRow("job_queued", { request_id: job.request_id, queue_depth: offered.depth }).catch(() => undefined);
+  reportJobState(job.request_id, "state_QUEUED");
+  try {
+    // The operator's live view of the queue depth follows each accepted job, not only the sweep.
+    send(status());
+  } catch {
+    // Best effort, as every live-view message.
+  }
 }
 
 function startQueue(): void {
@@ -102,15 +126,9 @@ function startQueue(): void {
       readRecord: (namespace, key, maxBytes) => store.readBounded(namespace, key, maxBytes),
       log: appendRow,
       putPending: (input) => results_.putPending(input),
-      markCommitted: (requestId, body) => results_.markCommitted(requestId, body),
+      markCommitted: (requestId, body, committedRow) => results_.markCommitted(requestId, body, { committedRow }),
       requestAuthority,
-      reportState: (requestId, jobState) => {
-        try {
-          send({ type: "job_state", request_id: requestId, state: jobState });
-        } catch {
-          // The live view is best effort; the operator log is the record.
-        }
-      },
+      reportState: reportJobState,
       // The only model client this job can build: the loopback transport over the descriptor's literal address.
       makeClient: (target, timeoutMs) => new SensitiveGenerationClient(target, { timeoutMs }),
       callTimeoutMs: limits.callTimeoutMs,
