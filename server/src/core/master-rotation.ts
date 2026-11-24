@@ -512,6 +512,9 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     infos: ["sovereignty-profile"],
   },
   _principal: { kind: "purpose-encrypted", infos: ["principal-baseline"] },
+  // Insert records are re-encrypted under the same purpose key as the snapshot.
+  // Must match BASELINE_NS_NAMESPACE in principal-policy/baseline.ts.
+  _principal_ns: { kind: "purpose-encrypted", infos: ["principal-baseline"] },
   _intelligence: {
     kind: "purpose-encrypted",
     infos: ["intelligence-substrate-config"],

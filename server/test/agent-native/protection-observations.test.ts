@@ -1,7 +1,9 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 // fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 /** Shared protection observations. */
 import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { afterEach, expect, it, vi } from "vitest";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
@@ -53,7 +55,7 @@ async function fixture() {
   const custodyRead = vi.spyOn(custodySource, "buildCustodyExitPanel").mockResolvedValue(custody);
   const chain = await auditLog.getAuditChainVerdict();
   const chainRead = vi.spyOn(auditLog, "getAuditChainVerdict").mockRejectedValue(new Error("chain unavailable"));
-  const makeTool = (sources = runtime) => createAgentNativeCooperativeTools({ ...primitives, ...sources,
+  const makeTool = (sources = runtime) => createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), ...primitives, ...sources,
     primitiveTools: primitives.tools, auditLog, storage,
     resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "absent" })
   }).tools.find(tool => tool.name === "sanctuary_active_protections")!;

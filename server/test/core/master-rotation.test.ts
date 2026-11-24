@@ -17,6 +17,8 @@ import { mkdir, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
+import { createHash } from "node:crypto";
+import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 
 import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -1328,6 +1330,32 @@ describe("master rotation: fail-closed coverage", () => {
       stringToBytes("chi8|agent-rotate-1")
     );
     expect(JSON.parse(bytesToString(plain)).weights).toEqual([1, 2, 3]);
+  });
+
+  it("master rotation succeeds on a fortress with insert records, and a fresh tracker after rotation still knows every inserted namespace", async () => {
+    // One record per namespace under the baseline purpose key, no AAD, keyed by hex SHA-256 of "ns:" plus the id.
+    const fortress = await buildFortress();
+    const purposeKey = derivePurposeKey(fortress.master, "principal-baseline");
+    const namespaces = ["notes", "travel"];
+    for (const namespace of namespaces) {
+      await fortress.storage.write(
+        "_principal_ns",
+        createHash("sha256").update("ns:" + namespace, "utf8").digest("hex"),
+        stringToBytes(JSON.stringify(encrypt(stringToBytes(namespace), purposeKey))),
+      );
+    }
+    await rotateMaster(rotateOpts(fortress));
+    const est = custodySessions.track(await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    }));
+    expect(toBase64url(est.masterKey)).not.toBe(toBase64url(fortress.master));
+    const tracker = new BaselineTracker(fortress.storage, est.masterKey);
+    await tracker.load();
+    for (const namespace of namespaces) expect(tracker.isNewNamespace(namespace)).toBe(false);
+    const stale = new BaselineTracker(fortress.storage, fortress.master);
+    await stale.load();
+    for (const namespace of namespaces) expect(stale.isNewNamespace(namespace)).toBe(true);
   });
 
   it("rotates the federation trust-root record (_federation/trust-root-v1, purpose-encrypted, no AAD) — re-wraps under the new master, no orphan/lockout", async () => {
