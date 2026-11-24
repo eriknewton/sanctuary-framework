@@ -170,8 +170,10 @@ it("a failed flag write at wrap still unregisters the no-dashboard audit flush",
   expect(__processShutdownCleanupCountForTest()).toBe(cleanupsBefore);
 });
 
-// The operator notes, written out byte for byte and never imported.
-const UNCONFIRMED_NOTE = "Note: default session binding could not be confirmed; check with `sanctuary session-binding status`.";
+// The operator notes, written out byte for byte and never imported; the printed line carries its indent.
+const UNCONFIRMED_NOTE_LINE = "  Note: default session binding could not be confirmed; check with `sanctuary session-binding status`.";
+/** Every printed line that carries the unconfirmed note's wording, so a longer or re-indented line fails the exact comparison. */
+const unconfirmedNoteLines = (text: string) => text.split("\n").filter((line) => line.includes("default session binding could not be confirmed"));
 const realWriteSoleBinding = config.writeSoleBindingForFreshFortress;
 const runWrapCommand = () => runWrap({ claudeCode: true, noOpen: true, noDashboard: true }, wrapDeps);
 
@@ -190,7 +192,7 @@ it.each([
   expect(await flag()).toEqual({ sole_identity: true });
   const text = stderr.mock.calls.flat().join("\n");
   expect(text).not.toContain("not enabled");
-  expect(text).not.toContain(UNCONFIRMED_NOTE);
+  expect(unconfirmedNoteLines(text)).toEqual([]);
   expect(text).not.toContain(enableCommand);
 });
 
@@ -220,6 +222,6 @@ it.each([
   // The command completes; only its note follows the flag on disk.
   await run();
   const text = stderr.mock.calls.flat().join("\n");
-  expect(text).toContain(UNCONFIRMED_NOTE);
+  expect(unconfirmedNoteLines(text)).toEqual([UNCONFIRMED_NOTE_LINE]);
   expect(text).not.toContain("not enabled");
 });
