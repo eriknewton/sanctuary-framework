@@ -13,6 +13,7 @@ import { once } from "node:events";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { vi } from "vitest";
 import { StateStore } from "../../../src/cognitive/state-store.js";
 import { createIdentity } from "../../../src/core/identity.js";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
@@ -43,7 +44,8 @@ export async function startFakeModel(script: Record<string, unknown> = {}): Prom
   const child: ChildProcess = fork(FAKE_CHILD, [], { execArgv: ["--import", TSX], stdio: ["ignore", "ignore", "ignore", "ipc"] });
   const requests: FakeModel["requests"] = [];
   const stop = async () => {
-    if (child.exitCode === null && child.signalCode === null) {
+    // A child that never started has no pid and may never emit exit; there is nothing to wait for.
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
       const exited = once(child, "exit");
       child.kill("SIGKILL");
       await exited;
@@ -57,6 +59,8 @@ export async function startFakeModel(script: Record<string, unknown> = {}): Prom
         if (message.type === "request") requests.push(message);
       });
       child.once("exit", () => reject(new Error("fake model exited")));
+      // A fork that fails to start rejects here, and the catch below stops the child.
+      child.once("error", reject);
     });
     const fake: FakeModel = { port, pid: child.pid!, requests, script: (update) => child.send({ type: "script", script: update }), stop };
     fake.script({ tag: Q5E_RUNTIME_TAG, digest: Q5E_DEFAULT_DIGEST, reply: "summary", ...script });
@@ -89,6 +93,8 @@ export interface WorldOptions {
   unarmed?: boolean;
   fakeScript?: Record<string, unknown>;
   seams?: ServerSeams;
+  /** A fixed wall clock for the record writes, so two worlds' records carry the same timestamps. */
+  recordTime?: number;
 }
 
 export interface World {
@@ -118,8 +124,14 @@ export async function openWorld(options: WorldOptions = {}): Promise<World> {
       const { storedIdentity: identity } = createIdentity("writer", encKey, "recovery-key");
       await persistStoredIdentity(storage, masterKey, identity);
       const store = new StateStore(storage, masterKey);
-      for (const record of options.records ?? []) {
-        await store.write(record.namespace, record.key, record.value, identity.identity_id, identity.encrypted_private_key, encKey);
+      // Only Date is faked, and only while the records are written; every timer stays real.
+      if (options.recordTime !== undefined) vi.useFakeTimers({ toFake: ["Date"], now: options.recordTime });
+      try {
+        for (const record of options.records ?? []) {
+          await store.write(record.namespace, record.key, record.value, identity.identity_id, identity.encrypted_private_key, encKey);
+        }
+      } finally {
+        if (options.recordTime !== undefined) vi.useRealTimers();
       }
     } finally {
       await first.close();

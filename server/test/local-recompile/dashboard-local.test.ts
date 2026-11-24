@@ -13,15 +13,6 @@ import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.j
 import { getFreePort } from "../helpers/free-port.js";
 import { LOCK_ROOT, operatorFixture, requestId, type OperatorFixture } from "./helpers/operator-fixture.js";
 
-// Must match the ROUTES list in dashboard-local-auth.test.ts, with ids as ":id".
-const AUTH_TEST_ROUTES = [
-  "GET /local",
-  "GET /api/local/status",
-  "GET /api/local/results",
-  "GET /api/local/results/:id",
-  "POST /api/local/results/:id/delete",
-  "GET /api/local/log",
-];
 // Must match LOCAL_SUMMARY_NOTICE in src/local-recompile/dashboard-routes.ts.
 const NOTICE = "This was written by your local model from your stored records. Check it before pasting it anywhere, including back to an agent.";
 
@@ -63,8 +54,8 @@ async function start(options: { stores?: boolean; armed?: boolean; loopbackAutoA
 }
 
 describe("local task dashboard", () => {
-  it("the route table is exactly the set the auth test covers", () => {
-    expect(new Set(LOCAL_DASHBOARD_ROUTES.map((route) => `${route.method} ${route.path}`))).toEqual(new Set(AUTH_TEST_ROUTES));
+  // The route table's set parity lives in dashboard-local-auth.test.ts, the one independent copy.
+  it("pins the summary notice", () => {
     expect(LOCAL_SUMMARY_NOTICE).toBe(NOTICE);
   });
 
@@ -135,8 +126,8 @@ describe("local task dashboard", () => {
   it("with loopback auto-auth on, a tokenless loopback request to every route is refused and writes no operator-log row", async () => {
     const h = await start({ loopbackAutoAuth: true });
     const id = await h.fixture.seed(1, "text");
+    // Every route in the table is driven; the table's own parity is checked in dashboard-local-auth.test.ts.
     const driven = LOCAL_DASHBOARD_ROUTES.map((route) => ({ ...route, url: route.path.replace(":id", id) }));
-    expect(new Set(driven.map((route) => `${route.method} ${route.path}`))).toEqual(new Set(LOCAL_DASHBOARD_ROUTES.map((route) => `${route.method} ${route.path}`)));
     const before = await h.fixture.rows();
     for (const route of driven) expect(await h.tokenless(route.method, route.url), `${route.method} ${route.path}`).toBe(401);
     expect(await h.fixture.rows()).toEqual(before);

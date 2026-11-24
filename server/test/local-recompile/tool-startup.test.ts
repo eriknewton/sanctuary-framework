@@ -1,6 +1,8 @@
 // fail-before-exempt: startup arming of a tool absent on base; the response tests carry the fail-before evidence.
 import { fork } from "node:child_process";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FORTRESS_STATE_DIRECTORY } from "../../src/core/custody-markers.js";
 import { createSanctuaryServer } from "../../src/index.js";
@@ -149,8 +151,25 @@ describe("local task startup", () => {
       __testLocalTask: { spawnWorker: true },
     });
     cleanups.push(() => runtime.cleanup());
-    expect(runtime.localTask).toMatchObject({ armed: false, cause: "storage_injected" });
-    expect(stderr.join("")).toContain("Sanctuary local tasks disarmed: storage_injected");
+    const client = new Client({ name: "local-task-memory-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await runtime.server.connect(serverTransport);
+    await client.connect(clientTransport);
+    cleanups.push(() => client.close());
+    const callTool = async (name: string, args: Record<string, unknown>) => {
+      const response = await client.callTool({ name, arguments: args });
+      const content = response.content as Array<{ type: string; text: string }>;
+      return { text: content[0]?.text ?? "", isError: response.isError === true, items: content.length };
+    };
+    const server: LocalTaskServer = {
+      runtime,
+      client,
+      storagePath: home.defaultFortressPath,
+      call: (args) => callTool("sanctuary_local_task", args),
+      callTool,
+      close: async () => undefined,
+    };
+    await expectDisarmed(server, "storage_injected", stderr);
   }, 120_000);
 
   it("under the test runner the worker starts only on an explicit opt-in", async () => {

@@ -50,6 +50,15 @@ export async function bootLocalTaskServer(options: {
 } = {}): Promise<LocalTaskServer> {
   const fortress = options.storagePath === undefined ? await prepareFortress(options.policy) : undefined;
   const storagePath = options.storagePath ?? fortress!.storagePath;
+  // The server boots this fortress, named explicitly, whatever another fortress set since; the
+  // previous value is restored when this server closes.
+  const hadStoragePath = Object.hasOwn(process.env, "SANCTUARY_STORAGE_PATH");
+  const previousStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+  const restoreStoragePath = () => {
+    if (hadStoragePath) process.env.SANCTUARY_STORAGE_PATH = previousStoragePath;
+    else delete process.env.SANCTUARY_STORAGE_PATH;
+  };
+  process.env.SANCTUARY_STORAGE_PATH = storagePath;
   let runtime: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
   const client = new Client({ name: "local-task-test", version: "1.0.0" });
   try {
@@ -64,6 +73,7 @@ export async function bootLocalTaskServer(options: {
   } catch (error) {
     await client.close().catch(() => undefined);
     await runtime?.cleanup().catch(() => undefined);
+    restoreStoragePath();
     await fortress?.cleanup();
     throw error;
   }
@@ -90,6 +100,7 @@ export async function bootLocalTaskServer(options: {
         try {
           await booted.cleanup();
         } finally {
+          restoreStoragePath();
           await fortress?.cleanup();
         }
       }

@@ -62,6 +62,7 @@ async function open(options: WorldOptions): Promise<Clocked> {
   let ids = 0;
   const world = await openWorld({
     ...options,
+    recordTime: T0,
     seams: {
       ...options.seams,
       clock: () => clock.now,
@@ -120,12 +121,94 @@ async function runScript(a: Clocked, b: Clocked, script: Shape[]): Promise<Array
   return pairs;
 }
 
+// Must match LOCAL_REQUEST_SUBMITTED_OPERATION in src/local-recompile/tool.ts.
+const SUBMITTED_OPERATION = "local_request_submitted";
+
 function expectSameSharedView(pairs: Array<[Measure, Measure]>): void {
   pairs.forEach(([a, b], index) => {
     expect(b, `call ${index + 1}`).toEqual(a);
     expect(a.items, `call ${index + 1}`).toBe(1);
     expect(a.isError, `call ${index + 1}`).toBe(false);
+    // Every added row is the gate's row for this tool, then the submission row on an acknowledgement;
+    // none carries a denial cause.
+    const submitted = a.text.startsWith('{"status":"submitted"');
+    expect(a.operations, `call ${index + 1}`).toEqual(submitted ? [GATE_OPERATION, SUBMITTED_OPERATION] : [GATE_OPERATION]);
+    for (const row of a.rows) expect(JSON.stringify(row), `call ${index + 1}`).not.toContain("denial_cause");
   });
+}
+
+// The gate's row for every call of this tool; must match the gate's audit operation in principal-policy/gate.ts.
+const GATE_OPERATION = "gate_allow:sanctuary_local_task";
+
+/**
+ * The rest of the agent-visible tools that report counts, sizes or names, called in both worlds after
+ * the script. Only the documented live presentation clocks are masked.
+ */
+const READ_TOOLS: Array<[string, Record<string, unknown>]> = [
+  ["monitor_health", {}],
+  ["state_list", { namespace: "notes" }],
+  ["state_list", {}],
+  ["sanctuary_help", { intent: "summarize my stored notes" }],
+  ["sanctuary_capabilities", {}],
+  ["identity_list", {}],
+  ["castle_wall_liveness", {}],
+];
+
+/** Tools whose answers report the agent's own stored records: sizes and names. */
+const RECORD_DEPENDENT = new Set(["monitor_health", "state_list"]);
+/** Tools whose answers name per-fortress random identities; compared within each world only. */
+const FORTRESS_SPECIFIC = new Set(["identity_list"]);
+// The paired worlds are two fortresses, and each names its own fortress id (16 hex digits) in the
+// Castle Wall socket path. The id is fixed for the fortress and set before any call, so it is masked.
+const FORTRESS_ID = /fortress-[0-9a-f]{16}/g;
+
+function maskLiveClocks(name: string, text: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(text.replace(FORTRESS_ID, "fortress-<masked>"));
+  } catch {
+    return text;
+  }
+  const walk = (node: unknown, inLiveness: boolean, top: boolean): unknown => {
+    if (Array.isArray(node)) return node.map((item) => walk(item, inLiveness, false));
+    if (node === null || typeof node !== "object") return node;
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+      const liveness = inLiveness || key === "castle_wall_liveness" || name === "castle_wall_liveness";
+      if (name === "monitor_health" && top && key === "checked_at") out[key] = "<masked>";
+      // Eight random bytes minted per call (cooperative-surface.ts audit()); it carries no world state.
+      else if (key === "audit_ref" && typeof child === "string") out[key] = child.replace(/:[0-9a-f]{16}$/, ":<masked>");
+      else if (liveness && (key === "evaluated_at" || key === "served_age_ms")) out[key] = "<masked>";
+      else out[key] = walk(child, liveness, false);
+    }
+    return out;
+  };
+  return JSON.stringify(walk(value, name === "castle_wall_liveness", true));
+}
+
+async function readTools(world: Clocked, names: (name: string) => boolean): Promise<Array<{ tool: string; isError: boolean; text: string }>> {
+  const out: Array<{ tool: string; isError: boolean; text: string }> = [];
+  for (const [name, args] of READ_TOOLS) {
+    if (!names(name)) continue;
+    const answer = await world.world.server.callTool(name, args);
+    out.push({ tool: `${name} ${JSON.stringify(args)}`, isError: answer.isError, text: maskLiveClocks(name, answer.text) });
+  }
+  return out;
+}
+
+/**
+ * The rest of the agent's tools answer the same in both worlds. When the hidden fact is the agent's
+ * own stored data, the tools that report those records are compared within each world instead
+ * (before the script and after its jobs end), so the job's work shows in neither.
+ */
+async function expectSameReadTools(a: Clocked, b: Clocked, storedDataDiffers = false): Promise<void> {
+  for (const [name, args] of READ_TOOLS) {
+    if (FORTRESS_SPECIFIC.has(name) || (storedDataDiffers && RECORD_DEPENDENT.has(name))) continue;
+    const left = await a.world.server.callTool(name, args);
+    const right = await b.world.server.callTool(name, args);
+    expect({ isError: right.isError, text: maskLiveClocks(name, right.text) }, `${name} ${JSON.stringify(args)}`)
+      .toEqual({ isError: left.isError, text: maskLiveClocks(name, left.text) });
+  }
 }
 
 /** Kind and body of each job row, with clocks and durations masked; the hidden fact shows up here. */
@@ -155,11 +238,13 @@ interface Pair {
   before?: (world: Clocked, which: "a" | "b") => Promise<void>;
   /** Jobs each world's operator log must show ended before the control compares them. */
   jobs: number;
+  /** The hidden fact is the agent's own stored data, which its record tools report by design. */
+  storedDataDiffers?: true;
 }
 
 const PAIRS: Pair[] = [
-  { name: "record content", a: { records: [RECORD] }, b: { records: [{ ...RECORD, value: "a different and much longer note, ".repeat(40) }] }, jobs: 4 },
-  { name: "record existence", a: { records: [RECORD] }, b: { records: [{ ...RECORD, key: "two" }] }, jobs: 4 },
+  { name: "record content", a: { records: [RECORD] }, b: { records: [{ ...RECORD, value: "a different and much longer note, ".repeat(40) }] }, jobs: 4, storedDataDiffers: true },
+  { name: "record existence", a: { records: [RECORD] }, b: { records: [{ ...RECORD, key: "two" }] }, jobs: 4, storedDataDiffers: true },
   { name: "coverage", a: { records: [RECORD] }, b: { records: [RECORD], policy: stateReadTier1 }, jobs: 4 },
   { name: "model availability", a: { records: [RECORD] }, b: { records: [RECORD], fakeScript: { mode: "bad_digest" } }, jobs: 4 },
   {
@@ -189,6 +274,9 @@ describe("the agent's view does not depend on a hidden fact", () => {
   it.each(PAIRS)("$name: same responses and shared log, different operator log", async (pair) => {
     const a = await open(pair.a);
     const b = await open(pair.b);
+    const every = () => true;
+    // Every read tool's answer in each world before anything else runs there.
+    const toolsBefore = [await readTools(a, every), await readTools(b, every)];
     if (pair.before) {
       await pair.before(a, "a");
       await pair.before(b, "b");
@@ -197,22 +285,28 @@ describe("the agent's view does not depend on a hidden fact", () => {
     expectSameSharedView(pairs);
     expect(pairs.map(([m]) => m.text.startsWith('{"status":"submitted"') ? "A1" : m.text)).toEqual(["A1", INVALID, "A1", "A1", "A1", BUSY]);
     expect(pairs.map(([m]) => m.operations.length)).toEqual([2, 1, 2, 2, 2, 1]);
+    await expectSameReadTools(a, b, pair.storedDataDiffers);
 
     // Control: the hidden fact did reach the operator side.
     const rowsA = await waitForJobEnds(a.world, pair.jobs);
     const rowsB = await waitForJobEnds(b.world, pair.jobs);
+    // In each world, every read tool answers after its jobs ended exactly as before them.
+    expect(await readTools(a, every)).toEqual(toolsBefore[0]);
+    expect(await readTools(b, every)).toEqual(toolsBefore[1]);
     expect(operatorView(rowsB)).not.toEqual(operatorView(rowsA));
     // World a is the armed baseline: its jobs reach the model and commit.
     expect(rowsA.some((row) => row.kind === "job_committed")).toBe(true);
   }, PAIR_TIMEOUT_MS);
 
-  it("disarmed: the unavailable response and its rows do not depend on record content", async () => {
-    const a = await open({ records: [RECORD], seams: { spawnWorker: false } });
-    const b = await open({ records: [{ ...RECORD, value: "another and longer note ".repeat(30) }], seams: { spawnWorker: false } });
+  // Every pair whose hidden fact is not about the worker, disarmed in both worlds.
+  it.each(PAIRS.filter((pair) => pair.before === undefined))("disarmed, $name: the unavailable response and its rows do not depend on it", async (pair) => {
+    const a = await open({ ...pair.a, seams: { ...pair.a.seams, spawnWorker: false } });
+    const b = await open({ ...pair.b, seams: { ...pair.b.seams, spawnWorker: false } });
     const pairs = await runScript(a, b, SCRIPT);
     expectSameSharedView(pairs);
     expect(pairs.map(([m]) => m.text)).toEqual([UNAVAILABLE, INVALID, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE]);
     expect(pairs.map(([m]) => m.operations.length)).toEqual([1, 1, 1, 1, 1, 1]);
+    await expectSameReadTools(a, b, pair.storedDataDiffers);
   }, PAIR_TIMEOUT_MS);
 
   it.each([

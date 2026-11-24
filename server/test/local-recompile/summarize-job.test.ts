@@ -16,7 +16,7 @@ import { derivePurposeKey, deriveNamespaceKey } from "../../src/core/key-derivat
 import { generateRandomKey } from "../../src/core/random.js";
 import { LocalAuthority } from "../../src/local-recompile/authority.js";
 import { LocalJobQueue } from "../../src/local-recompile/job-queue.js";
-import { CHUNK_BYTES, CHUNK_SUMMARY_MAX_BYTES, NUM_PREDICT_CHUNK, NUM_PREDICT_COMBINE, PROMPT_TOKEN_BOUND, WORKER_QUEUE_MAX, WORKER_QUEUE_PER_SEAT_MAX } from "../../src/local-recompile/limits.js";
+import { CHUNK_BYTES, CHUNK_SUMMARY_MAX_BYTES, RECORD_PLAINTEXT_MAX_BYTES, NUM_PREDICT_CHUNK, NUM_PREDICT_COMBINE, PROMPT_TOKEN_BOUND, WORKER_QUEUE_MAX, WORKER_QUEUE_PER_SEAT_MAX } from "../../src/local-recompile/limits.js";
 import { LocalOplog, type OplogRow } from "../../src/local-recompile/oplog.js";
 import { frameAndChunk, recordClose, recordOpen, SUMMARY_SYSTEM_TEXT, truncateUtf8 } from "../../src/local-recompile/prompts.js";
 import { LocalResultsStore, PENDING_GRACE_MS } from "../../src/local-recompile/results-store.js";
@@ -295,12 +295,27 @@ describe("summarize job", () => {
       await f.storage.write("notes", "big", new Uint8Array(RECORD_STORED_MAX_BYTES + 1));
       return { refs: [{ namespace: "notes", key: "big" }] };
     }],
-    ["a record whose writer is not authenticated", "record_unverifiable", async (f) => {
+    ["a record whose writer is not known", "record_unverifiable", async (f) => {
       await f.write("notes", "one", "text");
       const raw = JSON.parse(new TextDecoder().decode((await f.storage.read("notes", "one"))!));
       raw.kid = "someone-else";
       await f.storage.write("notes", "one", stringToBytes(JSON.stringify(raw)));
       return { refs: [{ namespace: "notes", key: "one" }] };
+    }],
+    ["a record whose signature is corrupted under its known writer", "record_unverifiable", async (f) => {
+      await f.write("notes", "one", "text");
+      const raw = JSON.parse(new TextDecoder().decode((await f.storage.read("notes", "one"))!)) as { kid?: string; sig: string; envelope_sig?: string };
+      // One base64url character changed in each signature; the writer id is left as written.
+      const flip = (text: string) => `${text[0] === "A" ? "B" : "A"}${text.slice(1)}`;
+      raw.sig = flip(raw.sig);
+      if (raw.envelope_sig !== undefined) raw.envelope_sig = flip(raw.envelope_sig);
+      await f.storage.write("notes", "one", stringToBytes(JSON.stringify(raw)));
+      return { refs: [{ namespace: "notes", key: "one" }] };
+    }],
+    ["one record over its plaintext cap that fits the stored cap", "record_oversized", async (f) => {
+      await f.write("notes", "wide", "y".repeat(RECORD_PLAINTEXT_MAX_BYTES + 1));
+      expect((await f.storage.read("notes", "wide"))!.length).toBeLessThanOrEqual(RECORD_STORED_MAX_BYTES);
+      return { refs: [{ namespace: "notes", key: "wide" }] };
     }],
     ["an undecryptable record", "record_undecryptable", async (f) => {
       await f.write("notes", "one", "text");
@@ -328,6 +343,21 @@ describe("summarize job", () => {
     expect(rowsFor(await r.rows(), id).filter((row) => row.kind === "job_refused")).toHaveLength(1);
     expect(await r.results().get(id, { includeUncommitted: true })).toBeNull();
     expect(generateRequests(fake)).toHaveLength(0);
+  }, 120_000);
+
+  it.each([
+    ["a redirect", "redirect", "redirect"],
+    ["a non-success status", "non200", "http_status"],
+  ])("a model reply that is %s fails the job and commits nothing", async (_label, mode, outcome) => {
+    const f = await fortress();
+    await f.write("notes", "one", "text");
+    const fake = await startFake({ mode });
+    const r = await rig(f, fake);
+    const id = r.submit([{ namespace: "notes", key: "one" }]);
+    const final = await r.waitForEnd(id);
+    expect(final).toMatchObject({ kind: "job_failed", body: { cause: "call_failed" } });
+    expect(rowsFor(await r.rows(), id).find((row) => row.kind === "job_call")?.body).toMatchObject({ outcome });
+    expect(await r.results().get(id)).toBeNull();
   }, 120_000);
 
   it("an output over its cap is cut at a character boundary and marked truncated", async () => {

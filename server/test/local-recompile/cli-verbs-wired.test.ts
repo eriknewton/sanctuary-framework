@@ -42,6 +42,8 @@ describe("the results and local verbs in the built CLI", () => {
     const env = { PATH: process.env.PATH ?? "", HOME: home, SANCTUARY_STORAGE_PATH: join(home, ".sanctuary"), NO_COLOR: "1" };
     const result = await run(process.execPath, [CLI, ...argv], { env, timeout: CLI_TIMEOUT_MS }).catch((error: { stdout?: string; stderr?: string; code?: number }) => error);
     expect(result.stdout ?? "").toContain(usage);
+    // A help or no-argument form exits 0; execFile reports any other exit as an error carrying `code`.
+    expect((result as { code?: number }).code ?? 0).toBe(0);
     expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).not.toMatch(/unknown command/i);
   });
 
