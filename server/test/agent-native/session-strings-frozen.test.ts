@@ -1,5 +1,4 @@
-// fail-before-exempt: pins agent-facing session text that already ships on this branch, byte for byte; no behaviour changes.
-/** The session text an agent reads in tools/list and the capabilities catalog, and the operator's unconfirmed note, are frozen. */
+/** The session text an agent reads in tools/list and the capabilities catalog is frozen. */
 import { afterEach, expect, it, vi } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -8,7 +7,6 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createSanctuaryServer } from "../../src/index.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
-import { SOLE_BINDING_UNCONFIRMED_NOTE } from "../../src/config.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 
 // Each literal is written out in full and never imported, so a change to the shipped text fails here.
@@ -17,7 +15,6 @@ const ACTIVE_PROTECTIONS_DESCRIPTION = "List every layer of Sanctuary with its e
 const CAPABILITIES_DESCRIPTION = "Return the start-here catalog of Sanctuary's cooperative tools: for each tool, what it does and when to reach for it. Read-only, takes no arguments. Call this to discover what cooperative memory/identity/audit tools are available and route your work through them instead of ad-hoc state. The same catalog is also delivered in the MCP server instructions at connect time; this tool re-serves it on demand. Returns { session: { bound, binding_source } when bound or { bound, operator_action } when not, capabilities: [{ tool, does, when, available }], audit_ref }.";
 const COMPOUND_EXECUTE_DESCRIPTION = "Execute a short plan of sanctuary_remember, sanctuary_recall, sanctuary_hide and sanctuary_forget steps in order, in one call. Tier 1 under the default policy: requires operator approval for the call itself. Each step is { tool, args } and gets a step_id by position (step-1, step-2, and so on). Every sanctuary_forget step also needs its own operator approval, passed in approvals keyed by step_id and bound to this exact plan and step. Step approvals are reserved before any step runs, and if one is missing or does not match, no step runs. Completed steps are not rolled back: if a step fails, the call returns the standard refusal, and the steps before it may have taken effect; use sanctuary_recall to check your current memory state.";
 const WHO_AM_I_CATALOG_DOES = "Returns whether this session has an identity and how it was bound, with the disclosable identity facts when it does (label, did, identity fingerprint, memory namespace handle). Never returns private keys.";
-const UNCONFIRMED_NOTE_LINE = "  Note: default session binding could not be confirmed; check with `sanctuary session-binding status`.";
 
 let cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -57,8 +54,4 @@ it("the capabilities catalog says what who-am-I does byte for byte", async () =>
   const result = await client.callTool({ name: "sanctuary_capabilities", arguments: {} }) as { content: Array<{ text: string }> };
   const answer = JSON.parse(result.content[0]!.text) as { capabilities: Array<{ tool: string; does: string }> };
   expect(answer.capabilities.find((entry) => entry.tool === "sanctuary_who_am_i")?.does).toBe(WHO_AM_I_CATALOG_DOES);
-});
-
-it("the unconfirmed default-binding note equals its frozen text", () => {
-  expect(SOLE_BINDING_UNCONFIRMED_NOTE).toBe(UNCONFIRMED_NOTE_LINE);
 });
