@@ -2115,8 +2115,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // browser alone does not stop a page on another local port from sending the operator's cookie.
     // A request that changes state and was admitted by cookie or ?session= is served only when it
     // shows it came from the dashboard's own origin; neither header present refuses. A bearer header
-    // cannot be set by a cross-origin page, so a bearer request is not checked. The refusal comes
-    // before handleLocalRoute, so it writes no operator-log row and touches no store.
+    // cannot be set by a cross-origin page, so the origin rule applies to cookie and session admission
+    // only. The refusal comes before handleLocalRoute, so it writes no operator-log row and touches
+    // no store.
     const method = req.method ?? "GET";
     if (method !== "GET" && method !== "HEAD" && !this.hasOperatorBearer(req) && !this.isOwnOriginRequest(req)) {
       denyForbidden(res);
