@@ -24,11 +24,12 @@ interface Child {
   stderr: string;
 }
 
-function spawnChild(identityId: string, value: string, env: NodeJS.ProcessEnv): Child {
+function spawnChild(identityId: string, value: string): Child {
   const fixture = fileURLToPath(new URL("./baseline-two-process-child.ts", import.meta.url));
   const child = spawn(process.execPath, ["--import", "tsx", fixture, value], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...env, SANCTUARY_SESSION_IDENTITY_ID: identityId },
+    // The child inherits the stubbed test environment, VITEST included, and names only its own session identity.
+    env: { ...process.env, SANCTUARY_SESSION_IDENTITY_ID: identityId },
   });
   const record: Child = { process: child, stdout: "", stderr: "" };
   child.stdout!.on("data", (chunk: Buffer) => { record.stdout += chunk.toString("utf8"); });
@@ -118,10 +119,9 @@ describe.skipIf(!supported)("two processes, one fortress", () => {
       await seed.cleanup();
     }
 
-    const env = { ...process.env };
-    const a = spawnChild(identities[0]!, "from-a", env);
+    const a = spawnChild(identities[0]!, "from-a");
     children.push(a);
-    const b = spawnChild(identities[1]!, "from-b", env);
+    const b = spawnChild(identities[1]!, "from-b");
     children.push(b);
     expect(await ready(a)).toEqual({ ready: true, saved: true, approvals: 0 });
     expect(await ready(b)).toEqual({ ready: true, saved: true, approvals: 0 });
