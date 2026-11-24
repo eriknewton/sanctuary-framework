@@ -44,7 +44,7 @@
 import { isAgentDiscoverySkippedNamespace, isAgentAggregateReservedNamespace } from "./agent-discovery.js";
 import { constants as fsConstants, existsSync, lstatSync } from "node:fs";
 import { link, mkdir, open, opendir, unlink, readdir, stat, lstat } from "node:fs/promises";
-import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES, StorageReadBoundError } from "./interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES, StorageReadBoundError, StorageEnumerationBoundError, assertEnumerationBound } from "./interface.js";
 import type { Stats } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
@@ -185,7 +185,7 @@ export interface CapabilityError {
   errors?: CapabilityError[];
   cause?: CapabilityError;
   /** Names a typed storage error the parent rebuilds as that class; absent for every other failure. */
-  type?: typeof CAPABILITY_ERROR_TYPE_READ_BOUND;
+  type?: typeof CAPABILITY_ERROR_TYPE_READ_BOUND | typeof CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND;
 }
 
 /**
@@ -195,12 +195,19 @@ export interface CapabilityError {
  */
 const CAPABILITY_ERROR_TYPE_READ_BOUND = "storage_read_bound";
 
+/**
+ * The wire discriminator for StorageEnumerationBoundError. Must match on both
+ * sides of the worker IPC, as CAPABILITY_ERROR_TYPE_READ_BOUND does.
+ */
+const CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND = "storage_enumeration_bound";
+
 /** Preserve every strict failure across the private worker IPC boundary. */
 export function serializeCapabilityError(error: unknown): CapabilityError {
   const value: CapabilityError = { message: error instanceof Error ? error.message : String(error) };
   // The class is carried by an explicit field because IPC keeps only plain data; a caller that
   // classifies a bounded-read refusal with instanceof must see the same type on every backend path.
   if (error instanceof StorageReadBoundError) value.type = CAPABILITY_ERROR_TYPE_READ_BOUND;
+  if (error instanceof StorageEnumerationBoundError) value.type = CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND;
   if (error instanceof Error) {
     for (const key of ["code", "kind", "rawName", "rawNamespace"] as const) {
       const field = (error as unknown as Record<string, unknown>)[key];
@@ -217,6 +224,7 @@ export function serializeCapabilityError(error: unknown): CapabilityError {
 export function deserializeCapabilityError(value: CapabilityError): Error {
   // Rebuilt from the discriminator, never from the message text, so the type is chosen by the serializer.
   if (value.type === CAPABILITY_ERROR_TYPE_READ_BOUND) return new StorageReadBoundError();
+  if (value.type === CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND) return new StorageEnumerationBoundError();
   const options = value.cause ? { cause: deserializeCapabilityError(value.cause) } : undefined;
   const error = value.errors
     ? new AggregateError(value.errors.map(deserializeCapabilityError), value.message, options)
@@ -1593,6 +1601,35 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       const key = decodeRawFilesystemStorageName(file.slice(0, -".enc".length), "key");
       if (prefix && !key.startsWith(prefix)) continue;
       keys.push(key);
+    }
+    return keys.sort();
+  }
+
+  /** Must match StorageBackend.listKeysBounded in interface.ts and the listKeysBounded op in directory-capability-worker.ts. */
+  async listKeysBounded(namespace: string, maxKeys: number): Promise<string[]> {
+    this.assertCallerNamespace(namespace);
+    assertEnumerationBound(maxKeys);
+    const capability = this.darwinCapability(namespace);
+    if (capability) {
+      // The worker applies the same bound to its own scan, so an over-bound listing never crosses the IPC channel.
+      return this.callDarwinNamespace(capability, "listKeysBounded", [maxKeys]);
+    }
+    let dir;
+    try {
+      dir = await opendir(this.activeNamespacePath(namespace));
+    } catch (err: unknown) {
+      // Only absence of the namespace is empty; incomplete enumeration throws.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+    const keys: string[] = [];
+    let scanned = 0;
+    for await (const entry of dir) {
+      // An enumeration holds at most bound plus one names, then throws; every
+      // directory entry counts, so non-key noise cannot stretch the scan.
+      if (++scanned > maxKeys) throw new StorageEnumerationBoundError();
+      if (!entry.name.endsWith(".enc")) continue;
+      keys.push(decodeRawFilesystemStorageName(entry.name.slice(0, -".enc".length), "key"));
     }
     return keys.sort();
   }

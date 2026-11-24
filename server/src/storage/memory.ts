@@ -18,7 +18,7 @@ import type {
 import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 import { SdwValidationError } from "../sdw/errors.js";
-import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, StorageReadBoundError } from "./interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, StorageReadBoundError, StorageEnumerationBoundError, assertEnumerationBound } from "./interface.js";
 import { assertStorageNamespacePathComponent } from "./namespace-component.js";
 
 export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabilities {
@@ -191,6 +191,21 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
       const key = storeKey.slice(nsPrefix.length);
       if (prefix && !key.startsWith(prefix)) continue;
       keys.push(key);
+    }
+    return keys.sort();
+  }
+
+  /** Must match StorageBackend.listKeysBounded in interface.ts. */
+  async listKeysBounded(namespace: string, maxKeys: number): Promise<string[]> {
+    assertEnumerationBound(maxKeys);
+    assertStorageNamespacePathComponent(namespace);
+    const nsPrefix = `${namespace}/`;
+    const keys: string[] = [];
+    for (const storeKey of this.store.keys()) {
+      if (!storeKey.startsWith(nsPrefix)) continue;
+      // An enumeration holds at most bound plus one names, then throws.
+      if (keys.length >= maxKeys) throw new StorageEnumerationBoundError();
+      keys.push(storeKey.slice(nsPrefix.length));
     }
     return keys.sort();
   }

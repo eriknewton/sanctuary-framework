@@ -167,6 +167,20 @@ export interface StorageBackend {
    * in sdw/document-corpus-store.ts, which refuses when it is absent.
    */
   readBounded?(namespace: string, key: string, maxBytes: number): Promise<Uint8Array | null>;
+
+  /**
+   * OPTIONAL bounded names-only enumeration: every decoded key in the namespace,
+   * complete, in ascending UTF-16 code-unit order, or StorageEnumerationBoundError
+   * once maxKeys + 1 directory entries have been seen. Non-key entries (temporary
+   * files, subdirectories) count toward that scan bound. An absent namespace
+   * returns []. A maxKeys that is not a non-negative safe integer throws.
+   * An enumeration holds at most bound plus one names, then throws.
+   * Must match listKeysBounded in filesystem.ts, memory.ts and
+   * directory-capability-worker.ts, READ_ONLY_STORAGE_DELEGATED_METHODS in
+   * read-only-guard.ts and STORAGE_READ_ONLY in
+   * test/structure/read-tool-mutation-reachability.ts.
+   */
+  listKeysBounded?(namespace: string, maxKeys: number): Promise<string[]>;
 }
 
 /** A bounded read refused an entry longer than its maximum; see StorageBackend.readBounded. */
@@ -174,6 +188,21 @@ export class StorageReadBoundError extends Error {
   constructor() {
     super("Stored entry exceeds the read size bound");
     this.name = "StorageReadBoundError";
+  }
+}
+
+/** A bounded enumeration saw more entries than its bound; see StorageBackend.listKeysBounded. */
+export class StorageEnumerationBoundError extends Error {
+  constructor() {
+    super("Stored entries exceed the enumeration bound");
+    this.name = "StorageEnumerationBoundError";
+  }
+}
+
+/** Refuse an enumeration bound that is not a non-negative safe integer; shared by every listKeysBounded implementer. */
+export function assertEnumerationBound(maxKeys: number): void {
+  if (!(Number.isSafeInteger(maxKeys) && maxKeys >= 0)) {
+    throw new RangeError("Enumeration bound must be a non-negative safe integer");
   }
 }
 
