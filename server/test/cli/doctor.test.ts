@@ -5,11 +5,11 @@
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as custodyLocks from "../../src/storage/cross-process-lock.js";
 import * as harnessPaths from "../../src/wrap/config-reader.js";
 import { CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME } from "../../src/core/master-custody.js";
-import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, open, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -39,6 +39,7 @@ import {
   hermesParityPythonCandidates,
   type SidecarExec,
 } from "../../src/wrap/hermes-yaml-parse-parity.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 class Capture extends Writable {
   chunks: string[] = [];
@@ -64,6 +65,16 @@ describe("sanctuary doctor", () => {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
+
+  // Doctor reads the Hermes config under HOME when no path is passed, so every
+  // test here starts with HOME at its own empty temp directory and never opens
+  // the operator's Hermes file; a test that stubs HOME itself overrides this.
+  beforeEach(async () => {
+    const home = await mkdtemp(join(tmpdir(), "sanctuary-doctor-home-"));
+    tempDirs.push(home);
+    vi.stubEnv("HOME", home);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
 
   async function makeFortress(opts: {
     identity?: boolean;
@@ -266,15 +277,80 @@ approval_channel:
     const configPath = join(fortress, "sanctuary.json");
     try {
       await writeFile(configPath, JSON.stringify({ session_binding: { sole_identity: true } }));
-      const check = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      const check = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
       expect(check).toBeDefined();
       expect(check!.message).toContain(`Config: ${configPath}`);
       expect(check!.message).toContain("session_binding.sole_identity: true");
       expect(check!.message).toContain("A server started now would be: bound by default to ");
       expect(check!.message).not.toMatch(/currently bound|live session/i);
       await writeFile(configPath, JSON.stringify({ session_binding: { sole_identity: false } }));
-      const next = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      const next = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
       expect(next!.message).toContain("A server started now would be: not bound: default binding is off");
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("doctor reports the session identity variable set in the Hermes sanctuary entry", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    const hermesConfigPath = join(fortress, "hermes", "config.yaml");
+    try {
+      await mkdir(join(fortress, "hermes"), { recursive: true });
+      await writeFile(hermesConfigPath, ["mcp_servers:", "  sanctuary:", "    command: sanctuary", "    env:",
+        `      SANCTUARY_STORAGE_PATH: ${fortress}`, "      SANCTUARY_SESSION_IDENTITY_ID: chosen-identity", ""].join("\n"));
+      const check = (await runDoctorChecks({ hermesConfigPath, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check!.message).toContain(`Hermes entry sanctuary (${hermesConfigPath}): fortress path ${fortress}`);
+      expect(check!.message).toContain(`Hermes entry sanctuary (${hermesConfigPath}): SANCTUARY_SESSION_IDENTITY_ID set`);
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("doctor reports a Hermes entry with no identity variable as not set or empty", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    const hermesConfigPath = join(fortress, "hermes", "config.yaml");
+    try {
+      await mkdir(join(fortress, "hermes"), { recursive: true });
+      await writeFile(hermesConfigPath, ["mcp_servers:", "  sanctuary:", "    command: sanctuary", "    env:",
+        "      SANCTUARY_AGENT_ID: hermes:fortress", ""].join("\n"));
+      const check = (await runDoctorChecks({ hermesConfigPath, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check!.message).toContain(`Hermes entry sanctuary (${hermesConfigPath}): fortress path not set or empty`);
+      expect(check!.message).toContain(`Hermes entry sanctuary (${hermesConfigPath}): SANCTUARY_SESSION_IDENTITY_ID not set or empty`);
+      // An absent Hermes file reads as an entry with no variables and creates nothing.
+      const absent = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(absent!.message.split("\n").filter(line => line.startsWith("Hermes entry"))).toEqual([
+        `Hermes entry sanctuary (${ABSENT_HERMES_CONFIG}): fortress path not set or empty`,
+        `Hermes entry sanctuary (${ABSENT_HERMES_CONFIG}): SANCTUARY_SESSION_IDENTITY_ID not set or empty`,
+      ]);
+      await expect(access(ABSENT_HERMES_CONFIG)).rejects.toThrow();
+    } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it.each([
+    ["a missing file", "missing"],
+    ["an unreadable file", "unreadable"],
+    ["an unparseable file", "unparseable"],
+    ["a file without a sanctuary entry", "no-entry"],
+  ] as const)("doctor reports %s as a Hermes entry with every variable not set or empty and creates nothing", async (_label, shape) => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    vi.stubEnv("HOME", fortress);
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
+    const hermesDir = join(fortress, "hermes");
+    const hermesConfigPath = join(hermesDir, "config.yaml");
+    try {
+      if (shape !== "missing") await mkdir(hermesDir, { recursive: true });
+      // A directory at the config path is a file doctor cannot read on every platform and user.
+      if (shape === "unreadable") await mkdir(hermesConfigPath);
+      if (shape === "unparseable") await writeFile(hermesConfigPath, "mcp_servers: [sanctuary]\n");
+      if (shape === "no-entry") await writeFile(hermesConfigPath, ["mcp_servers:", "  weather:", "    command: weather", ""].join("\n"));
+      const before = shape === "missing" ? null : await readdir(hermesDir, { recursive: true });
+      const check = (await runDoctorChecks({ hermesConfigPath, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      expect(check!.message.split("\n").slice(-2)).toEqual([
+        `Hermes entry sanctuary (${hermesConfigPath}): fortress path not set or empty`,
+        `Hermes entry sanctuary (${hermesConfigPath}): SANCTUARY_SESSION_IDENTITY_ID not set or empty`,
+      ]);
+      if (shape === "missing") await expect(access(hermesDir)).rejects.toThrow();
+      else expect(await readdir(hermesDir, { recursive: true })).toEqual(before);
     } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
   });
 
@@ -285,7 +361,7 @@ approval_channel:
     try {
       await writeFile(join(fortress, "sanctuary.json"), JSON.stringify({ session_binding: { sole_identity: true } }));
       await writeFile(join(fortress, "sanctuary.json.lock"), "holder");
-      const check = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      const check = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
       expect(check!.message).toContain("A server started now would be: not bound: the config lock is held");
       expect(check!.message).not.toContain("bound by default to");
       expect(check!.hint).toContain("from this shell's environment");
@@ -300,7 +376,7 @@ approval_channel:
     try {
       if (arm === "unreadable metadata") await mkdir(lock);
       else await symlink(lock, lock);
-      const check = (await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
+      const check = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
       expect(check).toMatchObject({ status: "WARN" });
       expect(check!.message).toContain(arm === "unreadable metadata"
         ? "sanctuary.json.lock present: holder metadata unavailable"
@@ -321,7 +397,7 @@ approval_channel:
         "another-fortress": { env: { SANCTUARY_STORAGE_PATH: join(fortress, "other"), SANCTUARY_FORTRESS_PATH: fortress } },
       }, mcp: { servers: { "alias-entry": { env: { SANCTUARY_FORTRESS_PATH: fortress } } } },
         mcp_servers: { "empty-selection": { env: { SANCTUARY_STORAGE_PATH: "", SANCTUARY_FORTRESS_PATH: fortress, SANCTUARY_SESSION_IDENTITY_ID: "" } } } }));
-      const check = (await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
+      const check = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
       expect(check).toBeDefined();
       expect(check!.message).toContain(`MCP entry sanctuary-coordinator (${harness}): SANCTUARY_SESSION_IDENTITY_ID set`);
       expect(check!.message).toContain(`MCP entry alias-entry (${harness}): SANCTUARY_SESSION_IDENTITY_ID not set`);
@@ -339,7 +415,7 @@ approval_channel:
     const holder = JSON.stringify({ pid: process.pid, acquired_at: "2020-01-01T00:00:00.000Z" });
     try {
       await writeFile(lock, holder);
-      const check = (await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
+      const check = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: {}, platform: "linux" })).find(row => row.name === "session binding");
       expect(check).toMatchObject({ status: "WARN" });
       expect(check!.message).toContain(`pid ${process.pid}`);
       expect(check!.message).toContain("remove only when no Sanctuary process is running");
@@ -353,7 +429,7 @@ approval_channel:
     const paths = vi.spyOn(harnessPaths, "getPlatformPaths").mockReturnValue(emptyHarnessPaths());
     try {
       await writeFile(join(fortress, "sanctuary.json"), JSON.stringify({ session_binding: { sole_identity: true } }));
-      const first = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      const first = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
       expect(first!.message).toContain("bound by default to ");
       const storage = new FilesystemStorage(join(fortress, "state"));
       const params = JSON.parse(bytesToString((await storage.read("_meta", "key-params"))!));
@@ -363,7 +439,7 @@ approval_channel:
         const { storedIdentity } = createIdentity("second", identityKey, "passphrase");
         await persistStoredIdentity(storage, derived.key, storedIdentity);
       } finally { identityKey.fill(0); derived.key.fill(0); }
-      const next = (await runDoctorChecks({ storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
+      const next = (await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux" })).find(row => row.name === "session binding");
       expect(next!.message).toContain("A server started now would be: not bound: this fortress has several identities");
     } finally { paths.mockRestore(); vi.unstubAllEnvs(); }
   });
@@ -382,7 +458,7 @@ approval_channel:
     const paths = vi.spyOn(harnessPaths, "getPlatformPaths");
     if (outcome === "later check rejects") paths.mockImplementation(() => { throw sentinel; });
     try {
-      const operation = runDoctorChecks({
+      const operation = runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
         storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
       });
       if (outcome === "later check rejects") await expect(operation).rejects.toBe(sentinel);
@@ -416,7 +492,7 @@ approval_channel:
       return { ...lease, release: async () => { await lease.release(); throw sentinel; } };
     });
     try {
-      await expect(runDoctorChecks({
+      await expect(runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
         storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
       })).rejects.toBe(sentinel);
       expect(leases[0]!.signal.aborted).toBe(true);
@@ -432,7 +508,7 @@ approval_channel:
     vi.stubEnv("HOME", fortress);
     const acquisition = vi.spyOn(custodyLocks, "acquireMasterWriteBarrier");
     try {
-      const checks = await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" });
+      const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, storagePath: fortress, env: {}, platform: "linux" });
       expect(checks.length).toBeGreaterThan(0);
       expect(acquisition).not.toHaveBeenCalled();
     } finally {
@@ -479,7 +555,7 @@ approval_channel:
       audit: "unsigned-checkpoint",
     });
 
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress,
       env: { SANCTUARY_PASSPHRASE: passphrase },
       platform: "linux",
@@ -506,7 +582,7 @@ approval_channel:
 
   it("warns for unsigned checkpoints while identity remains the only FAIL in an identity-less fortress", async () => {
     const fortress = await makeFortress({ identity: false, policy: "valid", audit: "unsigned-checkpoint" });
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress,
       env: { SANCTUARY_PASSPHRASE: passphrase },
       platform: "linux",
@@ -544,7 +620,7 @@ approval_channel:
     if (corruptRoot) unsigned.root_hash = computeAuditRoot([]);
     // Preserve the signed record to exercise mixed findings in the real export consumer.
     await storage.write("_audit_checkpoints", "audit-checkpoint-unsigned-fixture", stringToBytes(JSON.stringify(unsigned)));
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
     });
     expect(checks.find((check) => check.name === "audit chain")).toMatchObject({
@@ -566,7 +642,7 @@ approval_channel:
     const storage = new FilesystemStorage(join(fortress, "state"));
     await rewriteStorageAsForgedEmbeddedKeyChain(storage);
 
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress,
       env: { SANCTUARY_PASSPHRASE: passphrase },
       platform: "linux",
@@ -797,7 +873,7 @@ approval_channel:
 
   it("covers missing state dir, permissive permissions, missing key, malformed policy, and missing audit", async () => {
     const missing = join(tmpdir(), `sanctuary-missing-${Date.now()}`);
-    const missingChecks = await runDoctorChecks({
+    const missingChecks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: missing,
       env: {},
       platform: "linux",
@@ -806,7 +882,7 @@ approval_channel:
 
     const fortress = await makeFortress({ identity: true, policy: "invalid" });
     await chmod(fortress, 0o755);
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress,
       env: {},
       platform: "linux",
@@ -819,7 +895,7 @@ approval_channel:
 
   it("reports macOS Castle Wall sysext states", async () => {
     const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress,
       env: { SANCTUARY_PASSPHRASE: passphrase },
       platform: "darwin",
@@ -876,7 +952,7 @@ approval_channel:
     derived.key.fill(0);
 
     // With the passphrase available, doctor CAN verify -> the audit chain FAILs.
-    const withKey = await runDoctorChecks({
+    const withKey = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress,
       env: { SANCTUARY_PASSPHRASE: passphrase },
       platform: "linux",
@@ -897,7 +973,7 @@ approval_channel:
     expect(out.text()).not.toContain(passphrase);
 
     // WITHOUT the key it cannot verify: it must WARN (point at audit-store-status), not FAIL.
-    const noKey = await runDoctorChecks({
+    const noKey = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortress,
       env: {},
       platform: "linux",
@@ -1046,7 +1122,7 @@ describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
 
   it("WARNs for a sanctuary entry wrapped before SANCTUARY_AGENT_ID existed", async () => {
     const home = await withHome({ mcpServers: { sanctuary: { command: "npx", args: ["sanctuary"] } } });
-    const checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
     const check = checks.find((c) => c.name === "wrapped harness ids")!;
     expect(check.status).toBe("WARN");
     expect(check.message).toContain("without SANCTUARY_AGENT_ID");
@@ -1060,16 +1136,16 @@ describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
     await mkdir(join(home, ".hermes"), { recursive: true, mode: 0o700 });
     const yamlPath = join(home, ".hermes", "config.yaml");
     await writeFile(yamlPath, ["model: x", "mcp_servers:", "  sanctuary:", "    command: npx", "    args:", "      - sanctuary", ""].join("\n"));
-    let checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    let checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
     let check = checks.find((c) => c.name === "wrapped harness ids")!;
     expect(check.status).toBe("WARN");
     expect(check.message).toContain("hermes");
     // A SANCTUARY_AGENT_ID under ANOTHER entry must not count for sanctuary.
     await writeFile(yamlPath, ["mcp_servers:", "  other:", "    env:", "      SANCTUARY_AGENT_ID: other:fortress", "  sanctuary:", "    command: npx", ""].join("\n"));
-    checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
     expect(checks.find((c) => c.name === "wrapped harness ids")!.status).toBe("WARN");
     await writeFile(yamlPath, ["mcp_servers:", "  sanctuary:", "    command: npx", "    env:", "      SANCTUARY_AGENT_ID: hermes:fortress-abc", ""].join("\n"));
-    checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
     check = checks.find((c) => c.name === "wrapped harness ids")!;
     expect(check.status).toBe("OK");
   });
@@ -1078,7 +1154,7 @@ describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
     const home = await withHome({
       mcpServers: { sanctuary: { command: "npx", args: ["sanctuary"], env: { SANCTUARY_AGENT_ID: "claude_code:fortress-abc" } } },
     });
-    const checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG, env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
     expect(checks.find((c) => c.name === "wrapped harness ids")!.status).toBe("OK");
   });
 });

@@ -548,11 +548,14 @@ describe("evidence consumer boundaries", () => {
     const get = vi.spyOn(primitives.identityManager, "get");
     get.mockReturnValue(undefined);
     expect(composeProtectionLayers({ identityLoaded: false })[0]?.status).toBe("off");
+    // A bound identity gone from the manager is not a confirmed session, so the identity layer reads unknown.
     let result = JSON.parse((await tool.handler({})).content[0]!.text);
-    expect(result.layers.find((row: { id: string }) => row.id === "identity").status).toBe("off");
+    expect(result.layers.find((row: { id: string }) => row.id === "identity").status).toBe("unknown");
+    // A session read that fails for a reason other than identity gives the fixed denial.
     get.mockImplementation(() => { throw new Error("unavailable"); });
     result = JSON.parse((await tool.handler({})).content[0]!.text);
-    expect(result.layers?.find((row: { id: string }) => row.id === "identity")?.status).toBe("unknown");
+    expect(result.denied).toBe(true);
+    expect(result.layers).toBeUndefined();
   });
 
   it("Encrypted vault reports construction only and preserves unavailable construction", async () => {

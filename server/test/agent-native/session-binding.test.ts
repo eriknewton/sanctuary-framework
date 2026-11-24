@@ -1,7 +1,8 @@
+// fail-before-exempt: the boot resolver and the next-start prediction now share one precedence function; the agreement table pins behaviour that is unchanged, and its mutation record swaps the flag and launch checks.
 // fail-before-exempt: The resolver is a new module; production boot and router witnesses live in session-binding-wiring.test.ts.
 /** Session views follow one durable boot decision and per-call named selection. */
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { createSessionBindingAccessors, resolveSessionBinding, predictNextStartBinding, proveSoleIdentity, type SoleProofInputs, type SessionBindingState } from "../../src/agent-native/session-binding.js";
+import { collectSoleProofInputs, createSessionBindingAccessors, resolveSessionBinding, predictNextStartBinding, proveSoleIdentity, type SoleProofInputs, type SessionBindingState } from "../../src/agent-native/session-binding.js";
 import { SessionIdentityError, SessionNotBoundError, UNBOUND_SESSION, fingerprintIdentityId, resolveActiveSessionIdentity } from "../../src/agent-native/safety-base.js";
 import { isSessionNotBoundError } from "../../src/agent-native/session-not-bound.js";
 import { argumentStageCause } from "../../src/tool-outcome.js";
@@ -228,4 +229,46 @@ it("predicts no binding when identity loading throws", async () => {
   vi.spyOn(IdentityManager.prototype, "load").mockRejectedValue(new Error("load unavailable"));
   expect(await predictNextStartBinding({ flag: true, configFilePath: "/fixture/sanctuary.json", storage, masterKey, env: {} }))
     .toBe("A server started now would be: not bound: identity loading failed");
+});
+
+// The prediction text for each boot state, written out here; a named or sole state carries the identity.
+const PREDICTED: Record<SessionBindingState, (identityId: string) => string> = {
+  state_BOUND_NAMED: (identityId) => `A server started now would be: bound to ${identityId} by the launch variable`,
+  state_BOUND_SOLE_IDENTITY: (identityId) => `A server started now would be: bound by default to ${identityId}`,
+  state_UNBOUND_FLAG_OFF: () => "A server started now would be: not bound: default binding is off",
+  state_UNBOUND_NO_IDENTITY: () => "A server started now would be: not bound: this fortress has no identity",
+  state_UNBOUND_SEVERAL_IDENTITIES: () => "A server started now would be: not bound: this fortress has several identities; select one with SANCTUARY_SESSION_IDENTITY_ID",
+  state_UNBOUND_UNPROVEN: () => "A server started now would be: not bound: identity set could not be proven",
+  state_NAMED_EMPTY: () => "A server started now would be: not bound: launch variable is empty",
+  state_NAMED_UNRESOLVED: () => "A server started now would be: not bound: named identity not found",
+};
+
+it.each([
+  ["absent", false, "sole", "state_UNBOUND_FLAG_OFF"],
+  ["absent", false, "none", "state_UNBOUND_FLAG_OFF"],
+  ["absent", true, "sole", "state_BOUND_SOLE_IDENTITY"],
+  ["absent", true, "none", "state_UNBOUND_NO_IDENTITY"],
+  ["absent", true, "several", "state_UNBOUND_SEVERAL_IDENTITIES"],
+  ["absent", true, "unproven", "state_UNBOUND_UNPROVEN"],
+  ["empty", true, "sole", "state_NAMED_EMPTY"],
+  ["empty", false, "sole", "state_NAMED_EMPTY"],
+  ["loaded", true, "sole", "state_BOUND_NAMED"],
+  ["loaded", false, "sole", "state_BOUND_NAMED"],
+  ["loaded", true, "several", "state_BOUND_NAMED"],
+  ["missing", true, "sole", "state_NAMED_UNRESOLVED"],
+  ["missing", false, "none", "state_NAMED_UNRESOLVED"],
+] as const)("the next-start prediction and the boot resolver agree for every precedence case: variable %s, flag %s, proof %s", async (named, flag, proof, expected) => {
+  if (proof === "none") await storage.delete("_identities", id);
+  if (proof === "several") await identityManager.saveNew(createIdentity("second", masterKey, "recovery-key").storedIdentity);
+  if (proof === "unproven") vi.spyOn(storage, "listKeys").mockRejectedValue(new Error("enumeration unavailable"));
+  const env: NodeJS.ProcessEnv = named === "absent" ? {} : { SANCTUARY_SESSION_IDENTITY_ID: named === "loaded" ? id : named === "empty" ? "" : "missing" };
+  // Boot reads the same storage the prediction reads, through the same bracketed load.
+  const bootManager = new IdentityManager(storage, masterKey);
+  const bootInputs = await collectSoleProofInputs(storage, bootManager);
+  const resolver = await resolveSessionBinding({ identityManager: bootManager, storage, flag,
+    auditLog: { appendCritical: vi.fn().mockResolvedValue(undefined) }, stderr: vi.fn(), env: () => env, proofInputs: bootInputs });
+  // Each half is checked against the written expectation, never only against the other half.
+  expect.soft(resolver.bootState, "boot resolver").toBe(expected);
+  const predicted = await predictNextStartBinding({ flag, configFilePath: "/fixture/sanctuary.json", storage, masterKey, env });
+  expect.soft(predicted, "next-start prediction").toBe(PREDICTED[expected](id));
 });

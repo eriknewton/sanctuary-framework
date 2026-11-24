@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import {
   MIN_NODE_VERSION,
 } from "../../src/cli/node-version.js";
 import { runDoctorChecks } from "../../src/cli/doctor.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 const require = createRequire(import.meta.url);
 const serverPackage = require("../../package.json") as {
@@ -71,7 +73,7 @@ describe("node version preflight", () => {
   });
 
   it("reports a doctor FAIL for an injected unsupported Node version", async () => {
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: join(tmpdir(), "sanctuary-node-preflight-missing"),
       env: {},
       platform: "linux",
@@ -86,7 +88,7 @@ describe("node version preflight", () => {
   });
 
   it("reports a doctor OK for an injected supported Node version", async () => {
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: join(tmpdir(), "sanctuary-node-preflight-missing"),
       env: {},
       platform: "linux",

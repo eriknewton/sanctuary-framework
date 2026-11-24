@@ -110,7 +110,14 @@ import { runLocalIntelligenceSetup } from "./local-intelligence.js";
 import { LOCAL_INTELLIGENCE_OPT_IN_HINT } from "../intelligence/provisioning-consent.js";
 import type { CrossProcessLockLease } from "../storage/cross-process-lock.js";
 import { kernelBackedCrossProcessLockPlatformSupported } from "../storage/cross-process-lock.js";
-import { createFreshFortress, writeSoleBindingForFreshFortress, type FreshFortress } from "../config.js";
+import {
+  createFreshFortress,
+  FreshFortressEvidenceMismatchError,
+  readSoleBindingFlagBack,
+  SOLE_BINDING_UNCONFIRMED_NOTE,
+  writeSoleBindingForFreshFortress,
+  type FreshFortress,
+} from "../config.js";
 import { sessionBindingEnableHint } from "../cli/session-binding.js";
 
 /**
@@ -124,11 +131,22 @@ async function enableFreshSessionBindingForInit(
   fortressPath: string,
 ): Promise<void> {
   if (freshFortress && seededIdentity) {
+    const configFilePath = join(fortressPath, "sanctuary.json");
     try {
       // Creation and seed evidence must match writeSoleBindingForFreshFortress in config.ts.
-      await writeSoleBindingForFreshFortress(freshFortress, join(fortressPath, "sanctuary.json"));
+      await writeSoleBindingForFreshFortress(freshFortress, configFilePath);
       return;
     } catch (err) {
+      // Evidence naming another directory fails init; it is never reported as a flag that is merely off.
+      if (err instanceof FreshFortressEvidenceMismatchError) throw err;
+      // The note follows the flag on disk, so a committed flag is never reported as not enabled.
+      const readBack = await readSoleBindingFlagBack(configFilePath);
+      if (readBack === "flag_ENABLED") return;
+      if (readBack === "flag_UNREADABLE") {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(SOLE_BINDING_UNCONFIRMED_NOTE);
+        return;
+      }
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`  Note: default session binding not enabled at init time (${(err as Error).message}).`);
     }

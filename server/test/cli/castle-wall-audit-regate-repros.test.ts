@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 /**
  * F2 second adversarial fix round (Codex re-gate, 2026-07-14) — CLI repros.
  *
@@ -44,6 +45,7 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
 import { expectReaderSocketReleased, releaseCustodyLeases, takeCustodyLease } from "../helpers/custody-lease.js";
 import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -250,7 +252,7 @@ describe("F2 re-gate repros (round 2)", () => {
       operatorEntries: 2,
       daemonEntries: 1,
     });
-    const withKey = await runDoctorChecks({
+    const withKey = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       env: ENV(fortressPath),
       storagePath: fortressPath,
       platform: process.platform,
@@ -262,7 +264,7 @@ describe("F2 re-gate repros (round 2)", () => {
 
     // Without the master key doctor cannot re-verify the sealed region or the
     // daemon chain, so it must WARN (point at audit-store-status), never OK.
-    const noKey = await runDoctorChecks({
+    const noKey = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       env: {},
       storagePath: fortressPath,
       platform: process.platform,

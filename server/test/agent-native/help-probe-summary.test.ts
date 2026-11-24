@@ -1,4 +1,4 @@
-// fail-before-exempt: live probe-key generation imports the new classifier module; cadence and unbound assertions are witnessed with the cooperative surface restored to base and the classifier retained.
+// fail-before-exempt: the synthetic probe origins now read as loaded identities, because a cooperative session is confirmed against the identity manager; probe cadence and unbound assertions are unchanged.
 /** Help probe summaries retain bounded state and reserve audit rows synchronously. */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as surface from "../../src/agent-native/cooperative-surface.js";
@@ -29,6 +29,8 @@ function setup(storage = new MemoryStorage(), checkpointInterval?: number) {
   };
   setOrigin("origin-one");
   const { tools, identityManager, namespaceRegistry } = createL1Tools(new StateStore(storage, key), storage, key, "recovery-key", auditLog);
+  // Test-only manager: each synthetic origin is a loaded identity, so its binding is a confirmed session.
+  vi.spyOn(identityManager, "get").mockImplementation((id: string) => ({ identity_id: id }) as ReturnType<typeof identityManager.get>);
   const help = surface.createAgentNativeCooperativeTools({ identityManager, namespaceRegistry, auditLog,
     primitiveTools: tools, currentSessionBinding: () => binding, now: () => now,
   }).tools.find(tool => tool.name === "sanctuary_help")!;

@@ -219,7 +219,14 @@ import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.
 import { runProvisionPin } from "../cli/castle-wall.js";
 import { stripTrailingSlashes } from "../strings.js";
 import { requireCliTestRunner, argvTokenForDisplay } from "../cli/argv.js";
-import { createFreshFortress, writeSoleBindingForFreshFortress, type FreshFortress } from "../config.js";
+import {
+  createFreshFortress,
+  FreshFortressEvidenceMismatchError,
+  readSoleBindingFlagBack,
+  SOLE_BINDING_UNCONFIRMED_NOTE,
+  writeSoleBindingForFreshFortress,
+  type FreshFortress,
+} from "../config.js";
 import { sessionBindingEnableHint } from "../cli/session-binding.js";
 
 type ProcessShutdownCleanup = () => void | Promise<void>;
@@ -500,10 +507,21 @@ export function registerProcessShutdownCleanup(
  * from the identity seed's outcome, with the command that turns it on.
  */
 async function enableFreshSessionBindingForWrap(freshFortress: FreshFortress, storagePath: string): Promise<void> {
+  const configFilePath = join(storagePath, "sanctuary.json");
   try {
     // Creation and seed evidence must match writeSoleBindingForFreshFortress in config.ts.
-    await writeSoleBindingForFreshFortress(freshFortress, join(storagePath, "sanctuary.json"));
+    await writeSoleBindingForFreshFortress(freshFortress, configFilePath);
   } catch (err) {
+    // Evidence naming another directory fails wrap; it is never reported as a flag that is merely off.
+    if (err instanceof FreshFortressEvidenceMismatchError) throw err;
+    // The note follows the flag on disk, so a committed flag is never reported as not enabled.
+    const readBack = await readSoleBindingFlagBack(configFilePath);
+    if (readBack === "flag_ENABLED") return;
+    if (readBack === "flag_UNREADABLE") {
+      // SAFETY: stderr is the operator-facing wrap channel.
+      console.error(SOLE_BINDING_UNCONFIRMED_NOTE);
+      return;
+    }
     // SAFETY: stderr is the operator-facing wrap channel.
     console.error(`  Note: default session binding not enabled at wrap time (${(err as Error).message}).`);
     console.error(sessionBindingEnableHint(storagePath));

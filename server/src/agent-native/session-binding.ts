@@ -78,6 +78,36 @@ export async function collectSoleProofInputs(
 
 
 type Decision = { state: SessionBindingState; binding?: SessionBinding };
+
+/** A boot decision before it becomes a binding; the identity is carried only by the states that name one. */
+export type BootDecision =
+  | { state: "state_BOUND_NAMED" | "state_BOUND_SOLE_IDENTITY" | "state_NAMED_UNRESOLVED"; identity_id: string }
+  | { state: Exclude<SessionBindingState, "state_BOUND_NAMED" | "state_BOUND_SOLE_IDENTITY" | "state_NAMED_UNRESOLVED"> };
+
+/**
+ * The boot precedence: the launch variable when it is set, else no default
+ * when the flag is off, else the sole-identity proof. Pure; the proof is read
+ * only when the precedence reaches it. Both callers must use this one
+ * function: the boot decision in resolveSessionBinding and the next-start
+ * prediction in predictNextStartBinding, both in this file. Per-call named
+ * selection never calls it, so a sole boot stays frozen.
+ */
+export function decideBootBinding(input: {
+  launch: string | undefined;
+  flag: boolean;
+  identityExists: (id: string) => boolean;
+  proof: () => SoleProof;
+}): BootDecision {
+  if (input.launch !== undefined) {
+    if (input.launch === "") return { state: "state_NAMED_EMPTY" };
+    return input.identityExists(input.launch)
+      ? { state: "state_BOUND_NAMED", identity_id: input.launch }
+      : { state: "state_NAMED_UNRESOLVED", identity_id: input.launch };
+  }
+  if (!input.flag) return { state: "state_UNBOUND_FLAG_OFF" };
+  const proof = input.proof();
+  return proof.proven ? { state: "state_BOUND_SOLE_IDENTITY", identity_id: proof.identity_id } : { state: proof.state };
+}
 export interface SessionBindingResolver {
   readonly bootState: SessionBindingState;
   cooperative(): SessionBinding;
@@ -145,16 +175,24 @@ export async function resolveSessionBinding(options: {
       requester_identity_fingerprint: fingerprintIdentityId(id), binding_source: "launch_variable" }) };
   };
   const launch = options.env().SANCTUARY_SESSION_IDENTITY_ID;
-  let boot: Decision;
-  if (launch !== undefined) boot = named(launch);
-  else if (!options.flag) boot = { state: "state_UNBOUND_FLAG_OFF" };
-  else {
+  const chosen = decideBootBinding({ launch, flag: options.flag,
+    identityExists: (id) => options.identityManager.get(id) !== undefined,
     // The proof contract must match proveSoleIdentity in agent-native/session-binding.ts and its boot caller in index.ts.
-    const proof = proveSoleIdentity(options.proofInputs);
-    boot = proof.proven
-      ? { state: "state_BOUND_SOLE_IDENTITY", binding: Object.freeze({ identity_id: proof.identity_id,
-          requester_identity_fingerprint: fingerprintIdentityId(proof.identity_id), binding_source: "sole_identity" }) }
-      : { state: proof.state };
+    proof: () => proveSoleIdentity(options.proofInputs) });
+  let boot: Decision;
+  switch (chosen.state) {
+    case "state_BOUND_NAMED":
+    case "state_NAMED_UNRESOLVED":
+    case "state_NAMED_EMPTY":
+      // The launch variable is set, so the boot decision is the same named selection each later call makes.
+      boot = named(launch!);
+      break;
+    case "state_BOUND_SOLE_IDENTITY":
+      boot = { state: chosen.state, binding: Object.freeze({ identity_id: chosen.identity_id,
+        requester_identity_fingerprint: fingerprintIdentityId(chosen.identity_id), binding_source: "sole_identity" }) };
+      break;
+    default:
+      boot = { state: chosen.state };
   }
   let auditFailed = false;
   try {
@@ -216,25 +254,33 @@ export async function predictNextStartBinding(options: {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") return `${prefix}not bound: the config lock is held`;
   }
   if (!options.masterKey) return "cannot predict: identities are encrypted and no key is available";
-  const named = options.env.SANCTUARY_SESSION_IDENTITY_ID;
-  if (named === "") return `${prefix}not bound: launch variable is empty`;
-  if (named === undefined && !options.flag) return `${prefix}not bound: default binding is off`;
+  const launch = options.env.SANCTUARY_SESSION_IDENTITY_ID;
   const manager = new IdentityManager(options.storage, options.masterKey);
   try {
-    if (named !== undefined) {
-      await manager.load();
-      return manager.get(named) ? `${prefix}bound to ${named} by the launch variable`
-        : `${prefix}not bound: named identity not found`;
+    // Load only what the precedence will read: the identity set for a named launch, or the sole proof's inputs.
+    let proof: SoleProof | undefined;
+    if (launch !== undefined && launch !== "") await manager.load();
+    else if (launch === undefined && options.flag) {
+      // The prediction proof must match proveSoleIdentity in agent-native/session-binding.ts and the boot input collection in index.ts.
+      proof = proveSoleIdentity(await collectSoleProofInputs(options.storage, manager));
     }
-    // The prediction proof must match proveSoleIdentity in agent-native/session-binding.ts and the boot input collection in index.ts.
-    const proof = proveSoleIdentity(await collectSoleProofInputs(options.storage, manager));
-    if (proof.proven) return `${prefix}bound by default to ${proof.identity_id}`;
-    const reasons = {
-      state_UNBOUND_NO_IDENTITY: "this fortress has no identity",
-      state_UNBOUND_SEVERAL_IDENTITIES: "this fortress has several identities; select one with SANCTUARY_SESSION_IDENTITY_ID",
-      state_UNBOUND_UNPROVEN: "identity set could not be proven",
-    };
-    return `${prefix}not bound: ${reasons[proof.state]}`;
+    const decision = decideBootBinding({ launch, flag: options.flag,
+      identityExists: (id) => manager.get(id) !== undefined,
+      proof: () => {
+        if (!proof) throw new Error("sole proof was not collected");
+        return proof;
+      } });
+    switch (decision.state) {
+      case "state_BOUND_NAMED": return `${prefix}bound to ${decision.identity_id} by the launch variable`;
+      case "state_BOUND_SOLE_IDENTITY": return `${prefix}bound by default to ${decision.identity_id}`;
+      case "state_NAMED_UNRESOLVED": return `${prefix}not bound: named identity not found`;
+      case "state_NAMED_EMPTY": return `${prefix}not bound: launch variable is empty`;
+      case "state_UNBOUND_FLAG_OFF": return `${prefix}not bound: default binding is off`;
+      case "state_UNBOUND_NO_IDENTITY": return `${prefix}not bound: this fortress has no identity`;
+      case "state_UNBOUND_SEVERAL_IDENTITIES":
+        return `${prefix}not bound: this fortress has several identities; select one with SANCTUARY_SESSION_IDENTITY_ID`;
+      case "state_UNBOUND_UNPROVEN": return `${prefix}not bound: identity set could not be proven`;
+    }
   } catch {
     return `${prefix}not bound: identity loading failed`;
   }

@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 /**
  * A legacy fortress -- one built before `castle_wall_provision` existed, the
  * exact shape a 1.8.4 or 1.8.6-rc.1 install left on disk -- opens normally
@@ -44,6 +45,7 @@ import {
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { ABSENT_HERMES_CONFIG } from "../helpers/absent-hermes-config.js";
 
 /** A sink for CLI output a test does not assert on. */
 const silent = (): Writable =>
@@ -98,7 +100,7 @@ describe("a legacy fortress with no castle-wall-provision record", () => {
   });
 
   it("opens: doctor reports the fortress itself healthy, only the wall claim is silent", async () => {
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       storagePath: fortressPath,
       env: { SANCTUARY_PASSPHRASE: passphrase },
       platform: "darwin",

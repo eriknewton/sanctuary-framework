@@ -1,3 +1,4 @@
+// fail-before-exempt: doctor now also reads the Hermes launch entry, so each doctor run here is given a Hermes config path that does not exist; no assertion changes.
 import { describe, expect, it } from "vitest";
 
 import {
@@ -14,6 +15,7 @@ import {
   type UpgradeCommandRunner,
 } from "../../../src/castle-wall/runtime/linux-upgrade-routes.js";
 import { runDoctorChecks } from "../../../src/cli/doctor.js";
+import { ABSENT_HERMES_CONFIG } from "../../helpers/absent-hermes-config.js";
 
 const NEW_BINARY = "/tmp/castle-wall-daemon.new";
 const OLD_BINARY = "/usr/local/libexec/sanctuary/castle-wall-daemon";
@@ -327,7 +329,7 @@ describe("doctor reports the installed manifest's admission", () => {
   it("warns with the daemon's line when this host refuses the installed manifest", async () => {
     const line =
       "castle-wall-daemon: preflight-manifest FAILED - reissue the manifest through the publisher";
-    const checks = await runDoctorChecks({
+    const checks = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       env: {},
       storagePath,
       platform: "linux",
@@ -343,7 +345,7 @@ describe("doctor reports the installed manifest's admission", () => {
   });
 
   it("reports OK when the verb admits it, and n/a when no state is installed", async () => {
-    const admitted = await runDoctorChecks({
+    const admitted = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       env: {},
       storagePath,
       platform: "linux",
@@ -354,7 +356,7 @@ describe("doctor reports the installed manifest's admission", () => {
     });
     expect(admitted.find((c) => c.name === "castle wall manifest admission")?.status).toBe("OK");
 
-    const noState = await runDoctorChecks({
+    const noState = await runDoctorChecks({ hermesConfigPath: ABSENT_HERMES_CONFIG,
       env: {},
       storagePath,
       platform: "linux",

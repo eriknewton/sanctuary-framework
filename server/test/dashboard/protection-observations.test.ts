@@ -264,7 +264,10 @@ it("dashboard entry points preserve observation availability", async () => {
     delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
     page = await readHome(urlOf(main));
     expect(status(page.home.protection_layers, "identity"), "main resolver follows session").toBe("unknown");
-    expect((await call())?.denied).toBe(true);
+    const unboundTool = await call();
+    // The tool answers a session with no identity and reports the identity layer the dashboard reports.
+    expect(unboundTool?.denied).toBeUndefined();
+    expect(status(unboundTool?.layers, "identity")).toBe("unknown");
     await app.cleanup(); app = undefined;
 
     const standaloneRoot = join(directory.home, "standalone-fortress");
