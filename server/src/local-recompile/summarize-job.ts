@@ -262,9 +262,9 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
         truncated: truncated ? "true" : "false",
       };
       // The object and its job_committed row are written under the results lock then the operator-log
-      // lock. Invariant: a committed result never sits beside a job_failed row. A row that fails rolls
-      // the object back to pending (then job_failed is accurate, and the sweep marks it indeterminate);
-      // a rollback that also fails is logged job_indeterminate only.
+      // lock. Invariant: a committed result never sits beside a job_failed row. Only a refusal before
+      // the store's publication begins maps to job_failed; every failure after it has begun arrives as
+      // CommitIndeterminateError and is logged job_indeterminate only.
       try {
         await deps.markCommitted(id, body, () =>
           deps.log("job_committed", {

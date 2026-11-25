@@ -135,7 +135,7 @@ export class CommitDeadlineError extends LocalStoreError {
   }
 }
 
-/** A commit whose row failed and whose rollback failed: the object may be committed without its row. */
+/** A commit that failed after its publication began: the store cannot prove which of its writes landed. */
 export class CommitIndeterminateError extends LocalStoreError {
   constructor() {
     super("io");
@@ -226,9 +226,12 @@ export class LocalResultsStore {
    * appended under this results lock (the log takes its own lock inside, the usual order), after the
    * committed object is durable. Invariant: a committed object always has its row. When the append
    * fails, the object is rolled back to pending under the same lock, so the sweep later marks it
-   * indeterminate, and the append's error is rethrown. If the rollback fails too, the commit is
-   * reported as CommitIndeterminateError: the object may stand committed without its row, and the
-   * caller must not record the job as failed.
+   * indeterminate.
+   *
+   * Publication is the tail: the result_committed row, the object replacement and the caller's row.
+   * A failure before it begins is a refusal (CommitDeadlineError, or the store's own error) and
+   * publishes nothing. Any failure once it has begun, the rollback's included, is
+   * CommitIndeterminateError, and the caller must not record the job as failed.
    */
   async markCommitted(
     requestId: string,
@@ -261,18 +264,28 @@ export class LocalResultsStore {
       // Eviction writes and waits, so the deadline is read again immediately before the first
       // publication write: no publication begins after the job's deadline.
       if (this.clock() >= current.deadline) throw new CommitDeadlineError();
-      await this.log("result_committed", requestId);
-      const updated = await this.replaceObject(kept, next, bytes);
+      // After the first publication write begins, no outcome is reported failed: the store cannot prove
+      // which writes landed. An append can fail after its row is durable, and a replacement can fail
+      // after its object is written, so every error from here on is CommitIndeterminateError.
+      let updated: IndexEntry[];
+      try {
+        await this.log("result_committed", requestId);
+        updated = await this.replaceObject(kept, next, bytes);
+      } catch {
+        throw new CommitIndeterminateError();
+      }
       if (options.committedRow !== undefined) {
         try {
           await options.committedRow();
-        } catch (error) {
+        } catch {
+          // The rollback keeps a committed object from standing without its row; the result_committed
+          // row is already durable, so the outcome is indeterminate whether or not the rollback lands.
           try {
             await this.replaceObject(updated, current, objectBytes(current));
           } catch {
-            throw new CommitIndeterminateError();
+            // Indeterminate either way; the sweep reconciles a pending object after its deadline.
           }
-          throw error;
+          throw new CommitIndeterminateError();
         }
       }
       return next;

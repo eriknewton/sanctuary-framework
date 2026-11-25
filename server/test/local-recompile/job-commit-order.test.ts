@@ -12,6 +12,7 @@ import type { QueuedJob } from "../../src/local-recompile/job-queue.js";
 import { LocalOplog, type OplogAppendKind, type OplogBodies } from "../../src/local-recompile/oplog.js";
 import { CommitDeadlineError, CommitIndeterminateError, LocalResultsStore } from "../../src/local-recompile/results-store.js";
 import { runSummarizeJob, type GenerationClient, type SummarizeJobDependencies } from "../../src/local-recompile/summarize-job.js";
+import { LOCAL_OPLOG_NAMESPACE, LOCAL_RESULTS_NAMESPACE } from "../../src/local-recompile/store-record.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FIXTURE_SEAT, StrictMemoryStorage, fixtureRequestId, fixtureStoreKeys } from "./__fixtures__/strict-memory-storage.js";
@@ -28,12 +29,15 @@ afterEach(() => {
   for (const step of cleanups.splice(0).reverse()) step();
 });
 
-async function world(options: { resultsMaxTotalBytes?: number } = {}) {
+async function world(options: { resultsMaxTotalBytes?: number; oplogMaxRows?: number } = {}) {
   const clock = { now: START };
   const now = () => clock.now;
   const storage = new StrictMemoryStorage();
   const keys = fixtureStoreKeys();
-  const oplog = new LocalOplog(storage, keys.oplogKey, { now });
+  const oplog = new LocalOplog(storage, keys.oplogKey, {
+    now,
+    ...(options.oplogMaxRows === undefined ? {} : { caps: { maxRows: options.oplogMaxRows } }),
+  });
   const results = new LocalResultsStore(storage, keys.resultsKey, oplog, {
     now,
     ...(options.resultsMaxTotalBytes === undefined ? {} : { caps: { maxTotalBytes: options.resultsMaxTotalBytes } }),
@@ -187,10 +191,79 @@ describe("a summary job's deadline and commit", () => {
     const object = await w.results.get(fixtureRequestId(3), { includeUncommitted: true });
     const kinds = (await w.rows(3)).map((row) => row.kind);
     expect(kinds).not.toContain("job_committed");
-    // The object went back to pending under the same lock, so the failed row is accurate.
+    // The object went back to pending under the same lock; result_committed is durable, so the job is indeterminate.
     expect(object?.state).toBe("pending");
-    expect(kinds.at(-1)).toBe("job_failed");
-    expect(object?.state === "committed" && kinds.includes("job_failed")).toBe(false);
+    expect(kinds).toContain("result_committed");
+    expect(kinds.at(-1)).toBe("job_indeterminate");
+    expect(kinds).not.toContain("job_failed");
+  });
+
+  it("a replacement that fails after its object is written ends indeterminate, never failed", async () => {
+    const w = await world();
+    const entry = w.job(6, START);
+    let objectWritten = false;
+    let commitError: unknown;
+    const deps = w.deps({
+      markCommitted: async (id, body, committedRow) => {
+        // The committed object is written, then the index write that publishes its entry fails.
+        w.storage.beforeMutation = (call) => {
+          if (call.namespace !== LOCAL_RESULTS_NAMESPACE) return;
+          if (call.key === `obj/${id}`) objectWritten = true;
+          else if (call.key === "index" && objectWritten) throw new Error("injected index write failure");
+        };
+        try {
+          return await w.results.markCommitted(id, body, { committedRow });
+        } catch (error) {
+          commitError = error;
+          throw error;
+        } finally {
+          w.storage.beforeMutation = () => undefined;
+        }
+      },
+    });
+    expect(await runSummarizeJob(entry, deps)).toBe("state_REFUSED");
+    expect(objectWritten).toBe(true);
+    expect(commitError).toBeInstanceOf(CommitIndeterminateError);
+    const kinds = (await w.rows(6)).map((row) => row.kind);
+    expect(kinds.at(-1)).toBe("job_indeterminate");
+    expect(kinds).not.toContain("job_failed");
+  });
+
+  it("a result_committed append that fails after its row is durable ends indeterminate, never failed", async () => {
+    // Small enough that the result_committed append prunes: genesis, job_started, result_pending and
+    // job_call fill it, so the fifth row starts a prune.
+    const w = await world({ oplogMaxRows: 4 });
+    const entry = w.job(7, START);
+    let armed = false;
+    let pruneFailed = false;
+    let commitError: unknown;
+    w.storage.beforeMutation = (call) => {
+      // "prune" must match PRUNE_INTENT_KEY in src/local-recompile/oplog.ts: the append's row and head are durable first.
+      if (!armed || call.namespace !== LOCAL_OPLOG_NAMESPACE || call.key !== "prune") return;
+      armed = false;
+      pruneFailed = true;
+      throw new Error("injected pruning failure");
+    };
+    const deps = w.deps({
+      markCommitted: async (id, body, committedRow) => {
+        armed = true;
+        try {
+          return await w.results.markCommitted(id, body, { committedRow });
+        } catch (error) {
+          commitError = error;
+          throw error;
+        }
+      },
+    });
+    expect(await runSummarizeJob(entry, deps)).toBe("state_REFUSED");
+    w.storage.beforeMutation = () => undefined;
+    expect(pruneFailed).toBe(true);
+    expect(commitError).toBeInstanceOf(CommitIndeterminateError);
+    const kinds = (await w.rows(7)).map((row) => row.kind);
+    expect(kinds).toContain("result_committed");
+    expect(kinds).not.toContain("job_committed");
+    expect(kinds.at(-1)).toBe("job_indeterminate");
+    expect(kinds).not.toContain("job_failed");
   });
 
   it("the committed row is written inside the store's commit, after the object", async () => {
