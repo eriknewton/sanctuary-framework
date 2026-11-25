@@ -3,6 +3,7 @@
  * server's or the worker's event loop. It serves /api/tags and a streaming
  * /api/generate on a random loopback port, reports every request it receives
  * to its parent over IPC, and follows a scripted mode the parent can change.
+ * A `count` message is answered with the number of stream frames written so far.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -21,10 +22,13 @@ interface Script {
 
 let script: Script = { mode: "normal", tag: "qwen2.5:1.5b", digest: "1".repeat(64), reply: "summary", delay_ms: 0 };
 let generateCalls = 0;
+// Stream frames written across every generate call, final frames included.
+let framesWritten = 0;
 const open = new Set<ServerResponse>();
 
 function line(response: ServerResponse, frame: Record<string, unknown>): void {
   response.write(`${JSON.stringify(frame)}\n`);
+  framesWritten += 1;
 }
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -87,6 +91,7 @@ const server = createServer((request: IncomingMessage, response: ServerResponse)
 
 process.on("message", (message: { type: string; script?: Partial<Script> }) => {
   if (message.type === "script") script = { ...script, ...message.script };
+  if (message.type === "count") process.send?.({ type: "count", frames: framesWritten });
   if (message.type === "stop") {
     for (const response of open) response.destroy();
     server.close(() => process.exit(0));

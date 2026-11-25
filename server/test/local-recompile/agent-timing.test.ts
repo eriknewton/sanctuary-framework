@@ -23,6 +23,8 @@
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import type { OplogRow } from "../../src/local-recompile/oplog.js";
+import { LocalWorkerClient } from "../../src/local-recompile/worker-client.js";
+import type { JobState } from "../../src/local-recompile/worker-protocol.js";
 import { WORKER_QUEUE_PER_SEAT_MAX } from "../../src/local-recompile/limits.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { openWorld, operatorRows, type World, type WorldOptions } from "./helpers/armed-world.js";
@@ -158,6 +160,7 @@ afterEach(async () => {
   } finally {
     opened = [];
     stoppedPids.clear();
+    liveJobStates.clear();
   }
 });
 
@@ -295,6 +298,41 @@ async function expectStillGenerating(busy: Timed, id: string): Promise<void> {
   expect(rows.filter((row) => JOB_END_KINDS.has(row.kind) && sameRequest(row, id))).toEqual([]);
 }
 
+/** The last job state each in-process server's worker reported, by request id: the worker's live view. */
+const liveJobStates = new Map<string, JobState>();
+
+/** Record every job_state the worker client accepts; the real handler still runs. */
+function watchJobStates(): void {
+  const prototype = LocalWorkerClient.prototype as unknown as { onMessage: (child: unknown, raw: unknown) => void };
+  const original = prototype.onMessage;
+  vi.spyOn(prototype, "onMessage").mockImplementation(function (this: unknown, child: unknown, raw: unknown) {
+    const message = raw as { type?: unknown; request_id?: unknown; state?: unknown };
+    if (message?.type === "job_state" && typeof message.request_id === "string") liveJobStates.set(message.request_id, message.state as JobState);
+    return original.call(this, child, raw);
+  });
+}
+
+/**
+ * The streaming job is generating during the measured window: taken untimed, before the first and the
+ * final measured call, the worker's live view has the job in its model stage at the final one, and the
+ * fake model has written a frame since the first. `beforeCall` must be unset; it is set here.
+ */
+function watchStreaming(busy: Timed, id: string, firstIndex: number, finalIndex: number): () => Promise<void> {
+  let first: number | undefined;
+  let final: { frames: number; state: JobState | undefined } | undefined;
+  busy.beforeCall = async (index) => {
+    if (index === firstIndex) first = await busy.world.fake.frames();
+    if (index === finalIndex) final = { frames: await busy.world.fake.frames(), state: liveJobStates.get(id) };
+  };
+  return async () => {
+    busy.beforeCall = undefined;
+    expect(first, "frames at the first measured call").toBeDefined();
+    expect(final, "the final measured call was watched").toBeDefined();
+    expect(final!.state, "the job's live state at the final measured call").toBe("state_GENERATE");
+    expect(final!.frames, "frames written between the first and the final measured call").toBeGreaterThan(first!);
+  };
+}
+
 /** The streaming world dropped nothing as seat-full and only its one job ever started. */
 async function expectOnlyTheStreamingJob(busy: Timed, id: string): Promise<void> {
   const rows = await jobRows(busy.world);
@@ -346,8 +384,10 @@ describe.sequential("the timing harness", () => {
   }, COMPARISON_TIMEOUT_MS);
 
   it("with a job streaming, the idle world runs no job and the streaming world's seat holds every acknowledgement", async () => {
+    watchJobStates();
     const busy = await open({ records: [RECORD], fakeScript: STREAMING });
     const id = await startStreamingJob(busy);
+    const framesAtStart = await busy.world.fake.frames();
     const idle = await open({ records: [RECORD] });
     for (let i = 0; i < HARNESS_CALLS; i += 1) {
       await call(idle, OTHER_KINDS[i % OTHER_KINDS.length]!);
@@ -360,6 +400,9 @@ describe.sequential("the timing harness", () => {
       await call(busy, "local_task");
     }
     expect((await jobRows(stopped.world)).filter((row) => row.kind === "job_started")).toEqual([]);
+    // The seams the gated comparison reads: the job is in its model stage and the model is still writing.
+    expect(liveJobStates.get(id)).toBe("state_GENERATE");
+    expect(await busy.world.fake.frames()).toBeGreaterThan(framesAtStart);
     await expectStillGenerating(busy, id);
     await expectOnlyTheStreamingJob(busy, id);
     await closeAll([busy, idle, stopped].map((timed) => timed.world));
@@ -428,12 +471,15 @@ describe.runIf(TIMING_GATE).sequential("the agent's other calls while a local jo
   }, COMPARISON_TIMEOUT_MS);
 
   it("with a job streaming from the model, each call kind stays within its bound", async () => {
+    watchJobStates();
     const busy = await open({ records: [RECORD], fakeScript: STREAMING });
     const id = await startStreamingJob(busy);
     const idle = await open({ records: [RECORD] });
     expect(await jobRows(idle.world)).toEqual([]);
+    const streamed = watchStreaming(busy, id, WARM_UP_CALLS, WARM_UP_CALLS + MEASURED_PAIRS - 1);
     const others = await compare(idle, busy, OTHER_KINDS);
     // The idle world ran no job, and the busy world's one job streamed through the whole window.
+    await streamed();
     expect(await jobRows(idle.world)).toEqual([]);
     await expectStillGenerating(busy, id);
     await expectOnlyTheStreamingJob(busy, id);
@@ -446,7 +492,9 @@ describe.runIf(TIMING_GATE).sequential("the agent's other calls while a local jo
       const streaming = await open({ records: [RECORD], fakeScript: STREAMING });
       const streamId = await startStreamingJob(streaming);
       const stopped = await open({ records: [RECORD] }, { stopWorker: true });
+      const ackStreamed = watchStreaming(streaming, streamId, ACK_WARM_UP_PAIRS, ACK_WARM_UP_PAIRS + ACK_MEASURED_PAIRS - 1);
       const measured = (await sample(stopped, streaming, ["local_task"], ACK_WARM_UP_PAIRS, ACK_MEASURED_PAIRS)).local_task!;
+      await ackStreamed();
       acks.a.push(...measured.a);
       acks.b.push(...measured.b);
       expect((await jobRows(stopped.world)).filter((row) => row.kind === "job_started")).toEqual([]);

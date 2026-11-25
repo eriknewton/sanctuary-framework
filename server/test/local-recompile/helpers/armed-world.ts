@@ -36,6 +36,8 @@ export interface FakeModel {
   pid: number;
   requests: Array<{ method: string; path: string; body: string }>;
   script(update: Record<string, unknown>): void;
+  /** Stream frames the fake has written so far, asked over IPC; one question at a time. */
+  frames(): Promise<number>;
   stop(): Promise<void>;
 }
 
@@ -43,6 +45,7 @@ export interface FakeModel {
 export async function startFakeModel(script: Record<string, unknown> = {}): Promise<FakeModel> {
   const child: ChildProcess = fork(FAKE_CHILD, [], { execArgv: ["--import", TSX], stdio: ["ignore", "ignore", "ignore", "ipc"] });
   const requests: FakeModel["requests"] = [];
+  const counts: Array<(frames: number) => void> = [];
   const stop = async () => {
     // A child that never started has no pid and may never emit exit; there is nothing to wait for.
     if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
@@ -54,15 +57,20 @@ export async function startFakeModel(script: Record<string, unknown> = {}): Prom
   };
   try {
     const port = await new Promise<number>((resolve, reject) => {
-      child.on("message", (message: { type: string; port?: number } & FakeModel["requests"][number]) => {
+      child.on("message", (message: { type: string; port?: number; frames?: number } & FakeModel["requests"][number]) => {
         if (message.type === "listening") resolve(message.port!);
         if (message.type === "request") requests.push(message);
+        if (message.type === "count") counts.shift()?.(message.frames!);
       });
       child.once("exit", () => reject(new Error("fake model exited")));
       // A fork that fails to start rejects here, and the catch below stops the child.
       child.once("error", reject);
     });
-    const fake: FakeModel = { port, pid: child.pid!, requests, script: (update) => child.send({ type: "script", script: update }), stop };
+    const frames = () => new Promise<number>((answer) => {
+      counts.push(answer);
+      child.send({ type: "count" });
+    });
+    const fake: FakeModel = { port, pid: child.pid!, requests, script: (update) => child.send({ type: "script", script: update }), frames, stop };
     fake.script({ tag: Q5E_RUNTIME_TAG, digest: Q5E_DEFAULT_DIGEST, reply: "summary", ...script });
     return fake;
   } catch (error) {
