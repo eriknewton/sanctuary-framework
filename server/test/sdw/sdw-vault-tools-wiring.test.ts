@@ -1,3 +1,4 @@
+// fail-before-exempt: the exact-row assertion checks a row's call reference apart from the row and holds with or without one, so it passes against the source before and after.
 /**
  * Wired-consumer + isolation regression tests for the SDW vault tools
  * (IC-15/16, IC-27, IC-28 companion; AGENTS.md assurance rule 4).
@@ -319,11 +320,19 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       const { entries } = await fixture.auditLog.query({});
       const serializedRows = JSON.stringify(denials);
       const denialIndex = entries.findIndex((entry) => entry.operation === "sdw_import_denied");
+      // Negative one selects the newest row the tool wrote in the oldest-first query; the
+      // router boundary's own rows follow it and are checked separately below.
+      const lastEntry = entries.filter((entry) => !ROUTER_BOUNDARY_OPERATIONS.has(entry.operation)).at(-1);
+      // A row written inside a router call also carries that call's reference; it is checked apart from the exact row.
+      const withoutCallRef = <T extends object | undefined>(entry: T): T => {
+        if (entry === undefined || !("call_ref" in entry)) return entry;
+        const { call_ref: _callRef, ...rest } = entry as T & { call_ref?: unknown };
+        return rest as T;
+      };
       return {
-        denials,
-        // Negative one selects the newest row the tool wrote in the oldest-first query; the
-        // router boundary's own rows follow it and are checked separately below.
-        lastEntry: entries.filter((entry) => !ROUTER_BOUNDARY_OPERATIONS.has(entry.operation)).at(-1),
+        denials: denials.map(withoutCallRef),
+        lastEntry: withoutCallRef(lastEntry),
+        callRefs: [...denials, lastEntry].map((entry) => (entry as { call_ref?: unknown } | undefined)?.call_ref),
         // The flush in auditOps settles the ledger's detached row, so this order is fixed.
         boundaryRows: entries.slice(denialIndex + 1).map((entry) => ({
           operation: entry.operation,
@@ -360,6 +369,9 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       return {
         denials: [row],
         lastEntry: row,
+        // Sixteen lowercase hex characters where the router assigned a call reference; absent where none is assigned.
+        callRefs: expect.toSatisfy((refs: unknown[]) => refs.length === 2 &&
+          refs.every((ref) => ref === undefined || (typeof ref === "string" && /^[0-9a-f]{16}$/.test(ref)))),
         // Through the router, a refusal decided while preparing arguments writes one pre-gate
         // gate row, then one ledger row; a direct hook call has no router boundary.
         boundaryRows: through === "router" ? [
