@@ -117,7 +117,7 @@ async function fortress(): Promise<Fortress> {
     masterKey,
     identity,
     write: async (namespace, key, value) => {
-      await store.write(namespace, key, value, KID, identity.encrypted_private_key, idKey);
+      await store.write(namespace, key, value, KID, identity.encrypted_private_key, idKey, { provenance: { origin_actor: "operator" } });
     },
   };
 }

@@ -58,7 +58,7 @@ async function world(options: { resultsMaxTotalBytes?: number } = {}) {
     rotation_history: [],
   };
   await records.write("_identities", KID, stringToBytes(JSON.stringify(encrypt(stringToBytes(JSON.stringify(identity)), idKey))));
-  await new StateStore(records, masterKey).write("notes", "one", "The team decided to ship.", KID, identity.encrypted_private_key, idKey);
+  await new StateStore(records, masterKey).write("notes", "one", "The team decided to ship.", KID, identity.encrypted_private_key, idKey, { provenance: { origin_actor: "operator" } });
 
   const descriptor = Object.freeze({ runtime_tag: TAG, manifest_digest: DIGEST, endpoint: Object.freeze({ address: "127.0.0.1", port: 9 }) });
   const authority = new LocalAuthority({

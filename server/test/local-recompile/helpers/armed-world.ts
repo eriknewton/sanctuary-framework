@@ -128,7 +128,7 @@ export async function openWorld(options: WorldOptions = {}): Promise<World> {
       if (options.recordTime !== undefined) vi.useFakeTimers({ toFake: ["Date"], now: options.recordTime });
       try {
         for (const record of options.records ?? []) {
-          await store.write(record.namespace, record.key, record.value, identity.identity_id, identity.encrypted_private_key, encKey);
+          await store.write(record.namespace, record.key, record.value, identity.identity_id, identity.encrypted_private_key, encKey, { provenance: { origin_actor: "operator" } });
         }
       } finally {
         if (options.recordTime !== undefined) vi.useRealTimers();

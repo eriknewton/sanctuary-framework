@@ -108,7 +108,7 @@ async function fortressWithCommittedResult() {
   await persistStoredIdentity(storage, opened.masterKey, identity);
   const stateStore = new StateStore(storage, opened.masterKey);
   const write = (namespace: string, key: string, value: string) =>
-    stateStore.write(namespace, key, value, identity.identity_id, identity.encrypted_private_key, encKey);
+    stateStore.write(namespace, key, value, identity.identity_id, identity.encrypted_private_key, encKey, { provenance: { origin_actor: "operator" } });
   const auditLog = new AuditLog(storage, opened.masterKey);
   auditLogs.push(auditLog);
   return { fixture: { path: opened.storagePath }, identity, stateStore, write, auditLog };
