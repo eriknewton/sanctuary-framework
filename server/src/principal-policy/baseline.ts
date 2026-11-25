@@ -13,7 +13,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { StorageEnumerationBoundError, type StorageBackend } from "../storage/interface.js";
+import { StorageEnumerationBoundError, type StorageBackend, type StrictDurabilityStorageCapabilities } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
@@ -54,6 +54,20 @@ export const BASELINE_NS_FAILURE_ROW_INTERVAL_MS = 60_000;
  * pending; another namespace is never written.
  */
 export const BASELINE_NS_MAX_WRITES_PER_RECORD = 2;
+
+/**
+ * Strict namespace lock an insert publishes under on a backend with strict durability. Taken with no
+ * scaffold file, so the record namespace holds only records and the load bound counts records alone.
+ */
+const BASELINE_NS_INSERT_LOCK_FILE = "insert.lock";
+
+type StrictInsertStorage = StorageBackend &
+  Pick<StrictDurabilityStorageCapabilities, "withStrictNamespaceLock" | "writeIfAbsentStrict">;
+
+function hasStrictInsert(storage: StorageBackend): storage is StrictInsertStorage {
+  const candidate = storage as Partial<StrictInsertStorage>;
+  return typeof candidate.withStrictNamespaceLock === "function" && typeof candidate.writeIfAbsentStrict === "function";
+}
 
 /** Insert record key: the lowercase hex SHA-256 of the UTF-8 bytes of "ns:" plus the namespace id. */
 export function baselineNamespaceRecordKey(namespace: string): string {
@@ -397,6 +411,12 @@ export class BaselineNamespaceInserts {
   private readonly now: () => number;
   /** Namespaces whose insert failed; capped at BASELINE_NS_INSERT_LOAD_MAX and drained only by flushPending(). */
   private readonly pending = new Set<string>();
+  /**
+   * Namespaces whose record this process has published or found present; an already-recorded namespace is not
+   * inserted again. Capped at BASELINE_NS_INSERT_LOAD_MAX; past the cap a namespace re-runs its insert, which
+   * finds its record present.
+   */
+  private readonly recorded = new Set<string>();
   /** Last failure-row time per namespace; capped at BASELINE_NS_INSERT_LOAD_MAX and pruned by age on every failure. */
   private readonly failureRowAt = new Map<string, number>();
   /** The store-wide over-cap stderr slot: one line per interval. */
@@ -424,8 +444,13 @@ export class BaselineNamespaceInserts {
     const states: BaselineNamespaceInsertState[] = [];
     try {
       if (!isRecordableNamespace(namespace)) return states;
+      if (this.recorded.has(namespace)) {
+        states.push("insert_ALREADY_PRESENT");
+        return states;
+      }
       const attempt = await this.insertOnce(namespace);
       if (attempt === "insert_PERSISTED" || attempt === "insert_ALREADY_PRESENT") {
+        if (this.recorded.size < BASELINE_NS_INSERT_LOAD_MAX) this.recorded.add(namespace);
         // Only this namespace leaves the pending set; every other pending namespace waits for its own save or the flush.
         this.pending.delete(namespace);
         states.push(attempt);
@@ -489,16 +514,25 @@ export class BaselineNamespaceInserts {
     namespace: string,
   ): Promise<"insert_PERSISTED" | "insert_ALREADY_PRESENT" | { failed: BaselineNamespacePersistFailureCode }> {
     // An insert record is created once and never overwritten, so two processes cannot drop each other's records.
-    // The plain absent-write publishes exclusively across processes (link(2) on the filesystem backend), which is the
-    // property a record needs; the strict variant publishes only inside a held strict namespace lock, which this
-    // path does not take. A plain write is never a fallback.
-    if (typeof this.storage.writeIfAbsent !== "function") return { failed: "absent_write_unavailable" };
+    // A plain write is never a fallback.
+    const storage = this.storage;
+    const strict = hasStrictInsert(storage);
+    if (!strict && typeof storage.writeIfAbsent !== "function") return { failed: "absent_write_unavailable" };
+    const key = baselineNamespaceRecordKey(namespace);
     try {
-      const created = await this.storage.writeIfAbsent(
-        BASELINE_NS_NAMESPACE,
-        baselineNamespaceRecordKey(namespace),
-        encodeBaselineRecord(stringToBytes(namespace), this.encryptionKey),
-      );
+      const data = encodeBaselineRecord(stringToBytes(namespace), this.encryptionKey);
+      // The tracker counts a namespace as recorded only after a publication whose directory entry is durable:
+      // where the backend offers strict durability, the record is published exclusively inside the strict
+      // namespace lock, whose held descriptors make the record namespace's entry durable before the write
+      // resolves. A backend with no strict variant and no directory durability keeps the plain absent-write.
+      const created = strict
+        ? await storage.withStrictNamespaceLock(
+            BASELINE_NS_NAMESPACE,
+            BASELINE_NS_INSERT_LOCK_FILE,
+            () => storage.writeIfAbsentStrict(BASELINE_NS_NAMESPACE, key, data),
+            { kernelBacked: true, scaffold: false },
+          )
+        : await storage.writeIfAbsent!(BASELINE_NS_NAMESPACE, key, data);
       return created ? "insert_PERSISTED" : "insert_ALREADY_PRESENT";
     } catch {
       return { failed: "write_failed" };

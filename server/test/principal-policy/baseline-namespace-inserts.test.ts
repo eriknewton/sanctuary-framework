@@ -213,6 +213,53 @@ describe("insert records", () => {
   });
 });
 
+describe("durable publication", () => {
+  it("on the filesystem backend the first insert publishes inside the strict namespace lock and reports success only after that publication", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ns-inserts-durable-"));
+    try {
+      const storage = new FilesystemStorage(join(dir, "fortress"));
+      const h = harness(storage as unknown as MemoryStorage);
+      const events: string[] = [];
+      let inLock = false;
+      const lock = storage.withStrictNamespaceLock.bind(storage);
+      vi.spyOn(storage, "withStrictNamespaceLock").mockImplementation(async (namespace, lockFileName, operation, options) =>
+        lock(namespace, lockFileName, async (lease) => {
+          inLock = true;
+          try { return await operation(lease); } finally { inLock = false; }
+        }, options));
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const strictWrite = storage.writeIfAbsentStrict.bind(storage);
+      vi.spyOn(storage, "writeIfAbsentStrict").mockImplementation(async (namespace, key, data) => {
+        events.push(`strict:${namespace}:${inLock}`);
+        await gate;
+        const created = await strictWrite(namespace, key, data);
+        events.push("published");
+        return created;
+      });
+      const plainWrite = vi.spyOn(storage, "writeIfAbsent");
+      const settled = h.inserts.record("notes").then((states) => { events.push("reported"); return states; });
+      await vi.waitFor(() => { expect(events).toEqual([`strict:${NS}:true`]); });
+      release();
+      expect(await settled).toEqual(["insert_PERSISTED"]);
+      expect(events).toEqual([`strict:${NS}:true`, "published", "reported"]);
+      expect(plainWrite.mock.calls.filter(([namespace]) => namespace === NS)).toEqual([]);
+      const { tracker } = await load(storage, h.masterKey);
+      expect(tracker.isNewNamespace("notes")).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a namespace already recorded by this process is not inserted again", async () => {
+    const h = harness();
+    const writes = vi.spyOn(h.storage, "writeIfAbsent");
+    expect(await h.inserts.record("notes")).toEqual(["insert_PERSISTED"]);
+    expect(await h.inserts.record("notes")).toEqual(["insert_ALREADY_PRESENT"]);
+    expect(writes.mock.calls.filter(([namespace]) => namespace === NS)).toHaveLength(1);
+  });
+});
+
 describe("work and state per record call", () => {
   it("one record call performs at most two storage writes", async () => {
     const h = harness();
