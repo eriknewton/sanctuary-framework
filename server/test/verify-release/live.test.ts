@@ -1,3 +1,4 @@
+// fail-before-exempt: this test is skipped unless SANCTUARY_VERIFY_RELEASE_LIVE=1, so on any tree without that variable, the base included, it reports skipped rather than failing; its fail-before evidence is the recorded live run.
 /**
  * Live integration, gated: skipped unless SANCTUARY_VERIFY_RELEASE_LIVE=1, and
  * never run in CI. It installs 1.8.4 from npm into a temporary prefix and runs
