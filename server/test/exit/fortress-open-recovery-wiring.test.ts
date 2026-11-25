@@ -126,6 +126,7 @@ const ALLOWLIST: Record<string, string> = {
   "src/cli/castle-wall-observe.ts": "N2 (coordinator gate, 2026-08-22): writes observe-store state and critical audit entries (auditLog.appendCritical, observeStore.setState, removeCandidateAfterReview) - NOT read-only, corrected from an earlier false claim; not wired this fix round.",
   "src/cli/policy.ts": "policy verb family, multiple AuditLog sites; not wired this fix round.",
   "src/cli/checkpoint.ts": "checkpoint verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/local-results.ts": "results and local verbs read and write only the two local job stores, never through the N4-guarded StateStore/ReputationStore write chokepoints; not wired, same bounded-scope reason as checkpoint.",
   "src/cli/castle-wall.ts": "Castle Wall CLI, many AuditLog sites across many verbs; not wired this fix round.",
   "src/cli/state-disclose.ts": "state-disclose verb; not wired this fix round, same bounded-scope reason.",
   "src/cli/restore-attest.ts": "restore-attest verb; not wired this fix round, same bounded-scope reason.",

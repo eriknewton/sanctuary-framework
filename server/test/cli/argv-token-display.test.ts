@@ -418,8 +418,10 @@ function runCensus(): CensusResult {
 // the config-reset `unknown.map(...)` form) plus 11 caught-error refusals
 // (caughtErrorForDisplay). The standalone offline verifier prints a fixed
 // literal instead, since it may not import src/cli/argv.ts. Exact, so a
-// removed or added site is a decision.
-const EXPECTED_FORMATTER_SITES = 77;
+// removed or added site is a decision. 87 = those 77 plus the 10
+// argvTokenForDisplay sites of the `results` and `local` verbs in
+// src/cli/local-results.ts.
+const EXPECTED_FORMATTER_SITES = 87;
 
 describe("source census: refusal strings route argv tokens through the formatter", () => {
   const census = runCensus();

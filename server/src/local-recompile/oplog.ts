@@ -75,10 +75,79 @@ export const OPLOG_KINDS = [
   "operator_export",
   "operator_render",
   "prune_blocked",
+  "job_queued",
+  "job_started",
+  "job_refused",
+  "job_dropped",
+  "job_call",
+  "job_committed",
+  "job_failed",
+  "job_indeterminate",
+  "oplog_exported",
 ] as const;
 export type OplogKind = (typeof OPLOG_KINDS)[number];
 
 export const WORKER_EXIT_CAUSES = ["exit", "signal", "fault"] as const;
+
+/**
+ * Why accepted work never reached a job: the worker was not ready or its
+ * channel was backlogged, or the worker's queue or the seat's share was full.
+ * Must match the drop producers in tool.ts and job-queue.ts.
+ */
+export const JOB_DROP_CAUSES = ["worker_unavailable", "queue_full", "seat_full"] as const;
+export type JobDropCause = (typeof JOB_DROP_CAUSES)[number];
+
+/**
+ * Why a job was refused before generation: an authority refusal, the model
+ * check, a record that could not be read, or input over its bound. Must match
+ * AUTHORITY_REFUSAL_CAUSES in worker-protocol.ts and the producers in summarize-job.ts.
+ */
+export const JOB_REFUSAL_CAUSES = [
+  "unarmed",
+  "binding_absent",
+  "epoch_changed",
+  "assurance_mismatch",
+  "not_loopback",
+  "identity_mismatch",
+  "uncovered",
+  "request_unknown",
+  "writer_table_too_large",
+  "authority_timeout",
+  "model_digest_mismatch",
+  "model_unavailable",
+  "record_missing",
+  "record_oversized",
+  "record_unverifiable",
+  "record_undecryptable",
+  "input_too_large",
+  "internal",
+] as const;
+export type JobRefusalCause = (typeof JOB_REFUSAL_CAUSES)[number];
+
+/** Why a job that began generating ended without a committed result. Must match summarize-job.ts. */
+export const JOB_FAILURE_CAUSES = ["deadline", "call_failed", "results_full", "commit_failed"] as const;
+export type JobFailureCause = (typeof JOB_FAILURE_CAUSES)[number];
+
+/** A model call's outcome: ok, or the transport's closed refusal. Must match SensitiveGenerationRefusal. */
+export const JOB_CALL_OUTCOMES = [
+  "ok",
+  "not_loopback",
+  "num_predict_missing",
+  "connect_address_mismatch",
+  "redirect",
+  "http_status",
+  "line_cap",
+  "final_line_cap",
+  "total_cap",
+  "visible_text_cap",
+  "tags_cap",
+  "timeout",
+  "cancelled",
+  "transport",
+  "invalid_response",
+] as const;
+export type JobCallOutcome = (typeof JOB_CALL_OUTCOMES)[number];
+export const JOB_CALL_PHASES = ["chunk", "combine"] as const;
 
 /** Closed body per kind: ids and counters only, never key material or record text. */
 export interface OplogBodies {
@@ -94,6 +163,25 @@ export interface OplogBodies {
   operator_export: { request_id: string };
   operator_render: { request_id: string };
   prune_blocked: { base_seq: number };
+  job_queued: { request_id: string; queue_depth: number };
+  job_started: { request_id: string; refs: number };
+  job_refused: { request_id: string; cause: JobRefusalCause; slot: number | null };
+  job_dropped: { request_id: string; cause: JobDropCause };
+  job_call: {
+    request_id: string;
+    call: number;
+    phase: (typeof JOB_CALL_PHASES)[number];
+    input_bytes: number;
+    output_bytes: number;
+    truncated: boolean;
+    duration_ms: number;
+    outcome: JobCallOutcome;
+  };
+  job_committed: { request_id: string; chunks: number; output_bytes: number; truncated: boolean; duration_ms: number };
+  job_failed: { request_id: string; cause: JobFailureCause };
+  job_indeterminate: { request_id: string };
+  /** The operator exported the log; written before the file, naming the head it covers. */
+  oplog_exported: { head_seq: number };
 }
 export type OplogAppendKind = Exclude<OplogKind, "genesis">;
 
@@ -178,9 +266,70 @@ export function validateOplogBody<K extends OplogKind>(kind: K, input: unknown):
         throw new LocalStoreError("invalid_record");
       }
       break;
+    case "oplog_exported":
+      requireExactFields(body, ["head_seq"]);
+      if (!isSeq(body.head_seq)) throw new LocalStoreError("invalid_record");
+      break;
     case "prune_blocked":
       requireExactFields(body, ["base_seq"]);
       if (!isSeq(body.base_seq)) throw new LocalStoreError("invalid_record");
+      break;
+    case "job_dropped":
+      requireExactFields(body, ["request_id", "cause"]);
+      if (!isRequestId(body.request_id) || !JOB_DROP_CAUSES.some((cause) => cause === body.cause)) {
+        throw new LocalStoreError("invalid_record");
+      }
+      break;
+    case "job_queued":
+      requireExactFields(body, ["request_id", "queue_depth"]);
+      if (!isRequestId(body.request_id) || !isNonNegativeSafeInteger(body.queue_depth)) throw new LocalStoreError("invalid_record");
+      break;
+    case "job_started":
+      requireExactFields(body, ["request_id", "refs"]);
+      if (!isRequestId(body.request_id) || !isNonNegativeSafeInteger(body.refs)) throw new LocalStoreError("invalid_record");
+      break;
+    case "job_refused":
+      requireExactFields(body, ["request_id", "cause", "slot"]);
+      if (
+        !isRequestId(body.request_id) ||
+        !JOB_REFUSAL_CAUSES.some((cause) => cause === body.cause) ||
+        !(body.slot === null || isNonNegativeSafeInteger(body.slot))
+      ) {
+        throw new LocalStoreError("invalid_record");
+      }
+      break;
+    case "job_call":
+      requireExactFields(body, ["request_id", "call", "phase", "input_bytes", "output_bytes", "truncated", "duration_ms", "outcome"]);
+      if (
+        !isRequestId(body.request_id) ||
+        !isNonNegativeSafeInteger(body.call) ||
+        !JOB_CALL_PHASES.some((phase) => phase === body.phase) ||
+        !isNonNegativeSafeInteger(body.input_bytes) ||
+        !isNonNegativeSafeInteger(body.output_bytes) ||
+        typeof body.truncated !== "boolean" ||
+        !isNonNegativeSafeInteger(body.duration_ms) ||
+        !JOB_CALL_OUTCOMES.some((outcome) => outcome === body.outcome)
+      ) {
+        throw new LocalStoreError("invalid_record");
+      }
+      break;
+    case "job_committed":
+      requireExactFields(body, ["request_id", "chunks", "output_bytes", "truncated", "duration_ms"]);
+      if (
+        !isRequestId(body.request_id) ||
+        !isNonNegativeSafeInteger(body.chunks) ||
+        !isNonNegativeSafeInteger(body.output_bytes) ||
+        typeof body.truncated !== "boolean" ||
+        !isNonNegativeSafeInteger(body.duration_ms)
+      ) {
+        throw new LocalStoreError("invalid_record");
+      }
+      break;
+    case "job_failed":
+      requireExactFields(body, ["request_id", "cause"]);
+      if (!isRequestId(body.request_id) || !JOB_FAILURE_CAUSES.some((cause) => cause === body.cause)) {
+        throw new LocalStoreError("invalid_record");
+      }
       break;
     default:
       if (!OPLOG_KINDS.includes(kind)) throw new LocalStoreError("invalid_record");

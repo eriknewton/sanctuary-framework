@@ -258,8 +258,10 @@ export function isLowerHex(value: unknown, length: number): value is string {
 
 // A request id carries 128 random bits as 32 lowercase hex digits.
 export const REQUEST_ID_HEX_LENGTH = 128 / 4;
-// A seat is named by its identity id: the first 128 bits of SHA-256(public key)
-// as hex; must match generateIdentityId in core/identity.ts.
+// A seat is named by 128 bits as 32 hex digits: an identity id (the first 128
+// bits of SHA-256(public key), must match generateIdentityId in core/identity.ts),
+// or for a local task the first 128 bits of SHA-256 of the router seat
+// (must match resultSeatId in summarize-job.ts).
 export const SEAT_ID_HEX_LENGTH = 128 / 4;
 
 export function isRequestId(value: unknown): value is string {
