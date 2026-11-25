@@ -1792,6 +1792,9 @@ export interface CallScopeNote<Cause extends string = string> {
   readonly cause: Cause;
   readonly linked_ref?: string;
 }
+/** A retained row's identity that survives reload and trim: its chain sequence, or a legacy row's storage key. */
+export type CursorKey = { sequence: number } | { legacy_key: string };
+
 export interface CallScopeHandle {
   readonly call_ref: string;
   readonly state: CallScopeState;
@@ -2605,6 +2608,8 @@ export class AuditLog {
   private verifiedUncachedLastPass = 0;
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
+  /** Storage keys of the unchained legacy prefix of `entries`, aligned 1:1 with it. */
+  private legacyEntryKeys: string[] = [];
   private counter = 0;
   /**
    * Per-instance random suffix mixed into every persisted entry key. Two
@@ -3549,6 +3554,7 @@ export class AuditLog {
       // that, dropped entries are legacy-only and `chainEntries` is left intact.
       const legacyCount = this.entries.length - this.chainEntries.length;
       this.entries.splice(0, overflow);
+      this.legacyEntryKeys.splice(0, Math.min(overflow, legacyCount));
       const chainedDropped = Math.max(0, overflow - legacyCount);
       if (chainedDropped > 0) {
         this.chainEntries.splice(0, chainedDropped);
@@ -4751,11 +4757,14 @@ export class AuditLog {
     include_outcome_markers?: boolean;
     /** Return only rows an agent reader may see: a row written in a call only once its success marker is retained. */
     agent_visible?: boolean;
+    /** Return `sequences`, each returned row's key, parallel to `entries`. */
+    with_sequences?: boolean;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
     total: number;
     integrity_findings: AuditIntegrityFinding[];
+    sequences?: CursorKey[];
   }> {
     // EAGER SCOPE (posture surface): serve from the eagerly-maintained verified
     // view with the throttled on-disk re-verify, so the high-frequency board
@@ -4823,6 +4832,26 @@ export class AuditLog {
     const limit = options.limit ?? 50;
     // Must match renderActivityScreen in server/src/dashboard/v1_1/client.ts, which lists this oldest-first page newest first.
     const entries = filtered.slice(-limit); // Most recent entries
+
+    if (options.with_sequences === true) {
+      // `entries` is [legacy..., chained...]: the legacy prefix aligns with legacyEntryKeys, the chained suffix with chainEntries.
+      const legacyCount = retained.length - this.chainEntries.length;
+      const keys = new Map<AuditEntry, CursorKey>();
+      for (let i = 0; i < retained.length; i++) {
+        const legacyKey = i < legacyCount ? this.legacyEntryKeys[i] : undefined;
+        const chained = i >= legacyCount ? this.chainEntries[i - legacyCount] : undefined;
+        if (chained) keys.set(retained[i]!, { sequence: chained.sequence });
+        else if (legacyKey !== undefined) keys.set(retained[i]!, { legacy_key: legacyKey });
+      }
+      // A row with no key cannot be named again after a reload, so it is left out of a keyed read.
+      const keyed = entries.filter((entry) => keys.has(entry));
+      return {
+        entries: keyed,
+        total,
+        integrity_findings: [...this.integrityFindings],
+        sequences: keyed.map((entry) => keys.get(entry)!),
+      };
+    }
 
     return { entries, total, integrity_findings: [...this.integrityFindings] };
   }
@@ -6419,13 +6448,16 @@ export class AuditLog {
     const windowCap = this.maxInMemoryEntries;
     const recentEntries: AuditEntry[] = [];
     const recentChained: Array<{ sequence: number; entry_hash: string }> = [];
+    const recentLegacyKeys: string[] = [];
     const pushWindow = (
       entry: AuditEntry,
-      chained: { sequence: number; entry_hash: string } | null
+      chained: { sequence: number; entry_hash: string } | null,
+      legacyKey?: string
     ): void => {
       if (consumer) return; // streaming consumer keeps no window
       recentEntries.push(entry);
       if (chained) recentChained.push(chained);
+      else if (legacyKey !== undefined) recentLegacyKeys.push(legacyKey);
       // Trim the OLDEST entries from the front in lockstep with their aligned
       // chained twins (legacy entries, which have no chained twin, are dropped
       // first) so `recentEntries.length - recentChained.length` stays equal to
@@ -6435,6 +6467,7 @@ export class AuditLog {
       if (overflow > 0) {
         const legacyResident = recentEntries.length - recentChained.length;
         recentEntries.splice(0, overflow);
+        recentLegacyKeys.splice(0, Math.min(overflow, legacyResident));
         const chainedDropped = Math.max(0, overflow - legacyResident);
         if (chainedDropped > 0) recentChained.splice(0, chainedDropped);
       }
@@ -6651,7 +6684,7 @@ export class AuditLog {
         // decrypt try/catch above for the same reason as the chained path: a
         // post-decrypt throw must not be miscategorized as a decrypt failure.
         legacyRawEntries.push({ key: meta.key, raw });
-        pushWindow(legacyEntry, null);
+        pushWindow(legacyEntry, null, meta.key);
       }
 
       const legacyHashes = legacyRawEntries.map((legacy, index) =>
@@ -6713,6 +6746,7 @@ export class AuditLog {
       if (!consumer) {
         this.entries = recentEntries;
         this.chainEntries = recentChained;
+        this.legacyEntryKeys = recentLegacyKeys;
       }
       // F3: continue from the HIGHEST surviving sequence, not the entry count.
       // After rotation prunes a contiguous prefix, count != highest sequence, and

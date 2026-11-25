@@ -1,7 +1,7 @@
 import { enforceDeclaredStringLengths } from "../tool-args.js";
 import { classifyIntent, HELP_INTENT_SCHEMA_MAX_CHARS } from "./intent-classifier.js";
 import { randomBytes } from "node:crypto";
-import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
+import type { AuditEntry, AuditLog, CursorKey } from "../operational/audit-log.js";
 import {
   buildAgentSearchCorpus,
   redactAuditEntryForAgent,
@@ -87,9 +87,29 @@ interface EventCursor {
   cursor_id: string;
   owner_fingerprint: string;
   operation?: string;
-  offset: number;
+  /** The rows visible when the cursor opened, by key, in read order; empty while the open is pending. */
+  keys: CursorKey[];
+  /** The next snapshot position a read returns. */
+  position: number;
+  /** Set until the open's snapshot is taken; a pending cursor refuses reads. */
+  pending: boolean;
   opened_at: string;
   reads: number;
+}
+
+/** The read window the events cursor already used. */
+const EVENTS_CURSOR_WINDOW_ROWS = 500;
+/** The most reads one cursor serves. */
+const EVENTS_CURSOR_MAX_READS = 10;
+/** The most events one read returns. */
+const EVENTS_READ_MAX_LIMIT = 25;
+/** The most positions a cursor can ever read, so the snapshot keeps no more. */
+const EVENTS_CURSOR_SNAPSHOT_ROWS = EVENTS_CURSOR_MAX_READS * EVENTS_READ_MAX_LIMIT;
+/** The most cursors one server keeps open; each holds at most EVENTS_CURSOR_SNAPSHOT_ROWS keys. */
+const MAX_OPEN_CURSORS = 64;
+
+function cursorKeyId(key: CursorKey): string {
+  return "sequence" in key ? `s:${key.sequence}` : `l:${key.legacy_key}`;
 }
 
 // Thirty-two needles plus seven named keys fit within sixty-four, the next power of two.
@@ -995,20 +1015,52 @@ export function createAgentNativeCooperativeTools(
           opts: { type: "object", properties: { limit: { type: "number" } } },
         },
       },
-      handler: async (args) => {
+      handler: async (args, _caller, context) => {
         try {
           const filter = (args.filter as Record<string, unknown> | undefined) ?? {};
           if (filter.callback || filter.url || filter.other_agent) return deny("audit:sanctuary_events_open_cursor");
           const activeIdentity = active();
+          // Capacity is checked and the pending entry inserted with no await between, so concurrent opens never hold
+          // more than MAX_OPEN_CURSORS entries; spent cursors make room first, oldest first.
+          if (cursors.size >= MAX_OPEN_CURSORS) {
+            for (const [id, held] of cursors) {
+              if (cursors.size < MAX_OPEN_CURSORS) break;
+              if (held.reads >= EVENTS_CURSOR_MAX_READS) cursors.delete(id);
+            }
+          }
+          if (cursors.size >= MAX_OPEN_CURSORS) return deny("audit:sanctuary_events_open_cursor", "wait");
           const cursor: EventCursor = {
             cursor_id: `cursor:${randomBytes(12).toString("hex")}`,
             owner_fingerprint: activeIdentity.requester_identity_fingerprint,
             operation: typeof filter.operation === "string" ? filter.operation : undefined,
-            offset: 0,
+            keys: [],
+            position: 0,
+            pending: true,
             opened_at: new Date().toISOString(),
             reads: 0,
           };
           cursors.set(cursor.cursor_id, cursor);
+          try {
+            // A cursor pages through the rows visible when it was opened, so a row that becomes visible later is never
+            // inserted ahead of the read position.
+            const snapshot = await options.auditLog.runAllowingIntegrityFindings(() =>
+              options.auditLog.query({
+                operation_type: cursor.operation,
+                identity_id: activeIdentity.identity_id,
+                // Agent readers ask for agent-visible rows only.
+                agent_visible: true,
+                with_sequences: true,
+                limit: EVENTS_CURSOR_WINDOW_ROWS,
+              })
+            );
+            if (context?.signal?.aborted === true) throw new Error("cursor open cancelled");
+            cursor.keys = (snapshot.sequences ?? []).slice(0, EVENTS_CURSOR_SNAPSHOT_ROWS);
+            cursor.pending = false;
+          } catch (error) {
+            // Only this open's own entry is removed; a later entry under the same id is never touched.
+            if (cursors.get(cursor.cursor_id) === cursor) cursors.delete(cursor.cursor_id);
+            throw error;
+          }
           const auditRef = await audit("sanctuary_events_open_cursor", { operation: cursor.operation });
           return toolResult({ cursor: cursor.cursor_id, audit_ref: auditRef });
         } catch {
@@ -1036,21 +1088,20 @@ export function createAgentNativeCooperativeTools(
           if (!cursor || cursor.owner_fingerprint !== activeIdentity.requester_identity_fingerprint) {
             return deny("audit:sanctuary_events_read");
           }
+          if (cursor.pending) return deny("audit:sanctuary_events_read", "wait");
           cursor.reads += 1;
-          if (cursor.reads > 10) return deny("audit:sanctuary_events_read", "wait", "minutes");
-          const limit = Math.min(25, Math.max(1, Number((args.opts as Record<string, unknown> | undefined)?.limit ?? 10)));
-          // Scope to the caller's identity BEFORE the limit (AuditLog.query
-          // filters identity_id before its slice) so the 500-entry window is
-          // entirely the caller's OWN entries — cursor paging no longer drops a
-          // caller's older entries that sat behind other identities' (CISO LOW,
-          // 2026-06-16).
+          if (cursor.reads > EVENTS_CURSOR_MAX_READS) return deny("audit:sanctuary_events_read", "wait", "minutes");
+          const limit = Math.min(EVENTS_READ_MAX_LIMIT, Math.max(1, Number((args.opts as Record<string, unknown> | undefined)?.limit ?? 10)));
+          // The read keeps the whole retained window (do not slice; the retained window is the bound), scoped to the
+          // caller's identity and to rows still agent-visible, and returns the snapshot's next keys found in it.
           const queried = await options.auditLog.runAllowingIntegrityFindings(() =>
             options.auditLog.query({
               operation_type: cursor.operation,
               identity_id: activeIdentity.identity_id,
               // Agent readers ask for agent-visible rows only.
               agent_visible: true,
-              limit: 500,
+              with_sequences: true,
+              limit: Number.MAX_SAFE_INTEGER,
             })
           );
           // audit-chokepoint-exempt: fail-closed DENY on any integrity finding,
@@ -1058,13 +1109,21 @@ export function createAgentNativeCooperativeTools(
           // finding makes it refuse, it never stamps a verified-clean label, so it
           // does not derive an audit-chain cleanliness verdict (F2 round-4 HIGH-2).
           if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_events_read");
-          const own = queried.entries;
-          const startOffset = cursor.offset;
-          const page = own.slice(startOffset, startOffset + limit);
-          cursor.offset = startOffset + page.length;
+          const byKey = new Map<string, AuditEntry>();
+          const keys = queried.sequences ?? [];
+          queried.entries.forEach((entry, index) => { byKey.set(cursorKeyId(keys[index]!), entry); });
+          const start = cursor.position;
+          const slots = cursor.keys.slice(start, start + limit);
+          cursor.position = start + slots.length;
+          // A snapshotted row no longer retained, or no longer visible, is skipped; the rest keep snapshot order.
+          const page: Array<{ entry: AuditEntry; position: number }> = [];
+          slots.forEach((key, offset) => {
+            const entry = byKey.get(cursorKeyId(key));
+            if (entry) page.push({ entry, position: start + offset });
+          });
           const auditRef = await audit("sanctuary_events_read", { count: page.length });
           return toolResult({
-            events: page.map((entry, index) => redactEvent(entry, startOffset + index)),
+            events: page.map(({ entry, position }) => redactEvent(entry, position)),
             next_cursor: cursor.cursor_id,
             audit_ref: auditRef,
           });
