@@ -1,6 +1,6 @@
 {
   "name": "@sanctuary-framework/mcp-server",
-  "version": "1.9.0-rc.4",
+  "version": "1.9.0-rc.5",
   "mcpName": "ai.sanctuaryprotocol/sanctuary",
   "description": "Cooperative MCP policy gates and encrypted local state. macOS OS-level egress enforcement requires a separately installed and armed Castle Wall component. Linux enforcement: Ubuntu 24.04 x86-64 only, separate package. Wrapping and audit assurance remain partial; see the Assurance Matrix.",
   "homepage": "https://sanctuaryprotocol.ai",
