@@ -71,6 +71,11 @@ export interface LocalWorkerClientOptions {
    * refused as unknown, so a client built without it can never grant a job.
    */
   answerAuthority?: (requestId: string) => AuthorityReply;
+  /**
+   * Drop rows the server has not yet made durable for jobs a worker lost, across worker generations.
+   * Admission counts them with the jobs the current worker holds. Absent, there are none.
+   */
+  pendingDrops?: () => number;
 }
 
 function refuseUnknown(requestId: string): AuthorityReply {
@@ -112,6 +117,7 @@ export class LocalWorkerClient {
   private readonly spawnWorker: WorkerSpawn;
   private readonly onEvent: (event: WorkerClientEvent) => void;
   private readonly answerAuthority: (requestId: string) => AuthorityReply;
+  private readonly pendingDrops: () => number;
   private child: ChildProcess | undefined;
   private currentState: WorkerState | "state_CLOSED" = "state_DEAD";
   private backoffMs = WORKER_RESPAWN_INITIAL_MS;
@@ -160,6 +166,7 @@ export class LocalWorkerClient {
     this.spawnWorker = options.spawn ?? fork;
     this.onEvent = options.onEvent ?? (() => undefined);
     this.answerAuthority = options.answerAuthority ?? refuseUnknown;
+    this.pendingDrops = options.pendingDrops ?? (() => 0);
   }
 
   get state(): WorkerState | "state_CLOSED" {
@@ -200,7 +207,9 @@ export class LocalWorkerClient {
     assertSendable("to_worker", job);
     const child = this.sendableChild();
     if (child === undefined) return "unavailable";
-    if (this.outstanding.size >= WORKER_QUEUE_MAX) return "queue_full";
+    // Jobs the worker holds and drop rows not yet durable together never exceed the seat cap, across
+    // worker generations: a lost job moves from the first count to the second, so the sum never grows.
+    if (this.outstanding.size + this.pendingDrops() >= WORKER_QUEUE_MAX) return "queue_full";
     if (!this.write(child, job)) return "unavailable";
     this.outstanding.add(job.request_id);
     return "sent";

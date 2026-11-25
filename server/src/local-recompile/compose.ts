@@ -187,6 +187,8 @@ export async function composeLocalTask(input: ComposeLocalTaskInput): Promise<Co
       ...(spawn ? { spawn } : {}),
       ...(test?.workerLimits ? { limits: test.workerLimits } : {}),
       answerAuthority: (requestId) => authority.reply(requestId),
+      // The drop rows still in flight share the worker's seat cap, so lostDrops is bounded by it.
+      pendingDrops: () => lostDrops.size,
       onEvent: (event) => {
         if (event.type === "status") queueDepth = event.status.queue_depth;
         // A worker that is not ready holds no queue: a dead, closed or respawning worker reports zero.
