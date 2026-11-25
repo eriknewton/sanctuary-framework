@@ -111,13 +111,13 @@ function acceptJob(job: LocalTaskJob): void {
   // Every job this worker reads ends with an operator row: one that arrives before the queue is open
   // is dropped with a fixed cause, never ignored.
   if (jobs === undefined || state !== "state_READY") {
-    void dropJob(job.request_id, "worker_unavailable");
+    dropJob(job.request_id, "worker_unavailable").catch(() => undefined);
     return;
   }
   const offered = jobs.offer(job);
   // A full queue or seat drops the job on the operator side only; the agent was answered long ago.
   if (!offered.queued) {
-    void dropJob(job.request_id, offered.cause);
+    dropJob(job.request_id, offered.cause).catch(() => undefined);
     return;
   }
   appendRow("job_queued", { request_id: job.request_id, queue_depth: offered.depth }).catch(() => undefined);
