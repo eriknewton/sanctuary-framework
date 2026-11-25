@@ -19,6 +19,7 @@ import { SIEM_EXPORT_FORMATS } from "../../src/audit/siem-tools.js";
 import { AGENT_AUDIT_READ_MAX_LIMIT } from "../../src/operational/agent-audit-redaction.js";
 import { INTERNAL_SIGNING_DOMAIN_PREFIXES } from "../../src/core/signing-domains.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { buildAuditDigest } from "../../src/principal-policy/posture.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 import { expectedRefusal } from "../helpers/expected-refusal.js";
 
@@ -351,6 +352,63 @@ describe("the agent audit read ceiling", () => {
     const exported = body(await succeed(world, "audit_export_siem", { format: "ocsf", limit: 5_000 }));
     expect(exported.count).toBe(CEILING);
     expect(AGENT_AUDIT_READ_MAX_LIMIT).toBe(CEILING);
+  }, 240_000);
+});
+
+describe("monitor_health across refusals and markers", () => {
+  it("storage_bytes is the same before and after every refusal in the set, and after a successful call's marker", async () => {
+    const world = await boot();
+    const storageBytes = async () => body(await succeed(world, "monitor_health", {})).storage_bytes;
+    for (const c of CASES) {
+      await c.setup(world);
+      const before = await storageBytes();
+      expect(await c.measured(world)).toEqual(expectedRefusal());
+      expect(await storageBytes(), c.label).toBe(before);
+    }
+    // A successful call that writes only audit rows, so its marker is the one change to measure.
+    const before = await storageBytes();
+    await succeed(world, "sanctuary_audit_search", { query: MATCH_EVERY_ROW, limit: AUDIT_SEARCH_MAX_LIMIT });
+    await world.app.auditLog.flush();
+    expect((await operatorRows(world)).length).toBeGreaterThan(0);
+    expect(await storageBytes()).toBe(before);
+  }, 240_000);
+});
+
+describe("audit-failure rows in agent readers", () => {
+  it("monitor_audit_log and every SIEM format never surface an error_class from an audit-failure row", async () => {
+    const world = await boot();
+    const sentinel = "SentinelAuditWriteErrorClass";
+    // Must match the `${operation}_audit_failed` rows with an error_class detail in sdw/memory-file-tools.ts.
+    await world.app.auditLog.append("l2", "sdw_memory_file_audit_failed", world.identityId, { error_class: sentinel }, "failure");
+    await world.app.auditLog.flush();
+    const monitored = await succeed(world, "monitor_audit_log", { limit: 1_000 });
+    expect((body(monitored).entries as Array<{ operation: string }>).map((e) => e.operation)).toContain("sdw_memory_file_audit_failed");
+    const texts = [JSON.stringify(monitored)];
+    for (const format of SIEM_EXPORT_FORMATS) texts.push(JSON.stringify(await succeed(world, "audit_export_siem", { format, limit: 1_000 })));
+    for (const text of texts) {
+      expect(text).not.toContain(sentinel);
+      expect(text).not.toContain("error_class");
+    }
+  }, 240_000);
+});
+
+describe("the operator dashboard's activity counts", () => {
+  it("a refused call and a success marker leave the operator digest's activity counts as the operator rows give them", async () => {
+    const world = await boot();
+    const digest = () => buildAuditDigest({ auditLog: world.app.auditLog, originMachine: "fortress:test", protectionClaimSubject: null, now: Date.now() });
+    const operatorTotal = async () => { await world.app.auditLog.flush(); return (await world.app.auditLog.query({ limit: 100_000 })).total; };
+    const start = await digest();
+    const startRows = await operatorTotal();
+    // A refused call: its rows stay operator activity.
+    expect(await call(world, "sanctuary_recall", { key: "never-written" })).toEqual(expectedRefusal());
+    await succeed(world, "sanctuary_remember", { key: "counted", value: "v" });
+    const end = await digest();
+    const endRows = await operatorTotal();
+    expect(end.total_operations - start.total_operations).toBe(endRows - startRows);
+    const markers = (await world.app.auditLog.query({ limit: 100_000, include_outcome_markers: true })).entries
+      .filter((e) => e.operation === CALL_OUTCOME_SUCCESS_OPERATION).length;
+    expect(markers).toBeGreaterThan(0);
+    expect(end.by_agent.reduce((n, row) => n + row.operations, 0)).toBe(end.total_operations);
   }, 240_000);
 });
 

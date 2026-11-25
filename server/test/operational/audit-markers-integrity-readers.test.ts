@@ -23,6 +23,7 @@ import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
 import { exportExitBundle } from "../../src/exit/index.js";
 import { buildAuditDigest } from "../../src/principal-policy/posture.js";
+import { computeAuditPeriodSummary } from "../../src/compliance/eu_ai_act/generator.js";
 
 const temps: string[] = [];
 afterEach(async () => {
@@ -84,5 +85,23 @@ describe("integrity readers count success markers", () => {
     await successfulCall(auditLog, "more_activity");
     const digest = await buildAuditDigest({ auditLog, originMachine: "fortress:test", protectionClaimSubject: null, now });
     expect(digest).toMatchObject({ window_complete: true, window_incomplete_reason: null });
+  });
+});
+
+describe("the approved compliance bundle's counts", () => {
+  it("the period summary counts the same with and without a success marker in the log", async () => {
+    const periodStart = new Date(Date.now() - 60_000).toISOString();
+    const periodEnd = new Date(Date.now() + 60_000).toISOString();
+    const withMarker = new AuditLog(new MemoryStorage(), generateRandomKey());
+    await successfulCall(withMarker, "own_activity");
+    const withoutMarker = new AuditLog(new MemoryStorage(), generateRandomKey());
+    await withoutMarker.append("l2", "own_activity", "agent:one");
+    await withoutMarker.flush();
+    const a = await computeAuditPeriodSummary(withMarker, periodStart, periodEnd);
+    const b = await computeAuditPeriodSummary(withoutMarker, periodStart, periodEnd);
+    const { period_start: _a1, period_end: _a2, ...countsA } = a;
+    const { period_start: _b1, period_end: _b2, ...countsB } = b;
+    expect(countsA).toEqual(countsB);
+    expect(a.unique_operations).not.toContain(CALL_OUTCOME_SUCCESS_OPERATION);
   });
 });

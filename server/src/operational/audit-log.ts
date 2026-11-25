@@ -3606,6 +3606,7 @@ export class AuditLog {
 
   /** Number of oldest entries to prune to bring `metas` (key-sorted ascending)
    * back under the count and size limits. 0 when within budget. */
+  // DEBT(AGENT-SEAT-RETENTION-PRESSURE): retention counts every stored row alike, including rows agent readers do not return.
   private rotationDeleteCount(metas: readonly { size_bytes: number }[]): number {
     const totalSize = metas.reduce((sum, m) => sum + m.size_bytes, 0);
     if (metas.length <= this.maxEntries && totalSize <= this.maxTotalSizeBytes) return 0;
