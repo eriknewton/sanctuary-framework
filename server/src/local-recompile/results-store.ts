@@ -127,7 +127,7 @@ export interface SweepSummary {
   repaired: number;
 }
 
-/** A commit refused because the job's deadline had passed when the results lock was held. Nothing was written. */
+/** A commit refused because the job's deadline had passed before its publication began. Nothing was published. */
 export class CommitDeadlineError extends LocalStoreError {
   constructor() {
     super("conflict");
@@ -242,8 +242,9 @@ export class LocalResultsStore {
       // A completion that arrives after the object left pending is discarded, never resurrected.
       if (current.state !== "pending") throw new LocalStoreError("conflict");
       const now = this.clock();
-      // Nothing commits once the job's deadline has passed. The clock is read while this lock is held,
-      // so a lock or fsync wait that outlasts the deadline refuses here rather than committing late.
+      // No stage starts and no publication begins after the job's deadline; a publication that began
+      // before it either completes or is indeterminate, never reported failed. The clock is read while
+      // this lock is held, so a lock or fsync wait that outlasts the deadline refuses here.
       if (now >= current.deadline) throw new CommitDeadlineError();
       // Past its deadline plus grace a pending object is indeterminate by rule, whether or not a sweep has run yet.
       if (now >= current.expires_at) throw new LocalStoreError("conflict");
@@ -257,6 +258,9 @@ export class LocalResultsStore {
       const bytes = objectBytes(next);
       // The committing entry stays in every index evictFor publishes, so its object is never unreachable.
       const kept = await this.evictFor(entries, bytes, 0, requestId);
+      // Eviction writes and waits, so the deadline is read again immediately before the first
+      // publication write: no publication begins after the job's deadline.
+      if (this.clock() >= current.deadline) throw new CommitDeadlineError();
       await this.log("result_committed", requestId);
       const updated = await this.replaceObject(kept, next, bytes);
       if (options.committedRow !== undefined) {

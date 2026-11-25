@@ -10,11 +10,11 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { LocalAuthority } from "../../src/local-recompile/authority.js";
 import type { QueuedJob } from "../../src/local-recompile/job-queue.js";
 import { LocalOplog, type OplogAppendKind, type OplogBodies } from "../../src/local-recompile/oplog.js";
-import { LocalResultsStore } from "../../src/local-recompile/results-store.js";
+import { CommitDeadlineError, CommitIndeterminateError, LocalResultsStore } from "../../src/local-recompile/results-store.js";
 import { runSummarizeJob, type GenerationClient, type SummarizeJobDependencies } from "../../src/local-recompile/summarize-job.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { StrictMemoryStorage, fixtureRequestId, fixtureStoreKeys } from "./__fixtures__/strict-memory-storage.js";
+import { FIXTURE_SEAT, StrictMemoryStorage, fixtureRequestId, fixtureStoreKeys } from "./__fixtures__/strict-memory-storage.js";
 
 const START = Date.UTC(2026, 0, 1);
 const DEADLINE_MS = 60_000;
@@ -109,7 +109,24 @@ async function world(options: { resultsMaxTotalBytes?: number } = {}) {
     const status = await oplog.status();
     return (await oplog.readRows(status.base_seq, status.rows)).filter((row) => "request_id" in row.body && row.body.request_id === fixtureRequestId(n));
   };
-  return { clock, results, oplog, deps, job, rows, calls };
+  return { clock, storage, results, oplog, deps, job, rows, calls };
+}
+
+// Room for one committed object of COMMIT_BODY_CHARS beside one pending object, never two committed ones,
+// so committing a second object must first evict the first.
+const ONE_COMMITTED_ONE_PENDING_BYTES = 2_000;
+// One committed body of this many characters fills most of the byte cap above.
+const COMMIT_BODY_CHARS = 1_000;
+
+/** A committed object (2) and an older-than-now pending object (1) whose commit must evict object 2. */
+async function commitNeedsEviction() {
+  const w = await world({ resultsMaxTotalBytes: ONE_COMMITTED_ONE_PENDING_BYTES });
+  const deadline = START + DEADLINE_MS;
+  await w.results.putPending({ request_id: fixtureRequestId(12), seat: FIXTURE_SEAT, kind: "summarize", deadline });
+  await w.results.markCommitted(fixtureRequestId(12), { summary: "b".repeat(COMMIT_BODY_CHARS) });
+  w.clock.now += 1;
+  await w.results.putPending({ request_id: fixtureRequestId(11), seat: FIXTURE_SEAT, kind: "summarize", deadline });
+  return { w, deadline };
 }
 
 describe("a summary job's deadline and commit", () => {
@@ -141,6 +158,20 @@ describe("a summary job's deadline and commit", () => {
     expect(kinds).not.toContain("result_committed");
     expect(kinds.at(-1)).toBe("job_failed");
     expect((await w.rows(2)).at(-1)!.body).toEqual({ request_id: fixtureRequestId(2), cause: "deadline" });
+  });
+
+  it("a deadline that passes while the commit makes room refuses before any publication write", async () => {
+    const { w, deadline } = await commitNeedsEviction();
+    // The clock reaches the deadline during the eviction the commit runs first, after the store's first check.
+    w.storage.beforeMutation = (call) => {
+      if (call.op === "delete" && call.key === `obj/${fixtureRequestId(12)}`) w.clock.now = deadline;
+    };
+    await expect(w.results.markCommitted(fixtureRequestId(11), { summary: "a".repeat(COMMIT_BODY_CHARS) }))
+      .rejects.toBeInstanceOf(CommitDeadlineError);
+    w.storage.beforeMutation = () => undefined;
+    expect(w.clock.now).toBe(deadline);
+    expect((await w.rows(11)).map((row) => row.kind)).not.toContain("result_committed");
+    expect((await w.results.get(fixtureRequestId(11), { includeUncommitted: true }))?.state).toBe("pending");
   });
 
   it("a job_committed append that fails never leaves a committed result beside a job_failed row", async () => {

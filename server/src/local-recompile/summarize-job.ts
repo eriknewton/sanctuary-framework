@@ -121,8 +121,8 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
   let keys: Uint8Array[] = [];
   let generating = false;
   const state = (next: JobState) => deps.reportState(id, next);
-  // No work starts and nothing commits once the job's deadline has passed: this runs at entry and
-  // before every stage, and the results store checks it again under its lock at commit.
+  // No stage starts and no publication begins after the job's deadline: this runs at entry and before
+  // every stage, and the results store checks it again under its lock, immediately before publication.
   const beforeDeadline = () => {
     if (deps.now() >= deadlineAt) throw new Failure("deadline");
   };
@@ -249,7 +249,7 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
         : summaries[0]!.text;
 
       state("state_COMMIT");
-      // Nothing commits once the deadline has passed: checked here, and again by the store under its lock.
+      // No publication begins after the deadline: checked here, and again by the store under its lock.
       if (abort.signal.aborted) throw new Failure("deadline");
       beforeDeadline();
       const body: LocalResultBody = {
