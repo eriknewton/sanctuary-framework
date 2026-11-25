@@ -8,7 +8,7 @@ import { state_BUNDLE_SELECT, state_SIGSTORE, rootIsStaleAt, VERIFIER_THRESHOLDS
 import { state_IDENTITY } from "../../src/verify-release/identity.js";
 import { state_STATEMENT } from "../../src/verify-release/statement.js";
 import type { BundleSelectEvidence, SigstoreEvidence } from "../../src/verify-release/evidence.js";
-import { denyAllNetwork, foreignSlsaBundle, slsaBundle184, trustedRootBytes } from "./helpers.js";
+import { attestations184, denyAllNetwork, foreignSlsaBundle, slsaBundle184, trustedRootBytes } from "./helpers.js";
 
 denyAllNetwork();
 
@@ -172,6 +172,19 @@ describe("trust material", () => {
   it("an unreadable or invalid root refuses", async () => {
     expect(await verify(slsaBundle184(), null)).toEqual({ ok: false, reason: "sigstore-invalid:TRUSTED_ROOT_UNAVAILABLE" });
     expect(await verify(slsaBundle184(), Buffer.from("{", "utf8"))).toEqual({ ok: false, reason: "sigstore-invalid:TRUSTED_ROOT_INVALID" });
+  });
+
+  it("a message-signature bundle refuses DSSE_REQUIRED", async () => {
+    const bundle = slsaBundle184();
+    const signature = bundle.dsseEnvelope.signatures[0].sig;
+    delete bundle.dsseEnvelope;
+    bundle.messageSignature = { messageDigest: { algorithm: "SHA2_256", digest: Buffer.alloc(32, 1).toString("base64") }, signature };
+    expect(await state_SIGSTORE({ state: "state_BUNDLE_SELECT", bundle } as BundleSelectEvidence, trustedRootBytes())).toEqual({ ok: false, reason: "sigstore-invalid:DSSE_REQUIRED" });
+  });
+
+  it("a bundle signed by a bare public key, like npm's publish attestation, refuses CERTIFICATE_REQUIRED", async () => {
+    const publish = attestations184().attestations.find(a => a.predicateType !== "https://slsa.dev/provenance/v1")!.bundle;
+    expect(await state_SIGSTORE({ state: "state_BUNDLE_SELECT", bundle: publish } as BundleSelectEvidence, trustedRootBytes())).toEqual({ ok: false, reason: "sigstore-invalid:CERTIFICATE_REQUIRED" });
   });
 
   it("a bundle the library cannot parse refuses", async () => {

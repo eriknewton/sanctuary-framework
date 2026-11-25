@@ -135,7 +135,7 @@ export function constructVerifiedVerdict(
   for (const [field, state] of Object.entries(REQUIRED_STATES)) {
     const item = (evidence as unknown as Record<string, AnyEvidence | undefined>)[field];
     // Evidence must be minted by a step for its own state; a look-alike object is refused.
-    if (item === undefined || item === null || !minted.has(item) || item.state !== state) {
+    if (typeof item !== "object" || item === null || !minted.has(item) || item.state !== state) {
       throw new IncompleteEvidenceError(field);
     }
   }

@@ -96,6 +96,10 @@ describe.each(RESOURCES)("faults at %s", resource => {
   });
   it("a Content-Length that is not a decimal integer refuses fetch-failed", async () => {
     expect(await run(resource, modelledRequester({ [url]: () => response(200, "abc", { "content-length": "3, 3" }) }))).toEqual({ ok: false, reason: `fetch-failed:${resource}` });
+    // Forms Number() would read as 3: only plain decimal digits are a length.
+    for (const length of ["+3", "3.0", " 3", "0x3"]) {
+      expect(await run(resource, modelledRequester({ [url]: () => response(200, "abc", { "content-length": length }) })), length).toEqual({ ok: false, reason: `fetch-failed:${resource}` });
+    }
     expect(await run(resource, async () => ({ status: 200, headers: { "content-length": ["3", "3"] as unknown as string }, body: trackedBody([Buffer.from("abc")]) }))).toEqual({ ok: false, reason: `fetch-failed:${resource}` });
   });
 });
@@ -143,6 +147,8 @@ describe("redirect policy", () => {
   it("manifest: a loop refuses", async () => {
     const requester = modelledRequester({ [MANIFEST_URL]: () => response(302, "", { location: ASSET }), [ASSET]: () => response(302, "", { location: ASSET }) });
     expect(await run("manifest", requester)).toEqual({ ok: false, reason: "fetch-redirect-refused:manifest" });
+    // The loop is caught on the repeat, not by running out of hops.
+    expect(requester.calls).toEqual([MANIFEST_URL, ASSET]);
   });
 
   it.each([
@@ -167,8 +173,13 @@ describe("redirect policy", () => {
 
   it("manifest: a redirect without Location, or with two, refuses", async () => {
     expect(await run("manifest", modelledRequester({ [MANIFEST_URL]: () => response(302) }))).toEqual({ ok: false, reason: "fetch-redirect-refused:manifest" });
-    const two = async () => ({ status: 302, headers: { location: [ASSET, ASSET] as unknown as string }, body: trackedBody([]) });
+    // Two Location values are refused outright, even when joining them would name an allowed host that answers.
+    let calls = 0;
+    const two = async () => (++calls === 1
+      ? { status: 302, headers: { location: [ASSET, ASSET] as unknown as string }, body: trackedBody([]) }
+      : response(200, "{}"));
     expect(await run("manifest", two)).toEqual({ ok: false, reason: "fetch-redirect-refused:manifest" });
+    expect(calls).toBe(1);
   });
 
   it("the redirect response body is destroyed", async () => {

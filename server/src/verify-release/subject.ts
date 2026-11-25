@@ -12,8 +12,6 @@ import type { ManifestVerificationResult } from "../release-manifest.js";
 
 const SHA512_BYTES = 64;
 const SHA512_HEX_PATTERN = /^[0-9a-f]{128}$/; // 128 = 2 hex characters x 64 bytes
-/** Canonical padded base64 of 64 bytes: 86 characters then `==`. */
-const SHA512_BASE64_PATTERN = /^[A-Za-z0-9+/]{86}==$/;
 const SRI_SHA512_PREFIX = "sha512-";
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/; // 64 = 2 hex characters x 32 bytes
 
@@ -21,8 +19,8 @@ const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/; // 64 = 2 hex characters x 32 bytes
 export function decodeSriSha512(integrity: unknown): Buffer | null {
   if (typeof integrity !== "string" || !integrity.startsWith(SRI_SHA512_PREFIX)) return null;
   const body = integrity.slice(SRI_SHA512_PREFIX.length);
-  // Any whitespace or second token makes the string ambiguous about which digest counts.
-  if (!SHA512_BASE64_PATTERN.test(body)) return null;
+  // Node's decoder is lenient, so the bytes must re-encode to exactly the input: a second token, whitespace,
+  // missing padding or non-zero padding bits would make the string ambiguous about which digest counts.
   const bytes = Buffer.from(body, "base64");
   return bytes.length === SHA512_BYTES && bytes.toString("base64") === body ? bytes : null;
 }
@@ -67,11 +65,11 @@ export function state_MANIFEST(
   const result = verify(manifest);
   if (!result.ok) return refuse("manifest-invalid");
   if (result.body.version !== version) return refuse("manifest-version-mismatch");
-  const names = Object.keys(result.body.artifact_hashes);
-  const expected = manifestArtifactName(version);
-  if (names.length !== 1 || names[0] !== expected) return refuse("manifest-invalid");
-  const signed = result.body.artifact_hashes[expected]!;
-  if (!SHA256_HEX_PATTERN.test(signed)) return refuse("manifest-invalid");
+  const hashes = result.body.artifact_hashes;
+  if (Object.keys(hashes).length !== 1) return refuse("manifest-invalid");
+  // The one listed artifact must be this tarball; a lookup under any other name finds nothing.
+  const signed = hashes[manifestArtifactName(version)];
+  if (signed === undefined || !SHA256_HEX_PATTERN.test(signed)) return refuse("manifest-invalid");
   const actual = createHash("sha256").update(tarball).digest("hex");
   if (signed !== actual) return refuse("manifest-digest-mismatch");
   return passed({ state: "state_MANIFEST", sha256: actual });

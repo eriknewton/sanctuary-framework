@@ -73,6 +73,78 @@ therefore reports a healthy fortress on a run where the deepest check never exec
 Read the `WARN` lines, or supply `SANCTUARY_PASSPHRASE` / `SANCTUARY_RECOVERY_KEY` so
 the identity check actually runs.
 
+## `sanctuary verify-release`
+
+Checks an install of `@sanctuary-framework/mcp-server` against the record that
+Sanctuary's release workflow published for that version, and says, in one
+screen, whether the install's files are exactly the published files.
+
+```bash
+sanctuary verify-release --target "$(npm root -g)/@sanctuary-framework/mcp-server"
+sanctuary verify-release --target <dir> --version 1.8.4 --json
+sanctuary verify-release            # checks this copy's own install for drift
+```
+
+Run it from a copy of Sanctuary you already trust, with `--target` pointing at the
+install you want to check. Without `--target` it checks its own install, which detects
+later file drift but is only as trustworthy as the copy running it: a modified copy can
+report itself unmodified.
+
+The version always comes from the target's own `package.json`. `--version` only
+confirms it; a different value refuses, so the command never compares one
+version's files with another version's records.
+
+It fetches four records for that version, and nothing else: the npm version
+document, npm's provenance attestations, the package tarball, and the
+`release-manifest.json` on the GitHub release `v<version>`. It makes no request
+unless you run it. Every check below must pass, in order:
+
+- the npm provenance is a valid Sigstore signature, checked offline against a
+  Sigstore trusted root committed with Sanctuary, with both an inclusion proof and a
+  signed entry timestamp from the transparency log;
+- the signing certificate names Sanctuary's release workflow (`publish-on-tag.yml`
+  on `main` of `eriknewton/sanctuary-framework`), on a GitHub-hosted runner,
+  started by manual dispatch, with the repository's and owner's numeric ids;
+- the signed provenance statement names the same build, and its one subject is the
+  fetched tarball's sha512, which also equals the registry's integrity string;
+- the release manifest verifies under Sanctuary's pinned release key and lists the
+  tarball's SHA-256;
+- the installed files are exactly the tarball's files.
+
+What it detects:
+
+- a package substituted at the registry, or by someone holding a stolen npm token;
+- provenance from another repository, another workflow, or a self-hosted runner;
+- a release manifest that is not signed by Sanctuary's pinned release key;
+- any added, removed or changed file in the checked install. It compares the
+  contents and normalized names of regular files and directories, excluding a
+  top-level `node_modules` folder and `.DS_Store` files.
+
+What it does not detect:
+
+- a malicious change to the release workflow on `main`, or misuse of the signing
+  secret by that workflow (both checks share GitHub workflow administration);
+- changes to dependencies under `node_modules`;
+- file modes, and the bin launchers npm writes outside the package;
+- a writer that changes files while the check runs.
+
+Exit codes: `0` verified, `3` refused (the reason is printed), `2` usage error,
+`1` internal error with no verdict. Human output prints the resolved target path,
+the version, one line per step and a verdict line. `--json` prints one object with
+`verdict`, `version`, `target`, `steps` and, on refusal, `reason`; `version` and
+`target` are `null` when the run stopped before they were known. Paths are printed
+with control and non-ASCII bytes escaped.
+
+Failure mode: a symlink, a hardlinked file or any special file inside the install
+refuses, even when its bytes would match, and so does any network failure. A refusal
+is never a pass with a warning: read the reason line. Pointing `--target` at a
+global install's `bin` folder, or at a folder above the package, refuses as an
+unreadable or mismatched target rather than checking the wrong tree.
+
+Requires Node.js `^22.22.2`, `^24.15.0` or `>=26.0.0`, the range of the Sigstore
+verification library it uses; on an older runtime it refuses with
+`runtime-unsupported` before loading that library.
+
 ## `sanctuary completion <bash|zsh|fish>`
 
 Prints shell completion to stdout:

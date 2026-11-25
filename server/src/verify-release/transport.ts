@@ -98,8 +98,9 @@ export async function fetchResource(
     const outcome = await requestOnce(url, policy, requester, deadline);
     if (outcome.kind === "refused") return { ok: false, reason: outcome.reason };
     if (outcome.kind === "body") return { ok: true, evidence: outcome.body };
-    // A redirect: only enumerated edges, bounded hops, each target revalidated in full at the loop top.
-    if (policy.redirectHosts.length === 0 || hop + 1 > MAX_REDIRECT_HOPS) return { ok: false, reason: redirectRefused };
+    // A redirect: only enumerated edges, bounded hops, each target revalidated in full at the loop top. A
+    // registry resource has no redirect hosts, so any redirect it receives fails that revalidation.
+    if (hop + 1 > MAX_REDIRECT_HOPS) return { ok: false, reason: redirectRefused };
     let next: URL;
     try {
       next = new URL(outcome.location, url);
@@ -203,10 +204,8 @@ function raceAbort(pending: Promise<RawResponse>, signal: AbortSignal): Promise<
     return Promise.reject(new Error("aborted"));
   }
   return new Promise<RawResponse>((resolve, reject) => {
-    const onAbort = (): void => {
-      pending.then(late => late.body.destroy(), () => undefined);
-      reject(new Error("aborted"));
-    };
+    // The resolution handler below destroys a response that arrives after the abort.
+    const onAbort = (): void => reject(new Error("aborted"));
     signal.addEventListener("abort", onAbort, { once: true });
     pending.then(
       value => {
@@ -243,7 +242,8 @@ async function* iterateWithAbort(body: AsyncIterable<Uint8Array>, signal: AbortS
     }
   } finally {
     signal.removeEventListener("abort", onAbort);
-    void iterator.return?.();
+    // Not awaited: a body stuck in a pending read never settles its return(); the caller destroys the body.
+    iterator.return?.()?.catch(() => undefined);
   }
 }
 

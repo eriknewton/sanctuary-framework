@@ -127,13 +127,13 @@ export async function state_SIGSTORE(
     return refuse("sigstore-invalid:BUNDLE_INVALID");
   }
   if (bundle.content.$case !== "dsseEnvelope") return refuse("sigstore-invalid:DSSE_REQUIRED");
-  const material = bundle.verificationMaterial.content.$case;
-  if (material !== "certificate" && material !== "x509CertificateChain") return refuse("sigstore-invalid:CERTIFICATE_REQUIRED");
   const entry = bundle.verificationMaterial.tlogEntries[0]!;
   const integratedTime = Number(entry.integratedTime);
   if (!Number.isSafeInteger(integratedTime) || integratedTime <= 0) return refuse("sigstore-invalid:INTEGRATED_TIME");
 
   const entity = toSignedEntity(bundle);
+  // Only a Fulcio certificate carries the workflow identity; a bare public key names no build.
+  if (entity.key.$case !== "certificate") return refuse("sigstore-invalid:CERTIFICATE_REQUIRED");
   try {
     new Verifier(trustMaterial, VERIFIER_THRESHOLDS).verify(entity);
   } catch (error) {
@@ -144,7 +144,6 @@ export async function state_SIGSTORE(
     if (rootIsStaleAt(windows, new Date(integratedTime * MS_PER_SECOND))) return refuse("trusted-root-stale");
     return refuse(`sigstore-invalid:${libraryCode(error)}`);
   }
-  if (entity.key.$case !== "certificate") return refuse("sigstore-invalid:CERTIFICATE_REQUIRED");
 
   // The identity adapter reads the SAME certificate object the verifier accepted.
   const certificate = certificateViewOf(entity.key.certificate);

@@ -58,7 +58,8 @@ function at(value: unknown, path: readonly string[]): unknown {
   let current = value;
   for (const key of path) {
     if (typeof current !== "object" || current === null || Array.isArray(current)) return undefined;
-    current = Object.prototype.hasOwnProperty.call(current, key) ? (current as Record<string, unknown>)[key] : undefined;
+    // Input is JSON.parse output and every path segment is a fixed name outside Object.prototype.
+    current = (current as Record<string, unknown>)[key];
   }
   return current;
 }

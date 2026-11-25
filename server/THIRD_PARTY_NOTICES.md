@@ -85,6 +85,17 @@ profile v1, a deliberately narrower grammar that uses SPDX 3.0.1 vocabulary.
    typecheck, lint, build, and packed ESM/CJS consumer tests. The normal
    `npm test` path also re-derives the table in `pretest` without network access.
 
+## Sigstore public-good trusted root
+
+`sanctuary verify-release` ships one data file from the Sigstore project:
+`dist/verify-release/trusted_root.json`, a byte-identical copy of
+`targets/trusted_root.json` from the `sigstore/root-signing` repository, captured
+on 2026-11-25. It holds public keys and certificates only. The repository is
+licensed under the Apache License, Version 2.0
+(`https://github.com/sigstore/root-signing/blob/main/LICENSE`). Source, capture
+time, sha256 and each key's validity window are in
+`server/src/verify-release/README.md`.
+
 ## Bundled console fonts (SIL Open Font License 1.1)
 
 The web console embeds three typefaces as inline woff2 data in

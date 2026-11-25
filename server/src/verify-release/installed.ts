@@ -57,8 +57,8 @@ async function hashInstalledFile(path: Buffer, key: string, expected: ArchiveFil
       if (total > expected.size) throw new Refused(withPath("installed-file-differs", key));
       hash.update(buffer.subarray(0, bytesRead));
     }
-    const digest = hash.digest();
-    if (total !== expected.size || !timingSafeEqual(digest, Buffer.from(expected.sha256, "hex"))) {
+    // A shorter file has another sha256, so the digest comparison covers size too.
+    if (!timingSafeEqual(hash.digest(), Buffer.from(expected.sha256, "hex"))) {
       throw new Refused(withPath("installed-file-differs", key));
     }
   } catch (error) {
@@ -72,7 +72,6 @@ async function hashInstalledFile(path: Buffer, key: string, expected: ArchiveFil
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 export async function state_INSTALLED(root: string, archive: ArchiveEvidence, deadline: Deadline): Promise<StepOutcome<InstalledEvidence>> {
-  const seenKeys = new Set<string>();
   const seenFolds = new Set<string>();
   const seenFiles = new Set<string>();
   const seenDirectories = new Set<string>();
@@ -86,7 +85,6 @@ export async function state_INSTALLED(root: string, archive: ArchiveEvidence, de
     }
     entries.sort((a, b) => Buffer.compare(a.name, b.name));
     for (const entry of entries) {
-      if (deadline.expired()) throw new Refused("deadline-exceeded");
       let name: string;
       try {
         name = nfc(decoder.decode(entry.name));
@@ -96,9 +94,9 @@ export async function state_INSTALLED(root: string, archive: ArchiveEvidence, de
       }
       const key = prefix + name;
       // Two names with one NFC form, or one case-folded form, would be one path somewhere; both are collisions.
+      // The fold is taken over the NFC key, so equal keys always fold equal.
       const folded = simpleFold(key);
-      if (seenKeys.has(key) || seenFolds.has(folded)) throw new Refused(withPath("installed-name-collision", key));
-      seenKeys.add(key);
+      if (seenFolds.has(folded)) throw new Refused(withPath("installed-name-collision", key));
       seenFolds.add(folded);
       const path = Buffer.from(join(directory.toString("latin1"), entry.name.toString("latin1")), "latin1");
       const folds = simpleFold(name);
@@ -138,6 +136,5 @@ export async function state_INSTALLED(root: string, archive: ArchiveEvidence, de
     ...[...archive.directories].filter(key => !seenDirectories.has(key)),
   ].sort();
   if (missing.length > 0) return refuse(withPath("installed-file-missing", missing[0]!));
-  if (deadline.expired()) return refuse("deadline-exceeded");
   return passed({ state: "state_INSTALLED", fileCount: seenFiles.size });
 }

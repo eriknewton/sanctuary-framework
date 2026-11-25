@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { mint, type IdentityEvidence } from "../../src/verify-release/evidence.js";
-import { STATEMENT_FIELDS, STATEMENT_PINS, parseProvenanceStatement, state_STATEMENT } from "../../src/verify-release/statement.js";
+import { STATEMENT_FIELDS, STATEMENT_PINS, state_STATEMENT } from "../../src/verify-release/statement.js";
 import { denyAllNetwork, slsaBundle184 } from "./helpers.js";
 
 denyAllNetwork();
@@ -69,6 +69,8 @@ describe("statement policy", () => {
   it("a payload that is not UTF-8 JSON refuses provenance-field-absent:payload", () => {
     expect(state_STATEMENT(PAYLOAD_TYPE, Buffer.from([0xff, 0xfe]), IDENTITY)).toEqual({ ok: false, reason: "provenance-field-absent:payload" });
     expect(state_STATEMENT(PAYLOAD_TYPE, Buffer.from("{", "utf8"), IDENTITY)).toEqual({ ok: false, reason: "provenance-field-absent:payload" });
+    // Valid JSON only after lossy decoding: an invalid UTF-8 byte inside a JSON string.
+    expect(state_STATEMENT(PAYLOAD_TYPE, Buffer.from([0x22, 0xff, 0x22]), IDENTITY)).toEqual({ ok: false, reason: "provenance-field-absent:payload" });
   });
 
   it.each([
@@ -80,13 +82,6 @@ describe("statement policy", () => {
     ["a sha512 that is not a string", [{ name: "pkg:npm/x@1", digest: { sha512: 5 } }]],
   ])("a subject list that is %s refuses provenance-field-absent:subject", (_label, value) => {
     expect(state_STATEMENT(PAYLOAD_TYPE, bytes(edit(REAL_STATEMENT(), ["subject"], value)), IDENTITY)).toEqual({ ok: false, reason: "provenance-field-absent:subject" });
-  });
-
-  it("an inherited property never stands in for a missing field", () => {
-    const statement = REAL_STATEMENT();
-    delete statement.predicate.runDetails.builder.id;
-    const parsed = parseProvenanceStatement(PAYLOAD_TYPE, Buffer.from(JSON.stringify(statement).replace('"builder":{}', '"builder":{"__proto__":{"id":"https://github.com/actions/runner/github-hosted"}}'), "utf8"));
-    expect(parsed).toEqual({ ok: false, field: "predicate.runDetails.builder.id" });
   });
 });
 

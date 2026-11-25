@@ -9,6 +9,7 @@
  * committed windows refuses as `trusted-root-stale`.
  */
 
+import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,13 +43,14 @@ export async function readTrustedRootBytes(path?: string): Promise<Buffer | null
   let handle: Awaited<ReturnType<typeof open>>;
   try {
     // A CommonJS build has no file URL for this module, so the root cannot be located there; that refuses.
-    handle = await open(path ?? resolveTrustedRootPath(), "r");
+    handle = await open(path ?? resolveTrustedRootPath(), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
   } catch {
     return null;
   }
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_TRUSTED_ROOT_BYTES) return null;
+    if (!stat.isFile()) return null;
+    // One bounded read: a file that grows after the fstat still cannot exceed the cap.
     const buffer = Buffer.alloc(MAX_TRUSTED_ROOT_BYTES + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (bytesRead > MAX_TRUSTED_ROOT_BYTES) return null;

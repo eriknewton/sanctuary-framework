@@ -36,7 +36,8 @@ async function readPackageJson(root: string): Promise<Buffer | null> {
   }
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_PACKAGE_JSON_BYTES) return null;
+    if (!stat.isFile()) return null;
+    // One bounded read: a file that grows after the fstat still cannot exceed the cap.
     const buffer = Buffer.alloc(MAX_PACKAGE_JSON_BYTES + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     return bytesRead > MAX_PACKAGE_JSON_BYTES ? null : buffer.subarray(0, bytesRead);

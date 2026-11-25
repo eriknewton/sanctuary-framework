@@ -3,6 +3,7 @@
  * from, the only trust-material construction, and the absence of any Sigstore
  * client in the verifier.
  */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -67,7 +68,7 @@ describe("committed trusted root", () => {
     }
   });
 
-  it("the reader refuses a missing file, a directory, an oversize file and a symlink to a directory", async () => {
+  it("the reader refuses a missing file, a directory, an oversize file, a symlink to a directory and a FIFO", async () => {
     const dir = mkdtempSync(join(tmpdir(), "vr-root-"));
     try {
       expect(await readTrustedRootBytes(join(dir, "absent.json"))).toBeNull();
@@ -77,6 +78,8 @@ describe("committed trusted root", () => {
       expect(await readTrustedRootBytes(join(dir, "big.json"))).toBeNull();
       symlinkSync(join(dir, "folder"), join(dir, "link"));
       expect(await readTrustedRootBytes(join(dir, "link"))).toBeNull();
+      expect(spawnSync("mkfifo", [join(dir, "fifo")]).status).toBe(0);
+      expect(await readTrustedRootBytes(join(dir, "fifo"))).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

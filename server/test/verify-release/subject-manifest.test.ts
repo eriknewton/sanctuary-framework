@@ -56,6 +56,8 @@ describe("subject", () => {
   it.each([
     ["two tokens", `${SRI} ${SRI}`],
     ["a sha256 token", `sha256-${Buffer.alloc(32).toString("base64")}`],
+    ["another algorithm's prefix over 64 bytes", `sha256-${sha512(TARBALL).toString("base64")}`],
+    ["a sha512 prefix over 32 bytes", `sha512-${Buffer.alloc(32, 7).toString("base64")}`],
     ["unpadded base64", SRI.replace(/==$/, "")],
     ["a non-canonical last character", `${SRI.slice(0, -3)}B==`],
     ["missing", undefined],
