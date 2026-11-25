@@ -12,7 +12,7 @@ import { LOCAL_CALL_TIMEOUT_MS, SensitiveGenerationClient } from "../intelligenc
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { LocalJobQueue } from "./job-queue.js";
 import { JOB_DEADLINE_MS } from "./limits.js";
-import { LocalOplog, type OplogAppendKind, type OplogBodies } from "./oplog.js";
+import { LocalOplog, type JobDropCause, type OplogAppendKind, type OplogBodies } from "./oplog.js";
 import { HOUSEKEEPING_INTERVAL_MS, LocalResultsStore } from "./results-store.js";
 import { runSummarizeJob } from "./summarize-job.js";
 import {
@@ -82,13 +82,28 @@ function acceptAuthorityReply(reply: AuthorityReply): void {
   waiting(reply);
 }
 
-/** Tell the server a job reached a state; a terminal state ends the server's watch for that job. */
-function reportJobState(requestId: string, jobState: JobState): void {
+/**
+ * Tell the server a job reached a state; a terminal state ends the server's watch for that job. A
+ * terminal state is sent only once its operator row has settled, and `rowWritten` false names a row
+ * that did not become durable, so the server writes it. Must match the job_state shape in worker-protocol.ts.
+ */
+function reportJobState(requestId: string, jobState: JobState, rowWritten = true): void {
   try {
-    send({ type: "job_state", request_id: requestId, state: jobState });
+    send({ type: "job_state", request_id: requestId, state: jobState, ...(rowWritten ? {} : { row_written: false }) });
   } catch {
     // The live view is best effort; the operator log is the record.
   }
+}
+
+/** Drop one job: its terminal state is reported only after its job_dropped row has settled. */
+async function dropJob(requestId: string, cause: JobDropCause): Promise<void> {
+  let rowWritten = true;
+  try {
+    await appendRow("job_dropped", { request_id: requestId, cause });
+  } catch {
+    rowWritten = false;
+  }
+  reportJobState(requestId, "state_REFUSED", rowWritten);
 }
 
 function acceptJob(job: LocalTaskJob): void {
@@ -96,15 +111,13 @@ function acceptJob(job: LocalTaskJob): void {
   // Every job this worker reads ends with an operator row: one that arrives before the queue is open
   // is dropped with a fixed cause, never ignored.
   if (jobs === undefined || state !== "state_READY") {
-    appendRow("job_dropped", { request_id: job.request_id, cause: "worker_unavailable" }).catch(() => undefined);
-    reportJobState(job.request_id, "state_REFUSED");
+    void dropJob(job.request_id, "worker_unavailable");
     return;
   }
   const offered = jobs.offer(job);
   // A full queue or seat drops the job on the operator side only; the agent was answered long ago.
   if (!offered.queued) {
-    appendRow("job_dropped", { request_id: job.request_id, cause: offered.cause }).catch(() => undefined);
-    reportJobState(job.request_id, "state_REFUSED");
+    void dropJob(job.request_id, offered.cause);
     return;
   }
   appendRow("job_queued", { request_id: job.request_id, queue_depth: offered.depth }).catch(() => undefined);

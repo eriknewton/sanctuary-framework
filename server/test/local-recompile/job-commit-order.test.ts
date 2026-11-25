@@ -283,6 +283,35 @@ describe("a summary job's deadline and commit", () => {
     expect((await w.rows(4)).map((row) => row.kind).slice(-2)).toEqual(["result_committed", "job_committed"]);
   });
 
+  it("a refused job reports its terminal state only after its terminal row is durable", async () => {
+    const w = await world();
+    const durable: string[] = [];
+    const reported: Array<{ state: string; rowWritten: boolean | undefined; durable: string[] }> = [];
+    const deps = w.deps({
+      log: async (kind, body) => {
+        const row = await w.oplog.append(kind, body);
+        durable.push(kind);
+        return row;
+      },
+      reportState: (_id, state, rowWritten) => reported.push({ state, rowWritten, durable: [...durable] }),
+    });
+    expect(await runSummarizeJob(w.job(8, START - DEADLINE_MS - 1), deps)).toBe("state_REFUSED");
+    expect(reported).toEqual([{ state: "state_REFUSED", rowWritten: true, durable: ["job_failed"] }]);
+  });
+
+  it("a refused job whose terminal row fails reports the row as unwritten", async () => {
+    const w = await world();
+    const reported: Array<{ state: string; rowWritten: boolean | undefined }> = [];
+    const deps = w.deps({
+      log: async () => {
+        throw new Error("injected append failure");
+      },
+      reportState: (_id, state, rowWritten) => reported.push({ state, rowWritten }),
+    });
+    expect(await runSummarizeJob(w.job(9, START - DEADLINE_MS - 1), deps)).toBe("state_REFUSED");
+    expect(reported).toEqual([{ state: "state_REFUSED", rowWritten: false }]);
+  });
+
   it("a results store with no room fails the job as results_full and makes no model call", async () => {
     // A cap smaller than one pending object: the store refuses the reservation outright.
     const w = await world({ resultsMaxTotalBytes: 1 });

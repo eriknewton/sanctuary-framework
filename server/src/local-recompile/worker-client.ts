@@ -364,7 +364,13 @@ export class LocalWorkerClient {
     } else if (message.type === "status") {
       this.onEvent({ type: "status", status: message });
     } else if (message.type === "job_state") {
-      if (TERMINAL_JOB_STATES.has(message.state)) this.outstanding.delete(message.request_id);
+      if (TERMINAL_JOB_STATES.has(message.state)) {
+        // The parent forgets a job only once its terminal row is durable or the parent has taken over
+        // writing it: a row the worker reports unwritten is released through jobs_lost, which writes it.
+        // row_written must match the job_state shape in worker-protocol.ts.
+        const watched = this.outstanding.delete(message.request_id);
+        if (watched && message.row_written === false) this.onEvent({ type: "jobs_lost", request_ids: [message.request_id] });
+      }
       this.onEvent({ type: "job_state", request_id: message.request_id, state: message.state });
     } else if (message.type === "authority_request") {
       // Answered on a later turn of the event loop, so it never shares a turn with an agent call.

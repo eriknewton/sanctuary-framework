@@ -163,7 +163,12 @@ export type ParentMessage =
 export type WorkerMessage =
   | { type: "ready" }
   | { type: "authority_request"; request_id: string }
-  | { type: "job_state"; request_id: string; state: JobState }
+  /**
+   * `row_written: false` on a terminal state says the worker could not make the job's terminal row
+   * durable, so the parent writes it; absent or true, the row is durable. Must match reportJobState in
+   * worker-entry.ts and the job_state handling in worker-client.ts onMessage.
+   */
+  | { type: "job_state"; request_id: string; state: JobState; row_written?: boolean }
   | { type: "status"; state: WorkerState; env_names: string[]; exec_argv: string[]; queue_depth: number }
   | { type: "fault"; kind: WorkerFaultKind };
 
@@ -331,11 +336,23 @@ export function parseWorkerMessage(value: unknown): WorkerMessage | null {
   switch (message.type) {
     case "ready":
       return exactKeys(message, ["type"]) ? { type: "ready" } : null;
-    case "job_state":
-      return exactKeys(message, ["type", "request_id", "state"]) && isRequestId(message.request_id) &&
-        JOB_STATES.some((state) => state === message.state)
-        ? { type: "job_state", request_id: message.request_id, state: message.state as JobState }
-        : null;
+    case "job_state": {
+      const rowField = Object.hasOwn(message, "row_written");
+      if (
+        !exactKeys(message, rowField ? ["type", "request_id", "state", "row_written"] : ["type", "request_id", "state"]) ||
+        !isRequestId(message.request_id) ||
+        !JOB_STATES.some((state) => state === message.state) ||
+        (rowField && typeof message.row_written !== "boolean")
+      ) {
+        return null;
+      }
+      return {
+        type: "job_state",
+        request_id: message.request_id,
+        state: message.state as JobState,
+        ...(rowField ? { row_written: message.row_written as boolean } : {}),
+      };
+    }
     case "authority_request":
       return exactKeys(message, ["type", "request_id"]) && isRequestId(message.request_id)
         ? { type: "authority_request", request_id: message.request_id }

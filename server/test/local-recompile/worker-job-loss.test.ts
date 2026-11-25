@@ -1,14 +1,17 @@
 // Every accepted job ends with an operator row, through the real server and worker processes.
-import { fork, type ChildProcess } from "node:child_process";
+import { fork, type ChildProcess, type ForkOptions } from "node:child_process";
 import { once } from "node:events";
+import { existsSync } from "node:fs";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LocalOplog, type OplogRow } from "../../src/local-recompile/oplog.js";
 import { LocalResultsStore } from "../../src/local-recompile/results-store.js";
 import { deriveLocalStoreKeys } from "../../src/local-recompile/store-keys.js";
 import { LocalWorkerClient, resolveWorkerModule } from "../../src/local-recompile/worker-client.js";
+import { acceptMessage } from "../../src/local-recompile/worker-protocol.js";
 import { LOCAL_RESULTS_NAMESPACE, withLocalStoreLock } from "../../src/local-recompile/store-record.js";
 import { CROSS_PROCESS_LOCK_TIMEOUT_MS, resolveCustodyLockRoot } from "../../src/storage/cross-process-lock.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -30,6 +33,9 @@ const LOCK_HOLD_MAX_MS = CROSS_PROCESS_LOCK_TIMEOUT_MS / 2;
 const TEST_TIMEOUT_MS = 180_000;
 const LOCK_ROOT = resolveCustodyLockRoot(process.getuid!(), { env: process.env, platform: process.platform });
 const RECORD = { namespace: "notes", key: "one", value: "short note about the plan" };
+const DROP_CHILD = fileURLToPath(new URL("./__fixtures__/worker-drop-child.ts", import.meta.url));
+// Long enough for a terminal state the worker sent to reach the server, and for a late duplicate row to land.
+const SETTLE_MS = 1_000;
 
 const env = { ...process.env };
 const worlds: World[] = [];
@@ -96,6 +102,28 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await new Promise((resolve) => setTimeout(resolve, POLL_MS));
   }
+}
+
+/** The worker spawn seam, running the real worker under the drop fixture in `mode`. */
+async function dropChild(mode: "hold" | "fail" | "plain"): Promise<{ marker: string; spawnWorker: (modulePath: string, args: string[], options: ForkOptions) => ChildProcess }> {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "lr1b-drop-")));
+  dirs.push(dir);
+  const marker = join(dir, "drop-started");
+  return { marker, spawnWorker: (_modulePath, _args, options) => fork(DROP_CHILD, [mode, marker], options) };
+}
+
+async function dropRows(w: World, requestId: string): Promise<OplogRow[]> {
+  return (await operatorRows(w)).filter((row) => row.kind === "job_dropped" && "request_id" in row.body && row.body.request_id === requestId);
+}
+
+/** The job's drop rows once at least one is durable, or none after ROW_WAIT_MS; then a settle for late duplicates. */
+async function settledDropRows(w: World, requestId: string): Promise<OplogRow[]> {
+  const deadline = Date.now() + ROW_WAIT_MS;
+  while ((await dropRows(w, requestId)).length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+  await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+  return dropRows(w, requestId);
 }
 
 type WriteFn = (child: ChildProcess, message: { type: string }) => boolean;
@@ -190,6 +218,46 @@ describe("an accepted job always ends with an operator row", () => {
     });
     const id = await submit(w);
     expect(await endRow(w, id)).toMatchObject({ kind: "job_refused", body: { request_id: id, cause: "request_unknown" } });
+  }, TEST_TIMEOUT_MS);
+});
+
+describe("a terminal state is reported only after its operator row has settled", () => {
+  it("the job_state shape carries row_written only as a boolean", () => {
+    const base = { type: "job_state", request_id: "ab".repeat(16), state: "state_REFUSED" };
+    expect(acceptMessage("to_parent", base)).toEqual(base);
+    expect(acceptMessage("to_parent", { ...base, row_written: false })).toEqual({ ...base, row_written: false });
+    expect(acceptMessage("to_parent", { ...base, row_written: true })).toEqual({ ...base, row_written: true });
+    expect(acceptMessage("to_parent", { ...base, row_written: "false" })).toBeNull();
+    expect(acceptMessage("to_parent", { ...base, row_written: false, extra: 1 })).toBeNull();
+  });
+
+  it("a drop whose row is still in flight when the worker dies is held by the server and written on exit", async () => {
+    const drop = await dropChild("hold");
+    const w = await world({ unarmed: true, seams: { spawnWorker: drop.spawnWorker } });
+    const id = await submit(w);
+    await until(() => existsSync(drop.marker), "the drop append to start");
+    // A terminal state the worker had sent would reach the server in this time.
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+    process.kill(localTaskPid(w.server.runtime)!, "SIGKILL");
+    expect((await settledDropRows(w, id)).map((row) => row.body)).toEqual([{ request_id: id, cause: "worker_unavailable" }]);
+  }, TEST_TIMEOUT_MS);
+
+  it("a drop whose row fails is written once by the server", async () => {
+    const drop = await dropChild("fail");
+    const w = await world({ unarmed: true, seams: { spawnWorker: drop.spawnWorker } });
+    const id = await submit(w);
+    expect((await settledDropRows(w, id)).map((row) => row.body)).toEqual([{ request_id: id, cause: "worker_unavailable" }]);
+  }, TEST_TIMEOUT_MS);
+
+  it("a drop whose row is durable is written once, by the worker, and not again when the worker dies", async () => {
+    const drop = await dropChild("plain");
+    const w = await world({ unarmed: true, seams: { spawnWorker: drop.spawnWorker } });
+    const firstPid = localTaskPid(w.server.runtime);
+    const id = await submit(w);
+    expect((await settledDropRows(w, id)).map((row) => row.body)).toEqual([{ request_id: id, cause: "queue_full" }]);
+    process.kill(firstPid!, "SIGKILL");
+    await until(() => w.server.runtime.localTask.workerState() === "state_READY" && localTaskPid(w.server.runtime) !== firstPid, "respawn");
+    expect((await settledDropRows(w, id)).map((row) => row.body)).toEqual([{ request_id: id, cause: "queue_full" }]);
   }, TEST_TIMEOUT_MS);
 });
 

@@ -76,7 +76,8 @@ export interface SummarizeJobDependencies {
   markCommitted(requestId: string, body: LocalResultBody, committedRow: () => Promise<unknown>): Promise<unknown>;
   /** Ask the server for this job's authority; null when no reply arrives in time. */
   requestAuthority(requestId: string): Promise<AuthorityReply | null>;
-  reportState(requestId: string, state: JobState): void;
+  /** `rowWritten` false on a terminal state: the job's terminal row did not become durable. */
+  reportState(requestId: string, state: JobState, rowWritten?: boolean): void;
   /** The only way this job reaches a model: the loopback client bound to the descriptor's literal endpoint. */
   makeClient(target: LoopbackConnectTarget, timeoutMs: number): GenerationClient;
   callTimeoutMs: number;
@@ -286,7 +287,9 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
       deps.clearTimer(timer);
     }
   } catch (error) {
-    state("state_REFUSED");
+    // The terminal state is reported only after its row has settled, so the server never forgets a
+    // job whose row is still in flight; a row that failed is reported so the server writes it.
+    let rowWritten = true;
     try {
       if (error instanceof Refusal) {
         await deps.log("job_refused", { request_id: id, cause: error.cause, slot: error.slot });
@@ -300,8 +303,9 @@ export async function runSummarizeJob(entry: QueuedJob, deps: SummarizeJobDepend
         else await deps.log("job_refused", { request_id: id, cause: "internal", slot: null });
       }
     } catch {
-      // The operator log is the only record; an append that fails leaves the job refused with no row.
+      rowWritten = false;
     }
+    deps.reportState(id, "state_REFUSED", rowWritten);
     return "state_REFUSED";
   } finally {
     for (const key of keys) key.fill(0);
