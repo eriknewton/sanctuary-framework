@@ -14,6 +14,7 @@ import type { StateStore } from "../cognitive/state-store.js";
 import type { ResponseScreen } from "../proxy/response-screen.js";
 import { buildFeatureHealthPanel, SLICE1_FEATURE_REGISTRY } from "../principal-policy/feature-health.js";
 import type { ProducerKeyObservation } from "../principal-policy/panel-producer.js";
+import type { BaselineNamespaceInserts } from "../principal-policy/baseline.js";
 import { buildCustodyExitPanel } from "../principal-policy/posture.js";
 import { observeProtections } from "./protection-observations.js";
 import { composeProtectionLayers, summarizeProtectionLayers } from "./protection-layers.js";
@@ -122,6 +123,8 @@ export interface CooperativeSurfaceOptions {
   /** Resolve the dashboard's broker key per request; an unavailable source reports unknown. */
   resolveBrokerProducerKey?: () => Promise<{ keyB64url: string | null; observation: ProducerKeyObservation }>;
   approvalProofStore?: ApprovalProofStore;
+  /** Records each namespace a successful remember used, so the next process knows it; required so no boot path omits it. */
+  baselineNamespaceInserts: Pick<BaselineNamespaceInserts, "record">;
 }
 
 export function createAgentNativeCooperativeTools(
@@ -488,6 +491,8 @@ export function createAgentNativeCooperativeTools(
   }): Promise<Record<string, unknown>> {
     switch (step.tool) {
       case COOPERATIVE_TOOL_NAMES.remember:
+        // DEBT(AGENT-SEAT-COMPOUND-NAMESPACE-INSERT): A namespace first saved by a compound remember step is not kept
+        // for the next session, which then asks for it as new; a later slice records it as a single save does.
         return await callPrimitive("state_write", step.primitive);
       case COOPERATIVE_TOOL_NAMES.recall:
       case COOPERATIVE_TOOL_NAMES.hide:
@@ -659,6 +664,9 @@ export function createAgentNativeCooperativeTools(
           }
           // intent_audit_ref must match sdw/memory-tools.ts and the intent correlation in dashboard/v1_1/client.ts and principal-policy/posture-evidence-html.ts.
           const auditRef = await audit("sanctuary_remember", { agent_id: callerIdentity, intent_audit_ref: intentRef });
+          // A namespace insert never changes the save's response; its failure is a system row, then stderr.
+          // The namespace is the one the gate evaluated: the router built the gate arguments with rememberPrimitiveArgs.
+          await options.baselineNamespaceInserts.record(primitiveArgs.namespace as string);
           return toolResult({
             key: result.key,
             namespace_handle: result.namespace,

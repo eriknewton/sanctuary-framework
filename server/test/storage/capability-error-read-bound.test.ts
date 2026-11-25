@@ -4,7 +4,7 @@
 // on every platform.
 import { describe, expect, it } from "vitest";
 import { deserializeCapabilityError, serializeCapabilityError } from "../../src/storage/filesystem.js";
-import { StorageReadBoundError } from "../../src/storage/interface.js";
+import { StorageEnumerationBoundError, StorageReadBoundError } from "../../src/storage/interface.js";
 
 /** What the parent sees after the worker sends this error: serialize, cross a plain-data channel, deserialize. */
 function acrossWorker(error: unknown): Error {
@@ -17,6 +17,15 @@ describe("worker error encoding", () => {
     expect(result).toBeInstanceOf(StorageReadBoundError);
     expect(result.name).toBe("StorageReadBoundError");
     expect(result.message).toBe(new StorageReadBoundError().message);
+  });
+
+  it("an enumeration bound error crosses the capability worker as its own type", () => {
+    const result = acrossWorker(new StorageEnumerationBoundError());
+    expect(result).toBeInstanceOf(StorageEnumerationBoundError);
+    expect(result).not.toBeInstanceOf(StorageReadBoundError);
+    expect(result.name).toBe("StorageEnumerationBoundError");
+    expect(result.message).toBe("Stored entries exceed the enumeration bound");
+    expect(acrossWorker(new StorageReadBoundError())).not.toBeInstanceOf(StorageEnumerationBoundError);
   });
 
   it("does not type a generic error as a bounded-read refusal, even one carrying the same message", () => {

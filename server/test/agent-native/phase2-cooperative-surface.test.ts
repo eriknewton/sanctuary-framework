@@ -1,7 +1,9 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: the synthetic help owner now reads as a loaded identity, because a cooperative session is confirmed against the identity manager; the help assertions are unchanged.
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 // fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool (e.g. state_export) is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -116,7 +118,7 @@ async function setup() {
   await identityManager.load();
   const identity = await callTool(l1Tools, "identity_create", { label: "agent-a" });
   active = session(identity.identity_id as string);
-  const { tools: facadeTools } = createAgentNativeCooperativeTools({
+  const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
     identityManager,
     namespaceRegistry,
     auditLog,
@@ -192,7 +194,7 @@ function facadeWithPrimitives(
   env: Awaited<ReturnType<typeof setup>>,
   primitiveTools: ToolDefinition[]
 ): ToolDefinition[] {
-  return createAgentNativeCooperativeTools({
+  return createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
     identityManager: env.identityManager,
     namespaceRegistry: env.namespaceRegistry,
     auditLog: env.auditLog,
@@ -252,7 +254,7 @@ async function setupFilesystemSurface() {
     );
     await identityManager.load();
     const approvalProofStore = new ApprovalProofStore();
-    const { tools: facadeTools } = createAgentNativeCooperativeTools({
+    const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
       identityManager,
       namespaceRegistry,
       auditLog,
@@ -375,7 +377,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       }
       return originalWrite(namespace, key, data);
     };
-    const { tools: facadeTools } = createAgentNativeCooperativeTools({
+    const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
       identityManager,
       namespaceRegistry,
       auditLog,
@@ -433,7 +435,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
         MemoryHandleOwnershipConflictError
       );
 
-      const { tools: facadeTools } = createAgentNativeCooperativeTools({
+      const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
         identityManager,
         namespaceRegistry,
         auditLog,
@@ -619,7 +621,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
     });
     await callTool(env.facadeTools, "sanctuary_hide", { key: "durable_hidden" });
 
-    const restarted = createAgentNativeCooperativeTools({
+    const restarted = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
       identityManager: env.identityManager,
       namespaceRegistry: env.namespaceRegistry,
       auditLog: env.auditLog,
@@ -641,7 +643,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       conflict_resolution: "version",
     });
 
-    const afterImportTools = createAgentNativeCooperativeTools({
+    const afterImportTools = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
       identityManager: env.identityManager,
       namespaceRegistry: env.namespaceRegistry,
       auditLog: env.auditLog,
@@ -661,7 +663,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       value: "fresh",
       identity_id: env.identity.identity_id,
     });
-    const staleTools = createAgentNativeCooperativeTools({
+    const staleTools = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
       identityManager: env.identityManager,
       namespaceRegistry: env.namespaceRegistry,
       auditLog: env.auditLog,
@@ -930,7 +932,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
     let binding: SessionBinding | undefined = session("help-owner");
     // Test-only manager: the synthetic owner is a loaded identity, so its binding is a confirmed session.
     vi.spyOn(identityManager, "get").mockImplementation((id: string) => ({ identity_id: id }) as ReturnType<typeof identityManager.get>);
-    const facade = createAgentNativeCooperativeTools({ identityManager, namespaceRegistry, auditLog,
+    const facade = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), identityManager, namespaceRegistry, auditLog,
       primitiveTools: tools, currentSessionBinding: () => binding,
     }).tools;
     const bound = await callTool(facade, "sanctuary_help", { intent: "save the note" });

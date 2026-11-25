@@ -103,6 +103,7 @@ export const READ_ONLY_STORAGE_DELEGATED_METHODS = [
   "totalSizeOfNonReservedNamespaces",
   "listKeys",
   "readBounded",
+  "listKeysBounded",
   "namespacePath",
 ] as const;
 
@@ -142,6 +143,9 @@ export class ReadOnlyStorageGuard
   /** Mirror presence: a consumer that requires a bounded read must see its absence, not a method that throws. */
   readBounded?: (namespace: string, key: string, maxBytes: number) => Promise<Uint8Array | null>;
 
+  /** Mirror presence: a consumer that loads only through a bounded listing must see its absence. */
+  listKeysBounded?: (namespace: string, maxKeys: number) => Promise<string[]>;
+
   constructor(inner: StorageBackend) {
     this.inner = inner;
     if (typeof inner.listNamespacesForAgentDiscovery === "function") {
@@ -161,6 +165,11 @@ export class ReadOnlyStorageGuard
     // in test/structure/read-tool-mutation-reachability.ts.
     if (typeof inner.readBounded === "function") {
       this.readBounded = (namespace, key, maxBytes) => inner.readBounded!(namespace, key, maxBytes);
+    }
+    // Must match StorageBackend.listKeysBounded in interface.ts and STORAGE_READ_ONLY
+    // in test/structure/read-tool-mutation-reachability.ts.
+    if (typeof inner.listKeysBounded === "function") {
+      this.listKeysBounded = (namespace, maxKeys) => inner.listKeysBounded!(namespace, maxKeys);
     }
     this.innerCapabilities = inner as Partial<FilesystemStorageCapabilities>;
     if (typeof inner.listNamespaces === "function") {

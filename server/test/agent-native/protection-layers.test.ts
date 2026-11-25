@@ -1,7 +1,9 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: Construction assertions select a production-created identity for a resolved cooperative session.
 // fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 // fail-before-exempt: this change only reorders a clock freeze in an existing test so its audit entry is never timestamped after the frozen now; the source under test is unchanged, so the test passes against pre-change source by construction.
 import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -44,7 +46,7 @@ async function setup(extra: Partial<Parameters<typeof createAgentNativeCooperati
   const created = await primitives.tools.find(t => t.name === "identity_create")!.handler({ label: "protections-test" });
   const identity = JSON.parse(created.content[0]!.text);
   binding = { identity_id: identity.identity_id, requester_identity_fingerprint: fingerprintIdentityId(identity.identity_id) };
-  const facade = createAgentNativeCooperativeTools({ ...primitives, primitiveTools: primitives.tools,
+  const facade = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), ...primitives, primitiveTools: primitives.tools,
     auditLog, storage, currentSessionBinding: () => binding,
     resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "absent" }), ...extra });
   const tool = facade.tools.find(t => t.name === "sanctuary_active_protections")!;
@@ -157,7 +159,7 @@ describe("protection layers", () => {
     vi.spyOn(healthSource, "buildFeatureHealthPanel").mockResolvedValue(home.feature_health);
     vi.spyOn(custodySource, "buildCustodyExitPanel").mockResolvedValue(home.custody_exit);
     vi.spyOn(auditLog, "getAuditChainVerdict").mockRejectedValue(new Error("chain unavailable"));
-    const facade = createAgentNativeCooperativeTools({ ...primitives, primitiveTools: primitives.tools,
+    const facade = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), ...primitives, primitiveTools: primitives.tools,
       auditLog, stateStore, currentSessionBinding: () => binding });
     const response = await facade.tools.find(tool => tool.name === "sanctuary_active_protections")?.handler({});
     const toolResult = JSON.parse(response?.content?.[0]?.text ?? "null");
@@ -564,7 +566,7 @@ describe("evidence consumer boundaries", () => {
     expect(result.layers.find((row: { id: string }) => row.id === "encrypted_vault").status).toBe("unknown");
     expect(composeProtectionLayers({ encryptedStateStoreConstructed: false })[1]?.status).toBe("off");
     const { primitives, auditLog, binding } = await setup();
-    const facade = createAgentNativeCooperativeTools({ ...primitives, primitiveTools: primitives.tools,
+    const facade = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), ...primitives, primitiveTools: primitives.tools,
       auditLog, currentSessionBinding: () => binding,
       resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "unknown" }),
       get stateStore(): StateStore { throw new Error("unavailable"); } });

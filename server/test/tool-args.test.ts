@@ -1,5 +1,7 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 /** String length declarations are enforced by the shared validator for registered schemas. */
 import { describe, expect, it } from "vitest";
+import { recordingNamespaceInserts } from "./helpers/cooperative-test-options.js";
 import * as toolArgs from "../src/tool-args.js";
 import { createAgentNativeCooperativeTools } from "../src/agent-native/cooperative-surface.js";
 import { createL1Tools } from "../src/cognitive/tools.js";
@@ -13,7 +15,7 @@ function helpSchema() {
   const key = generateRandomKey();
   const auditLog = new AuditLog(storage, key);
   const { tools, identityManager, namespaceRegistry } = createL1Tools(new StateStore(storage, key), storage, key, "recovery-key", auditLog);
-  return createAgentNativeCooperativeTools({ identityManager, namespaceRegistry, auditLog, primitiveTools: tools, currentSessionBinding: () => undefined }).tools.find(tool => tool.name === "sanctuary_help")!.inputSchema;
+  return createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), identityManager, namespaceRegistry, auditLog, primitiveTools: tools, currentSessionBinding: () => undefined }).tools.find(tool => tool.name === "sanctuary_help")!.inputSchema;
 }
 
 describe("declared string lengths", () => {

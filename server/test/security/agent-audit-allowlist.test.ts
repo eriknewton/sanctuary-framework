@@ -1,3 +1,4 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision, so this file supplies a named boot decision beside its existing binding; it also passes an empty surrogateBoundSecrets set to its Broker constructions. Neither edit asserts new behavior.
 /**
  * Agent-facing audit redaction ALLOWLIST — acceptance + structure tripwire.
@@ -24,6 +25,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -584,7 +586,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
       })).content[0]!.text
     );
     active = binding(id.identity_id as string);
-    const { tools: facadeTools } = createAgentNativeCooperativeTools({
+    const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
       identityManager,
       namespaceRegistry,
       auditLog,
@@ -794,7 +796,7 @@ describe("agent-audit-allowlist: HIGH — decision-granularity search oracle (al
       })).content[0]!.text
     );
     active = binding(id.identity_id as string);
-    const { tools: facadeTools } = createAgentNativeCooperativeTools({
+    const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
       identityManager,
       namespaceRegistry,
       auditLog,
