@@ -18,6 +18,14 @@ import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect } from "vitest";
 import type { Clock } from "../../src/verify-release/deadline.js";
+import { gzipSync } from "node:zlib";
+import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
+import { ed25519 } from "@noble/curves/ed25519";
+import { generateKeypair } from "../../src/core/identity.js";
+import { toBase64url } from "../../src/core/encoding.js";
+import { buildReleaseManifestMessage, verifyReleaseManifestWithKey, type ReleaseManifestBody } from "../../src/release-manifest.js";
+import type { HttpRequester, RawResponse } from "../../src/verify-release/transport.js";
 
 export const FIXTURES = join(__dirname, "..", "fixtures", "verify-release");
 export const TRUSTED_ROOT_PATH = join(__dirname, "..", "..", "src", "verify-release", "trusted_root.json");
@@ -172,4 +180,102 @@ function readHeader(der: Buffer, offset: number): { headerLength: number; length
   let length = 0;
   for (let i = 0; i < octets; i++) length = length * 256 + der[offset + 2 + i]!;
   return { headerLength: 2 + octets, length };
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic tarballs, release manifests and a modelled requester.
+// ---------------------------------------------------------------------------
+
+
+export interface TarEntrySpec {
+  path: string;
+  /** Default "0" (regular file). "5" directory, "2" symlink, "1" hardlink, "3" char device, "6" FIFO. */
+  type?: string;
+  body?: Buffer | string;
+  /** Declared size, when it must differ from the body (truncation tests). */
+  size?: number;
+  linkpath?: string;
+}
+
+const BLOCK = 512;
+function octal(value: number, width: number): string {
+  return `${value.toString(8).padStart(width - 1, "0")}\0`;
+}
+function header(name: string, type: string, size: number, linkpath = ""): Buffer {
+  const block = Buffer.alloc(BLOCK, 0);
+  block.write(name, 0, 100, "utf8");
+  block.write(octal(type === "5" ? 0o755 : 0o644, 8), 100, "ascii");
+  block.write(octal(0, 8), 108, "ascii");
+  block.write(octal(0, 8), 116, "ascii");
+  block.write(octal(size, 12), 124, "ascii");
+  block.write(octal(0, 12), 136, "ascii");
+  block.write("        ", 148, "ascii");
+  block.write(type, 156, "ascii");
+  block.write(linkpath, 157, 100, "utf8");
+  block.write("ustar\u000000", 257, "binary");
+  let sum = 0;
+  for (const byte of block) sum += byte;
+  block.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return block;
+}
+function padded(body: Buffer): Buffer {
+  const rest = body.length % BLOCK;
+  return rest === 0 ? body : Buffer.concat([body, Buffer.alloc(BLOCK - rest, 0)]);
+}
+function paxRecord(key: string, value: string): string {
+  const content = ` ${key}=${value}\n`;
+  let length = content.length;
+  while (`${length}${content}`.length !== length) length = `${length}${content}`.length;
+  return `${length}${content}`;
+}
+
+/** An uncompressed tar stream; names over 100 bytes get a pax `path` record. */
+export function tarBytes(entries: TarEntrySpec[], { endBlocks = true } = {}): Buffer {
+  const parts: Buffer[] = [];
+  for (const entry of entries) {
+    const type = entry.type ?? "0";
+    const body = Buffer.from(entry.body ?? "");
+    let name = entry.path;
+    if (Buffer.byteLength(name) > 100) {
+      const pax = Buffer.from(paxRecord("path", name), "utf8");
+      parts.push(header("PaxHeader", "x", pax.length), padded(pax));
+      name = name.slice(0, 99);
+    }
+    parts.push(header(name, type, entry.size ?? (type === "0" ? body.length : 0), entry.linkpath ?? ""));
+    if (type === "0") parts.push(padded(body));
+  }
+  if (endBlocks) parts.push(Buffer.alloc(BLOCK * 2, 0));
+  return Buffer.concat(parts);
+}
+export function tgz(entries: TarEntrySpec[]): Buffer {
+  return gzipSync(tarBytes(entries));
+}
+
+export const sha256Hex = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
+export const sha512 = (bytes: Buffer): Buffer => createHash("sha512").update(bytes).digest();
+
+export const TEST_MANIFEST_KEY = generateKeypair();
+export function signManifest(body: ReleaseManifestBody, privateKey: Uint8Array = TEST_MANIFEST_KEY.privateKey): { body: ReleaseManifestBody; signature: string } {
+  return { body, signature: toBase64url(ed25519.sign(buildReleaseManifestMessage(body), privateKey)) };
+}
+/** `verifyReleaseManifestWithKey` bound to the test key: the manifest seam. */
+export const verifyWithTestKey = (value: unknown) => verifyReleaseManifestWithKey(value, TEST_MANIFEST_KEY.publicKey);
+
+export function body(bytes: Buffer | string): RawResponse["body"] {
+  return Readable.from([Buffer.from(bytes)]);
+}
+export function response(status: number, payload: Buffer | string = "", headers: Record<string, string> = {}): RawResponse {
+  return { status, headers, body: body(payload) };
+}
+
+/** A requester serving fixed responses by URL; every call is recorded. */
+export function modelledRequester(routes: Record<string, () => RawResponse | Promise<RawResponse>>): HttpRequester & { calls: string[] } {
+  const calls: string[] = [];
+  const requester: HttpRequester = async url => {
+    calls.push(url.href);
+    const route = routes[url.href];
+    if (route === undefined) return response(404);
+    return route();
+  };
+  return Object.assign(requester, { calls });
 }

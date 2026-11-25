@@ -96,10 +96,10 @@ describe("trust material construction", () => {
     expect(count(/toTrustMaterial\(/g)).toEqual(["sigstore.ts"]);
   });
 
-  it("imports no Sigstore client: no TUF, signing, Rekor, Fulcio or CT client package", () => {
+  it("imports no Sigstore client (no TUF, signing, Rekor, Fulcio or CT client package); tar is the only other package", () => {
     const specifiers = [...all.matchAll(/(?:from|import)\s*\(?\s*"([^"]+)"/g)].map(match => match[1]!);
     const external = [...new Set(specifiers.filter(s => !s.startsWith(".") && !s.startsWith("node:")))].sort();
-    expect(external).toEqual(["@sigstore/bundle", "@sigstore/protobuf-specs", "@sigstore/verify"]);
+    expect(external).toEqual(["@sigstore/bundle", "@sigstore/protobuf-specs", "@sigstore/verify", "tar"]);
   });
 
   it("the Sigstore packages are reached only through dynamic import", () => {

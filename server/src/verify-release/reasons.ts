@@ -118,15 +118,8 @@ const BACKSLASH = 0x5c;
  * TRUNCATION_MARK, still within MAX_DETAIL_CHARS.
  */
 export function escapeDetail(value: string): string {
-  const pieces: string[] = [];
-  let length = 0;
-  for (const byte of Buffer.from(value, "utf8")) {
-    const piece = byte === BACKSLASH ? "\\\\"
-      : byte >= PRINTABLE_MIN && byte <= PRINTABLE_MAX ? String.fromCharCode(byte)
-        : `\\x${byte.toString(16).padStart(2, "0")}`;
-    pieces.push(piece);
-    length += piece.length;
-  }
+  const pieces = escapedPieces(value);
+  const length = pieces.reduce((sum, piece) => sum + piece.length, 0);
   if (length <= MAX_DETAIL_CHARS) return pieces.join("");
   let out = "";
   for (const piece of pieces) {
@@ -134,6 +127,22 @@ export function escapeDetail(value: string): string {
     out += piece;
   }
   return out + TRUNCATION_MARK;
+}
+
+/** The same escaping with no length cap, for the resolved target path. */
+export function escapePrintable(value: string): string {
+  return escapedPieces(value).join("");
+}
+
+function escapedPieces(value: string): string[] {
+  const pieces: string[] = [];
+  for (const byte of Buffer.from(value, "utf8")) {
+    const piece = byte === BACKSLASH ? "\\\\"
+      : byte >= PRINTABLE_MIN && byte <= PRINTABLE_MAX ? String.fromCharCode(byte)
+        : `\\x${byte.toString(16).padStart(2, "0")}`;
+    pieces.push(piece);
+  }
+  return pieces;
 }
 
 const TRUNCATION_MARK = "...";
