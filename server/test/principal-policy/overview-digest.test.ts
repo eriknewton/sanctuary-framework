@@ -311,7 +311,7 @@ describe("round 2 coverage read bounds", () => {
     expect(await eagerDigest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
     expect(stream).not.toHaveBeenCalled(); expect(view).not.toHaveBeenCalled();
     // Must match the retained-view read budget in routineWindowCoverage (posture.ts): the digest cap or the retention cap.
-    expect(query).toHaveBeenCalledWith({ limit: Math.max(50_000, audit.getRetentionConfig().maxEntries) });
+    expect(query).toHaveBeenCalledWith({ limit: Math.max(50_000, audit.getRetentionConfig().maxEntries), include_outcome_markers: true });
   });
   it("withholds coverage when the chain head and the retained view disagree", async () => {
     const audit = log(); await append(audit, 1);

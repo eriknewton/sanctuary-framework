@@ -68,6 +68,8 @@ export interface AuditEntry {
   result: "success" | "failure";
   details?: Record<string, unknown>;
   contributors?: PluginContribution[];
+  /** The call this row was appended in (16 lowercase hex characters); set only by the call scope, never by a caller. */
+  call_ref?: string;
 }
 
 /** One chained, decrypted, verified entry handed to a streaming consumer. */
@@ -103,7 +105,7 @@ export interface VerifiedChainConsumer {
   reset?: () => void;
 }
 
-export type AuditEntryInput = Omit<AuditEntry, "timestamp"> & {
+export type AuditEntryInput = Omit<AuditEntry, "timestamp" | "call_ref"> & {
   timestamp?: string;
 };
 
@@ -1772,6 +1774,129 @@ export async function withAuditWriteSettlement<T>(operation: () => Promise<T>): 
  */
 const auditEagerReadContext = new AsyncLocalStorage<{ eager: boolean }>();
 
+// ── Call scope: one outcome per call, and the rows the call wrote ──────────
+//
+// Must match runBoundedCall in router.ts and the CallToolRequestSchema handler
+// in broker-mcp/broker-server.ts, the only callers of runInCallScope,
+// settleCallOutcome and writeCallOutcomeMarkers.
+
+/** Must match the default exclusion and the visible-call set in AuditLog.query. */
+export const CALL_OUTCOME_SUCCESS_OPERATION = "call_outcome_success";
+/** 8 random bytes = 16 hex characters, the router's tool-error reference width; must match TOOL_ERROR_REF_BYTES in router.ts. */
+export const CALL_REF_BYTES = 8;
+
+export type CallScopeState = "scope_OPEN" | "scope_SUCCEEDED" | "scope_REFUSED";
+export type CallScopeOutcome = "succeeded" | "refused";
+/** Must match noteRefusalCause in agent-native/denial-ledger.ts, which narrows `Cause` to DenialCause. */
+export interface CallScopeNote<Cause extends string = string> {
+  readonly cause: Cause;
+  readonly linked_ref?: string;
+}
+export interface CallScopeHandle {
+  readonly call_ref: string;
+  readonly state: CallScopeState;
+}
+
+interface CallScopeRecord {
+  readonly call_ref: string;
+  state: CallScopeState;
+  /** Rows each audit log stamped while the scope was open. */
+  readonly stamped: Map<AuditLog, number>;
+  /** Logs whose marker was already enqueued. */
+  readonly marked: Set<AuditLog>;
+  note?: CallScopeNote;
+}
+
+const callScopeContext = new AsyncLocalStorage<CallScopeRecord>();
+const callScopeRecords = new WeakMap<CallScopeHandle, CallScopeRecord>();
+/** Module-private: only writeCallOutcomeMarkers reaches the marker append. */
+const enqueueCallOutcomeMarker = Symbol("enqueueCallOutcomeMarker");
+
+/** Public append paths refuse the outcome-marker operation. */
+export class ReservedAuditOperationError extends Error {
+  constructor() {
+    super(`audit operation ${CALL_OUTCOME_SUCCESS_OPERATION} is reserved`);
+    this.name = "ReservedAuditOperationError";
+  }
+}
+
+/** Run `fn` as one call: every audit row appended inside it carries the call's reference. */
+export function runInCallScope<T>(fn: (scope: CallScopeHandle) => Promise<T>): Promise<T> {
+  const record: CallScopeRecord = {
+    call_ref: randomBytes(CALL_REF_BYTES).toString("hex"),
+    state: "scope_OPEN",
+    stamped: new Map(),
+    marked: new Set(),
+  };
+  const handle: CallScopeHandle = Object.freeze({
+    call_ref: record.call_ref,
+    get state(): CallScopeState {
+      return record.state;
+    },
+  });
+  callScopeRecords.set(handle, record);
+  return callScopeContext.run(record, () => fn(handle));
+}
+
+function callScopeRecord(scope: CallScopeHandle): CallScopeRecord {
+  const record = callScopeRecords.get(scope);
+  if (!record) throw new Error("not a call scope handle");
+  return record;
+}
+
+/** Settle the call's outcome and return the terminal one. */
+export function settleCallOutcome(scope: CallScopeHandle, outcome: CallScopeOutcome): CallScopeOutcome {
+  const record = callScopeRecord(scope);
+  // A call's outcome is set once; a later settlement, including a handler success after cancellation, never changes it.
+  if (record.state === "scope_OPEN") {
+    switch (outcome) {
+      case "succeeded":
+        record.state = "scope_SUCCEEDED";
+        break;
+      case "refused":
+        record.state = "scope_REFUSED";
+        break;
+      default:
+        throw new Error(`unknown call outcome: ${String(outcome satisfies never)}`);
+    }
+  }
+  switch (record.state) {
+    case "scope_SUCCEEDED":
+      return "succeeded";
+    case "scope_REFUSED":
+      return "refused";
+    default:
+      throw new Error(`unknown call scope state: ${String(record.state satisfies never)}`);
+  }
+}
+
+/** Enqueue one success marker per audit log that stamped a row while the call was open; never awaited. */
+export function writeCallOutcomeMarkers(scope: CallScopeHandle): void {
+  const record = callScopeRecord(scope);
+  // A call's rows become agent-visible only through a success marker written after the outcome is success; a refused call never gets one.
+  if (record.state !== "scope_SUCCEEDED") return;
+  for (const [log, count] of record.stamped) {
+    if (count <= 0 || record.marked.has(log)) continue;
+    record.marked.add(log);
+    log[enqueueCallOutcomeMarker](record.call_ref);
+  }
+}
+
+/** Store the first cause noted inside an open call; returns whether this note was stored. */
+export function noteCallScopeCause(note: CallScopeNote): boolean {
+  const record = callScopeContext.getStore();
+  if (!record || record.state !== "scope_OPEN" || record.note !== undefined) return false;
+  record.note = Object.freeze({
+    cause: note.cause,
+    ...(note.linked_ref !== undefined ? { linked_ref: note.linked_ref } : {}),
+  });
+  return true;
+}
+
+export function readCallScopeNote(scope: CallScopeHandle): CallScopeNote | undefined {
+  return callScopeRecord(scope).note;
+}
+
 // ── F2 Option A: split-boundary record (shared read/write logic) ───────────
 //
 // These are module-level (not `AuditLog` methods) because BOTH the class's
@@ -2885,6 +3010,8 @@ export class AuditLog {
     details?: Record<string, unknown>,
     result: "success" | "failure" = "success"
   ): Promise<void> {
+    // Only the marker writer may append the outcome-marker operation, so no other path can make a call's rows visible.
+    if (operation === CALL_OUTCOME_SUCCESS_OPERATION) throw new ReservedAuditOperationError();
     this.pendingVisibleEntries++;
     const writePromise = this.enqueueAppend({
       layer,
@@ -2912,6 +3039,8 @@ export class AuditLog {
    * failure is rethrown by `flush()`.
    */
   appendCritical(entry: AuditEntryInput): Promise<void> {
+    // Only the marker writer may append the outcome-marker operation, so no other path can make a call's rows visible.
+    if (entry.operation === CALL_OUTCOME_SUCCESS_OPERATION) throw new ReservedAuditOperationError();
     const writePromise = this.enqueueAppend(entry, {
       verifyDurability: true,
       critical: true,
@@ -3107,15 +3236,45 @@ export class AuditLog {
     await this.appendQueue;
   }
 
+  /**
+   * Append one success marker for `callRef`, as an ordinary append on this
+   * log's queue, so it lands after every row of its call already enqueued.
+   * Must match writeCallOutcomeMarkers, its only caller.
+   */
+  [enqueueCallOutcomeMarker](callRef: string): void {
+    this.pendingVisibleEntries++;
+    const writePromise = this.enqueueAppend({
+      layer: "l2",
+      operation: CALL_OUTCOME_SUCCESS_OPERATION,
+      identity_id: "system",
+      result: "success",
+      details: { call_ref: callRef, outcome: "success" },
+    }, { verifyDurability: false, critical: false, outcomeMarker: true });
+    // A marker that never lands leaves its call's rows hidden from agent readers; the operator view is unaffected.
+    void writePromise.catch(() => {
+      console.error(`[audit-log] ${CALL_OUTCOME_SUCCESS_OPERATION} append failed`);
+    });
+  }
+
   private enqueueAppend(
     entry: AuditEntryInput,
-    options: { verifyDurability: boolean; critical: boolean }
+    options: { verifyDurability: boolean; critical: boolean; outcomeMarker?: true }
   ): Promise<void> {
+    // The call reference is taken when the caller appends, never when the queue drains, so a row belongs to the call
+    // that wrote it, including a row that settles after the call returned.
+    let callRef: string | undefined;
+    if (options.outcomeMarker !== true) {
+      const scope = callScopeContext.getStore();
+      if (scope) {
+        callRef = scope.call_ref;
+        if (scope.state === "scope_OPEN") scope.stamped.set(this, (scope.stamped.get(this) ?? 0) + 1);
+      }
+    }
     const task = this.appendQueue
       .catch(() => {
         // Keep later appends from inheriting a prior append failure.
       })
-      .then(() => this.persistChainedEntry(entry, options));
+      .then(() => this.persistChainedEntry(entry, options, callRef));
     this.appendQueue = task.then(
       () => undefined,
       () => undefined
@@ -3125,10 +3284,11 @@ export class AuditLog {
 
   private async persistChainedEntry(
     entry: AuditEntryInput,
-    options: { verifyDurability: boolean; critical: boolean }
+    options: { verifyDurability: boolean; critical: boolean },
+    callRef: string | undefined
   ): Promise<void> {
     try {
-      const normalized = this.normalizeEntry(entry);
+      const normalized = this.normalizeEntry(entry, callRef);
       await this.reverifyCachedIntegrityFindingsBeforeAppend();
       // C9 (availability, register): resolve the mandatory first-load
       // read-consistency pass BEFORE requesting the cross-process write lock,
@@ -3367,7 +3527,7 @@ export class AuditLog {
     }
   }
 
-  private normalizeEntry(entry: AuditEntryInput): AuditEntry {
+  private normalizeEntry(entry: AuditEntryInput, callRef: string | undefined): AuditEntry {
     return {
       timestamp: entry.timestamp ?? new Date().toISOString(),
       layer: entry.layer,
@@ -3376,6 +3536,8 @@ export class AuditLog {
       result: entry.result,
       details: entry.details,
       ...(entry.contributors !== undefined ? { contributors: entry.contributors } : {}),
+      // The call reference comes only from the call scope; a caller-supplied value is never kept.
+      ...(callRef !== undefined ? { call_ref: callRef } : {}),
     };
   }
 
@@ -4550,6 +4712,8 @@ export class AuditLog {
     identity_id?: string;
     /** Operator Evidence display filter; independent of the own-signed identity authorization filter. */
     evidence_agent?: string;
+    /** Return call outcome markers too; integrity, export, verify and completeness paths that count stored rows set it. */
+    include_outcome_markers?: boolean;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
@@ -4587,6 +4751,10 @@ export class AuditLog {
       filtered = filtered.filter(
         (e) => e.operation === options.operation_type
       );
+    }
+    // Outcome markers are bookkeeping, not activity; a reader sees them only by asking.
+    if (options.include_outcome_markers !== true) {
+      filtered = filtered.filter((e) => e.operation !== CALL_OUTCOME_SUCCESS_OPERATION);
     }
     // Identity filter BEFORE the limit slice (own-identity-read paging fix): the
     // limit must bound the caller's OWN entries, not a global page.
@@ -4721,6 +4889,7 @@ export class AuditLog {
     layer?: AuditEntry["layer"];
     operation_type?: string;
     identity_id?: string;
+    include_outcome_markers?: boolean;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];

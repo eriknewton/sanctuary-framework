@@ -18,9 +18,17 @@ import {
 import { randomBytes } from "node:crypto";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
-import type { AuditLog } from "./operational/audit-log.js";
+import {
+  readCallScopeNote,
+  runInCallScope,
+  settleCallOutcome,
+  writeCallOutcomeMarkers,
+  type AuditLog,
+  type CallScopeHandle,
+} from "./operational/audit-log.js";
 import { refusalResult, type SessionBinding } from "./agent-native/safety-base.js";
 import {
+  closedDenialCause,
   CountingDenialRecorder,
   DenialLedger,
   type DenialCause,
@@ -148,7 +156,7 @@ interface BoundedCall {
   readonly signal: AbortSignal | undefined;
 }
 
-// 8 random bytes = 16 hex characters: the existing tool_error audit_ref width.
+// 8 random bytes = 16 hex characters: the existing tool_error audit_ref width. Must match CALL_REF_BYTES in operational/audit-log.ts.
 const TOOL_ERROR_REF_BYTES = 8;
 
 /** Prepare the gate's approval-target arguments; a throw becomes a refusal, not an escape. */
@@ -328,12 +336,38 @@ export function createServer(
    *   state_ARGS -> state_GATE -> (denied) refusal
    *   state_GATE -> state_INTEGRITY -> (write stop) refusal
    *   state_INTEGRITY -> state_HANDLER -> state_OUTCOME -> state_FINISH
+   *
+   * The boundary is one call scope (runInCallScope in operational/audit-log.ts):
+   * its outcome is settled once, every audit row it appends carries its
+   * reference, and only a committed success writes the success marker.
    */
   async function runBoundedCall(call: BoundedCall): Promise<Awaited<ReturnType<ToolHandler>> | ReturnType<typeof refusalResult>> {
+    return runInCallScope(async (scope) => {
+      const signal = call.signal;
+      // Cancellation before the success commits makes the call refused.
+      const onAbort = (): void => {
+        settleCallOutcome(scope, "refused");
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted === true) settleCallOutcome(scope, "refused");
+      try {
+        return await runBoundedStages(call, scope);
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        if (scope.state === "scope_OPEN") settleCallOutcome(scope, "refused");
+      }
+    });
+  }
+
+  async function runBoundedStages(
+    call: BoundedCall,
+    scope: CallScopeHandle,
+  ): Promise<Awaited<ReturnType<ToolHandler>> | ReturnType<typeof refusalResult>> {
     const { name, tool, handlerArgs, approvalRef, callerIdentity } = call;
     // The operation name the gate evaluates; a pre-gate refusal records under the same name.
     const gateOperation = tool.approvalTargetToolName ?? name;
     let stage: BoundaryStage = "state_ARGS";
+    let committed: { readonly result: Awaited<ReturnType<ToolHandler>> } | undefined;
     try {
       let approvalAuditId: string | undefined;
       if (gate) {
@@ -345,7 +379,7 @@ export function createServer(
           await gate.recordPreGateRefusal(gateOperation);
           // Must match argumentStageCause in tool-outcome.ts, which picks the cause by error type.
           recordDenial(argumentStageCause(prepared.error), denialInput(call, { error: prepared.error }));
-          return refuse();
+          return refuse(scope);
         }
 
         stage = "state_GATE";
@@ -362,7 +396,7 @@ export function createServer(
         if (!verdict.allowed) {
           // Invariant #7: which policy class fired stays in the gate's audit row and the ledger.
           recordDenial("gate_denied", denialInput(call, { linkedRef: verdict.approval_audit_id }));
-          return refuse();
+          return refuse(scope);
         }
         approvalAuditId = verdict.approval_audit_id;
       }
@@ -395,7 +429,7 @@ export function createServer(
           errorName: "audit_integrity_findings",
           errorMessage: `${findingCount} audit integrity findings detected`,
         }));
-        return refuse();
+        return refuse(scope);
       }
 
       stage = "state_HANDLER";
@@ -439,8 +473,20 @@ export function createServer(
       const outcome = classifyToolOutcome(name, result, tool);
 
       stage = "state_FINISH";
-      if (outcome === "success") return result;
-      if (proxiedOutcomeFact(result)?.upstream_failed === true) {
+      if (outcome === "success") {
+        if (call.signal?.aborted !== true && settleCallOutcome(scope, "succeeded") === "succeeded") {
+          committed = { result };
+          writeCallOutcomeMarkers(scope);
+          return result;
+        }
+        recordDenial("call_cancelled", denialInput(call, {}));
+        return refuse(scope);
+      }
+      const note = readCallScopeNote(scope);
+      if (note !== undefined) {
+        // A cause noted inside a call reaches the ledger once, through the router, so one refused call is one record.
+        recordDenial(closedDenialCause(note.cause), denialInput(call, { linkedRef: note.linked_ref }));
+      } else if (proxiedOutcomeFact(result)?.upstream_failed === true) {
         recordDenial("proxy_upstream_error", denialInput(call, {}));
       } else {
         const facts = refusedResultFacts(result);
@@ -450,8 +496,10 @@ export function createServer(
           facts: facts.facts,
         }));
       }
-      return refuse();
+      return refuse(scope);
     } catch (err) {
+      // A committed success stays a success: its marker is already enqueued, so no refusal follows it.
+      if (committed !== undefined) return committed.result;
       // FAIL-CLOSED ERROR HANDLING (CISO MED-2, Invariant #7 no-policy-inference):
       // a throw from any stage must NOT return its raw message to the agent -
       // `err.message` can carry a path, a policy detail, a stack-derived
@@ -484,12 +532,16 @@ export function createServer(
         default:
           recordDenial("other", denialInput(call, { error: err }));
       }
-      return refuse();
+      return refuse(scope);
     }
   }
 
-  /** The one place the boundary returns a refusal; must match refusalResult() in agent-native/safety-base.ts. */
-  function refuse(): ReturnType<typeof refusalResult> {
+  /**
+   * The one place the boundary returns a refusal; must match refusalResult() in agent-native/safety-base.ts. It
+   * settles the call refused first, so no refusal leaves a call whose rows could still be marked.
+   */
+  function refuse(scope: CallScopeHandle): ReturnType<typeof refusalResult> {
+    settleCallOutcome(scope, "refused");
     return refusalResult();
   }
 

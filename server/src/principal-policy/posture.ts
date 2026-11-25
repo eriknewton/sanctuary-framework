@@ -1259,7 +1259,8 @@ export async function buildAuditDigest(
       : result.entries.length !== result.total ? "read_limit"
       // The view read stays in this builder, the caller-wrapped site the eager-read chokepoint registers; the helper
       // only decides when it runs (after the head read).
-      : await routineWindowCoverage(input.auditLog, windowStart, (limit) => input.auditLog.query({ limit }));
+      // This path counts stored rows, so it reads outcome markers too.
+      : await routineWindowCoverage(input.auditLog, windowStart, (limit) => input.auditLog.query({ limit, include_outcome_markers: true }));
   } catch {
     // A tainted/unreadable read is reported as an unverified chain with zero
     // counts — never as a clean day.
