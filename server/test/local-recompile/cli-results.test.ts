@@ -1,5 +1,5 @@
 // fail-before-exempt: the results and local verbs and their module are new; base has no such commands.
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { open, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +18,16 @@ vi.mock("../../src/core/master-custody.js", async (original) => ({
 // Owner read and write only; must match EXPORT_FILE_MODE in src/cli/local-results.ts.
 const OWNER_ONLY = 0o600;
 const PERMISSION_BITS = 0o777;
+
+/** Mode and text of one file, both read through a single descriptor so they describe the same file. */
+async function readOwnedFile(path: string): Promise<{ mode: number; text: string }> {
+  const handle = await open(path, "r");
+  try {
+    return { mode: (await handle.stat()).mode, text: await handle.readFile("utf8") };
+  } finally {
+    await handle.close();
+  }
+}
 const fixtures: OperatorFixture[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -93,8 +103,9 @@ describe("sanctuary results", () => {
     const path = join(f.path, "export.json");
     const result = await run(runResultsCommand, ["export", id, "--out", path]);
     expect(result.code, result.err).toBe(0);
-    expect((await stat(path)).mode & PERMISSION_BITS).toBe(OWNER_ONLY);
-    expect(JSON.parse(await readFile(path, "utf8")).body.summary).toBe("exported text");
+    const exported = await readOwnedFile(path);
+    expect(exported.mode & PERMISSION_BITS).toBe(OWNER_ONLY);
+    expect(JSON.parse(exported.text).body.summary).toBe("exported text");
     expect((await kinds(f)).at(-1)).toBe("operator_export");
   });
 
@@ -202,8 +213,9 @@ describe("sanctuary local log", () => {
     const path = join(f.path, "log.jsonl");
     const result = await run(runLocalCommand, ["log", "export", "--out", path]);
     expect(result.code, result.err).toBe(0);
-    expect((await stat(path)).mode & PERMISSION_BITS).toBe(OWNER_ONLY);
-    const lines = (await readFile(path, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { kind: string });
+    const exported = await readOwnedFile(path);
+    expect(exported.mode & PERMISSION_BITS).toBe(OWNER_ONLY);
+    const lines = exported.text.trim().split("\n").map((line) => JSON.parse(line) as { kind: string });
     expect(lines[0]!.kind).toBe("genesis");
     expect(lines.at(-1)!.kind).toBe("oplog_exported");
   });

@@ -1,5 +1,5 @@
 // The results and local log verbs: export rows before files, whole pages, option values, and a clean environment.
-import { open, readFile, stat } from "node:fs/promises";
+import { open, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -76,7 +76,7 @@ describe("export rows come before export files", () => {
     const id = await f.seed(1, "text");
     for (const [runner, argv] of [[runResultsCommand, ["export", id]], [runLocalCommand, ["log", "export"]]] as Array<[Runner, string[]]>) {
       const path = join(f.path, `existing-${argv[0]}.txt`);
-      await (await open(path, "wx", 0o600)).writeFile("keep me", "utf8"); // Owner-only scratch file.
+      await writeFile(path, "keep me", { encoding: "utf8", flag: "wx", mode: 0o600 }); // Owner-only scratch file, created exclusively.
       const before = await f.rows();
       const result = await run(runner, [...argv, "--out", path]);
       expect(result.code).toBe(1);
