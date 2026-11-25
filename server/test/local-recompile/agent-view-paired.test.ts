@@ -152,12 +152,9 @@ const READ_TOOLS: Array<[string, Record<string, unknown>]> = [
   ["sanctuary_capabilities", {}],
   ["identity_list", {}],
   ["castle_wall_liveness", {}],
+  // Namespace discovery, the bulk form. Last, because it is Tier 1 and writes an approval row.
+  ["state_export", {}],
 ];
-
-/** Tools whose answers report the agent's own stored records: sizes and names. */
-const RECORD_DEPENDENT = new Set(["monitor_health", "state_list"]);
-/** Tools whose answers name per-fortress random identities; compared within each world only. */
-const FORTRESS_SPECIFIC = new Set(["identity_list"]);
 // The paired worlds are two fortresses, and each names its own fortress id (16 hex digits) in the
 // Castle Wall socket path. The id is fixed for the fortress and set before any call, so it is masked.
 const FORTRESS_ID = /fortress-[0-9a-f]{16}/g;
@@ -186,28 +183,82 @@ function maskLiveClocks(name: string, text: string): string {
   return JSON.stringify(walk(value, name === "castle_wall_liveness", true));
 }
 
-async function readTools(world: Clocked, names: (name: string) => boolean): Promise<Array<{ tool: string; isError: boolean; text: string }>> {
-  const out: Array<{ tool: string; isError: boolean; text: string }> = [];
+/** The export's structure: namespaces, key total and per-namespace item counts, never its bundle, hashes or clock. */
+function exportStructure(text: string): unknown {
+  let value: { namespaces?: unknown; total_keys?: unknown; completeness_manifest?: { namespace_items?: Record<string, { item_count?: unknown }> } };
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  const items = value.completeness_manifest?.namespace_items ?? {};
+  return {
+    namespaces: value.namespaces,
+    total_keys: value.total_keys,
+    item_counts: Object.fromEntries(Object.entries(items).map(([namespace, entry]) => [namespace, entry.item_count])),
+  };
+}
+
+/** Each identity's label, key type and key protection, and their count; never its id, key, DID or creation time. */
+function identityStructure(text: string): unknown {
+  let value: { identities?: Array<Record<string, unknown>> };
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  const identities = value.identities ?? [];
+  return {
+    count: identities.length,
+    identities: identities.map((identity) => ({ label: identity.label, key_type: identity.key_type, key_protection: identity.key_protection })),
+  };
+}
+
+/** One answer as a world reports it to itself: the documented live clocks masked, and the export by its structure. */
+function withinWorldView(name: string, text: string): unknown {
+  return name === "state_export" ? exportStructure(text) : maskLiveClocks(name, text);
+}
+
+/**
+ * One answer as it is compared across the two worlds of a pair. The worlds differ in their own random
+ * identity and in the agent's own stored data by construction; every field that could carry the
+ * hidden fact is compared. `storedDataDiffers` marks a pair whose hidden fact is the agent's own
+ * stored record: there state_list is not compared and monitor_health's storage_bytes is left out.
+ * Returns undefined for an answer that is not compared.
+ */
+function crossWorldView(name: string, text: string, storedDataDiffers: boolean): unknown {
+  if (name === "state_export") return exportStructure(text);
+  if (name === "identity_list") return identityStructure(text);
+  if (name === "state_list") return storedDataDiffers ? undefined : maskLiveClocks(name, text);
+  if (name === "monitor_health" && storedDataDiffers) {
+    const masked = maskLiveClocks(name, text);
+    try {
+      const { storage_bytes: _storageBytes, ...rest } = JSON.parse(masked) as Record<string, unknown>;
+      return rest;
+    } catch {
+      return masked;
+    }
+  }
+  return maskLiveClocks(name, text);
+}
+
+async function readTools(world: Clocked, names: (name: string) => boolean): Promise<Array<{ tool: string; isError: boolean; view: unknown }>> {
+  const out: Array<{ tool: string; isError: boolean; view: unknown }> = [];
   for (const [name, args] of READ_TOOLS) {
     if (!names(name)) continue;
     const answer = await world.world.server.callTool(name, args);
-    out.push({ tool: `${name} ${JSON.stringify(args)}`, isError: answer.isError, text: maskLiveClocks(name, answer.text) });
+    out.push({ tool: `${name} ${JSON.stringify(args)}`, isError: answer.isError, view: withinWorldView(name, answer.text) });
   }
   return out;
 }
 
-/**
- * The rest of the agent's tools answer the same in both worlds. When the hidden fact is the agent's
- * own stored data, the tools that report those records are compared within each world instead
- * (before the script and after its jobs end), so the job's work shows in neither.
- */
+/** Every other agent tool in READ_TOOLS answers the same in both worlds, through crossWorldView. */
 async function expectSameReadTools(a: Clocked, b: Clocked, storedDataDiffers = false): Promise<void> {
   for (const [name, args] of READ_TOOLS) {
-    if (FORTRESS_SPECIFIC.has(name) || (storedDataDiffers && RECORD_DEPENDENT.has(name))) continue;
     const left = await a.world.server.callTool(name, args);
     const right = await b.world.server.callTool(name, args);
-    expect({ isError: right.isError, text: maskLiveClocks(name, right.text) }, `${name} ${JSON.stringify(args)}`)
-      .toEqual({ isError: left.isError, text: maskLiveClocks(name, left.text) });
+    expect({ isError: right.isError, view: crossWorldView(name, right.text, storedDataDiffers) }, `${name} ${JSON.stringify(args)}`)
+      .toEqual({ isError: left.isError, view: crossWorldView(name, left.text, storedDataDiffers) });
   }
 }
 
@@ -269,6 +320,74 @@ const PAIRS: Pair[] = [
     jobs: 5,
   },
 ];
+
+// Answers shaped as the probe recorded them (ids, keys and hashes shortened); used only by the mutation control.
+const SAMPLE: Record<"state_export" | "identity_list" | "monitor_health" | "state_list", string> = {
+  state_export: JSON.stringify({
+    bundle: "eyJhIjoxfQ", namespaces: ["notes"], total_keys: 1, bundle_hash: "U0rV", exported_at: "2026-11-25T05:11:57.696Z",
+    completeness_manifest: { schema_version: 1, format: "sanctuary-v1", exported_at: "2026-11-25T05:11:57.696Z", namespaces: ["notes"], namespace_count: 1, total_keys: 1, namespace_items: { notes: { item_count: 1, content_sha256: "12ia" } } },
+  }),
+  identity_list: JSON.stringify({ identities: [{ identity_id: "c55a", label: "writer", public_key: "nAdy", did: "did:key:z6Mk", created_at: "2026-11-25T05:12:17.795Z", key_type: "ed25519", key_protection: "recovery-key" }] }),
+  monitor_health: JSON.stringify({ status: "degraded", storage_bytes: 1496, layers: { l1: { key_count: 1 } }, checked_at: "2026-11-25T05:12:17.795Z" }),
+  state_list: JSON.stringify({ keys: [{ key: "one", version: 1, size_bytes: 1496, written_at: "2027-01-15T08:00:00.000Z", tags: [] }], total: 1, merkle_root: "_5qA" }),
+};
+
+type Mutation = [tool: keyof typeof SAMPLE, field: string, mutate: (value: Record<string, any>) => void];
+/** Every field compared across worlds, each with an injected difference the comparison must catch. */
+const COMPARED: Mutation[] = [
+  ["state_export", "namespaces", (v) => { v.namespaces = ["notes", "other"]; }],
+  ["state_export", "total_keys", (v) => { v.total_keys = 2; }],
+  ["state_export", "item count", (v) => { v.completeness_manifest.namespace_items.notes.item_count = 2; }],
+  ["identity_list", "count", (v) => { v.identities.push({ ...v.identities[0] }); }],
+  ["identity_list", "label", (v) => { v.identities[0].label = "other"; }],
+  ["identity_list", "key_type", (v) => { v.identities[0].key_type = "x25519"; }],
+  ["identity_list", "key_protection", (v) => { v.identities[0].key_protection = "passphrase"; }],
+  ["monitor_health", "a field other than storage_bytes", (v) => { v.layers.l1.key_count = 2; }],
+  ["state_list", "a key's size", (v) => { v.keys[0].size_bytes = 1497; }],
+];
+/** Every field left out of the cross-world comparison: per-fortress randomness and clocks only. */
+const UNCOMPARED: Mutation[] = [
+  ["state_export", "bundle", (v) => { v.bundle = "eyJiIjoyfQ"; }],
+  ["state_export", "bundle_hash", (v) => { v.bundle_hash = "V1tG"; }],
+  ["state_export", "exported_at", (v) => { v.exported_at = "2026-11-25T05:11:57.943Z"; v.completeness_manifest.exported_at = v.exported_at; }],
+  ["state_export", "content hash", (v) => { v.completeness_manifest.namespace_items.notes.content_sha256 = "bTtL"; }],
+  ["identity_list", "identity_id", (v) => { v.identities[0].identity_id = "9949"; }],
+  ["identity_list", "public_key", (v) => { v.identities[0].public_key = "U0o5"; }],
+  ["identity_list", "did", (v) => { v.identities[0].did = "did:key:z6Mn"; }],
+  ["identity_list", "created_at", (v) => { v.identities[0].created_at = "2026-11-25T05:12:23.327Z"; }],
+];
+
+function mutated(tool: keyof typeof SAMPLE, mutate: (value: Record<string, any>) => void): string {
+  const value = JSON.parse(SAMPLE[tool]) as Record<string, any>;
+  mutate(value);
+  return JSON.stringify(value);
+}
+
+describe("the cross-world comparison of the read tools", () => {
+  it.each(COMPARED)("catches an injected difference in %s %s", (tool, _field, mutate) => {
+    // A record-dependent field is caught in the pairs that compare it; the rest are caught in every pair.
+    const pairs = tool === "state_list" ? [false] : [false, true];
+    for (const storedDataDiffers of pairs) {
+      expect(crossWorldView(tool, mutated(tool, mutate), storedDataDiffers)).not.toEqual(crossWorldView(tool, SAMPLE[tool], storedDataDiffers));
+    }
+  });
+
+  it.each(UNCOMPARED)("leaves out %s %s, which differs between fortresses by construction", (tool, _field, mutate) => {
+    for (const storedDataDiffers of [false, true]) {
+      expect(crossWorldView(tool, mutated(tool, mutate), storedDataDiffers)).toEqual(crossWorldView(tool, SAMPLE[tool], storedDataDiffers));
+    }
+  });
+
+  it("compares storage_bytes and state_list only in pairs whose hidden fact is not the agent's own stored record", () => {
+    const bigger = mutated("monitor_health", (v) => { v.storage_bytes = 5056; });
+    expect(crossWorldView("monitor_health", bigger, false)).not.toEqual(crossWorldView("monitor_health", SAMPLE.monitor_health, false));
+    expect(crossWorldView("monitor_health", bigger, true)).toEqual(crossWorldView("monitor_health", SAMPLE.monitor_health, true));
+    expect(crossWorldView("state_list", SAMPLE.state_list, true)).toBeUndefined();
+    // The pairs whose hidden fact is not the agent's own stored record, where both are compared in full.
+    expect(PAIRS.filter((pair) => !pair.storedDataDiffers).map((pair) => pair.name))
+      .toEqual(["coverage", "model availability", "worker alive or killed", "a job running or idle"]);
+  });
+});
 
 describe("the agent's view does not depend on a hidden fact", () => {
   it.each(PAIRS)("$name: same responses and shared log, different operator log", async (pair) => {
