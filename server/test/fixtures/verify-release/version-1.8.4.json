@@ -1,0 +1,23 @@
+{
+  "name": "@sanctuary-framework/mcp-server",
+  "version": "1.8.4",
+  "dist": {
+    "shasum": "6c7993bfd4058f2008c16183fb5484a4bd0a2f13",
+    "tarball": "https://registry.npmjs.org/@sanctuary-framework/mcp-server/-/mcp-server-1.8.4.tgz",
+    "fileCount": 81,
+    "integrity": "sha512-J/F2Hf/aNp74pFCl4rIkHGiJ1T82ifYjI1sgKf6E8YejWvo1p18RaIjdQYNWkevsp1fbUxbH8yYFXFAs5o+jPA==",
+    "signatures": [
+      {
+        "sig": "MEYCIQDiZst3tN5pezU+CXNHWVp9z3cZv02Cm+P8YoOrbv/pXAIhAOYjDpACA3FMPKxzoY8HKqNEjgAL/UaSOCRHaVhRMOaZ",
+        "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+      }
+    ],
+    "attestations": {
+      "url": "https://registry.npmjs.org/-/npm/v1/attestations/@sanctuary-framework%2fmcp-server@1.8.4",
+      "provenance": {
+        "predicateType": "https://slsa.dev/provenance/v1"
+      }
+    },
+    "unpackedSize": 132452876
+  }
+}
