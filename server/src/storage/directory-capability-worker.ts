@@ -206,8 +206,9 @@ async function perform(
     case "listKeysBounded": {
       // Must match FilesystemStorage.listKeysBounded in filesystem.ts: the worker
       // validates the bound itself and streams its own scan, stopping at bound plus one.
+      // The request argument reaches the bound check uncoerced: it must be a number; must match assertEnumerationBound in interface.ts.
       const { namespace, args } = requestNamespaceArg(request);
-      const maxKeys = Number(args[0]);
+      const maxKeys: unknown = args[0];
       assertEnumerationBound(maxKeys);
       return storage.listKeysBounded(namespace, maxKeys);
     }

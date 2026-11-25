@@ -163,4 +163,25 @@ describe("capability worker", () => {
       });
     }
   }, 30_000); // One real worker startup includes the production CLI import graph.
+
+  it("the capability worker refuses a bound that is not a number, as the direct backend does", async () => {
+    const dir = join(root, NAMESPACE);
+    await mkdir(dir);
+    await writeFile(join(dir, "a.enc"), "fixture");
+    const direct = new FilesystemStorage(join(root, "direct"));
+    await direct.write(NAMESPACE, "a", new Uint8Array([1]));
+    const call = await worker(dir);
+    for (const bound of [null, true, "3", []]) {
+      await expect(direct.listKeysBounded(NAMESPACE, bound as never)).rejects.toThrow(RangeError);
+      await expect(direct.listKeysBounded(NAMESPACE, bound as never)).rejects.toThrow(
+        "Enumeration bound must be a non-negative safe integer",
+      );
+      // Across the worker the refusal carries the same message and no enumeration-bound discriminator.
+      const refusal = await call("listKeysBounded", [bound]).then(
+        (value) => ({ accepted: value }),
+        (error: { message: string; type?: string }) => ({ message: error.message, type: error.type }),
+      );
+      expect(refusal).toEqual({ message: "Enumeration bound must be a non-negative safe integer", type: undefined });
+    }
+  }, 30_000); // One real worker startup includes the production CLI import graph.
 });

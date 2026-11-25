@@ -200,8 +200,9 @@ export class StorageEnumerationBoundError extends Error {
 }
 
 /** Refuse an enumeration bound that is not a non-negative safe integer; shared by every listKeysBounded implementer. */
-export function assertEnumerationBound(maxKeys: number): void {
-  if (!(Number.isSafeInteger(maxKeys) && maxKeys >= 0)) {
+// Must match the listKeysBounded op in directory-capability-worker.ts, which passes its request argument here uncoerced.
+export function assertEnumerationBound(maxKeys: unknown): asserts maxKeys is number {
+  if (!(typeof maxKeys === "number" && Number.isSafeInteger(maxKeys) && maxKeys >= 0)) {
     throw new RangeError("Enumeration bound must be a non-negative safe integer");
   }
 }
