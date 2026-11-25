@@ -3292,6 +3292,7 @@ export class AuditLog {
     }, { verifyDurability: false, critical: false, outcomeMarker: true });
     // A marker that never lands leaves its call's rows hidden from agent readers; the operator view is unaffected.
     void writePromise.catch(() => {
+      // SAFETY: stderr names only the failed marker operation, without entry content or audit-backed logging.
       console.error(`[audit-log] ${CALL_OUTCOME_SUCCESS_OPERATION} append failed`);
     });
   }
