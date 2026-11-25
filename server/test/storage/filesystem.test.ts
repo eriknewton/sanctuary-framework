@@ -1,3 +1,4 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 /**
  * FilesystemStorage tests
@@ -8,6 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import {
   mkdir,
   mkdtemp,
@@ -300,7 +302,7 @@ describe("FilesystemStorage", () => {
         label: "cooperative-roundtrip-agent",
       });
       binding.current = session(identity.identity_id as string);
-      const { tools: facadeTools } = createAgentNativeCooperativeTools({
+      const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
         identityManager,
         namespaceRegistry,
         auditLog,

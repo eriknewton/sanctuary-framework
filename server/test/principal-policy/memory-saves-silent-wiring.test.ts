@@ -4,6 +4,11 @@ import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { BaselineTracker } from "../../src/principal-policy/baseline.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { stringToBytes } from "../../src/core/encoding.js";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createSanctuaryServer } from "../../src/index.js";
@@ -537,4 +542,181 @@ it("an unclassified validation throw after insert commit leaves intent only", as
     expect(rows.filter(e => e.operation === "memory_insert_intent")).toHaveLength(1);
     expect(rows.filter(e => e.operation === "memory_insert")).toEqual([]);
   } finally { spy.mockRestore(); }
+});
+
+// A namespace a successful remember used is written at once as its own record, so the next process on
+// the same storage knows it without a clean shutdown. These tests seed and read records only through
+// exports that predate the record store, so each fails on a server that keeps namespaces in memory only.
+describe("namespaces a save used are known to the next process", () => {
+  const NS_RECORDS = "_principal_ns";
+  afterEach(() => { vi.restoreAllMocks(); });
+  const recordKey = (namespace: string) => createHash("sha256").update("ns:" + namespace, "utf8").digest("hex");
+
+  async function bootOn(storage: MemoryStorage, options: { createIdentity: boolean }) {
+    const yaml = generateDefaultPolicyYaml().replace(/approval_channel:\n {2}type: \w+/, "approval_channel:\n  type: callback");
+    await writeFile(join(fortressHome.defaultFortressPath, "principal-policy.yaml"), yaml, { mode: POLICY_FILE_MODE });
+    const captured: ApprovalRequest[] = [];
+    const deny = async (request: ApprovalRequest): Promise<ApprovalResponse> => {
+      captured.push(request);
+      return { decision: "deny", decided_at: new Date().toISOString(), decided_by: "human" };
+    };
+    const booted = await createSanctuaryServer({ storage, passphrase: TEST_PASSPHRASE, approvalCallback: deny });
+    cleanups.push(() => booted.cleanup());
+    const masterKey = new Uint8Array(booted.masterKey);
+    const handler = (booted.server as unknown as { _requestHandlers: Map<string, (request: unknown, extra: unknown) => Promise<{ content: Array<{ text: string }> }>> })._requestHandlers.get("tools/call");
+    if (!handler) throw new Error("tools/call handler not registered");
+    const call = (name: string, args: Record<string, unknown>) => handler({ method: "tools/call", params: { name, arguments: args } }, {});
+    if (options.createIdentity) {
+      const identity = JSON.parse((await call("identity_create", { label: "memory-owner" })).content[0].text);
+      process.env.SANCTUARY_SESSION_IDENTITY_ID = identity.identity_id;
+    }
+    return { booted, captured, call, masterKey };
+  }
+
+  async function memoryNamespaces(storage: MemoryStorage): Promise<string[]> {
+    return (await storage.listNamespaces()).filter((namespace) => !namespace.startsWith("_"));
+  }
+
+  async function freshTracker(storage: MemoryStorage, masterKey: Uint8Array): Promise<BaselineTracker> {
+    const tracker = new BaselineTracker(storage, masterKey);
+    await tracker.load();
+    return tracker;
+  }
+
+  /** Make every absent-write to the record namespace fail while armed; other namespaces are untouched. */
+  function failRecordWrites(storage: MemoryStorage): { armed: boolean } {
+    const control = { armed: true };
+    const original = storage.writeIfAbsent.bind(storage);
+    vi.spyOn(storage, "writeIfAbsent").mockImplementation(async (namespace, key, data) => {
+      if (namespace === NS_RECORDS && control.armed) throw new Error("injected record write failure");
+      return original(namespace, key, data);
+    });
+    return control;
+  }
+
+  it("a namespace saved by remember is known to a fresh tracker on the same storage", async () => {
+    const storage = new MemoryStorage();
+    const { call, masterKey } = await bootOn(storage, { createIdentity: true });
+    expect(JSON.parse((await call("sanctuary_remember", { key: "cup", value: "blue" })).content[0].text).key).toBe("cup");
+    const [namespace] = await memoryNamespaces(storage);
+    expect(namespace).toEqual(expect.any(String));
+    const tracker = await freshTracker(storage, masterKey);
+    expect(tracker.isNewNamespace(namespace!)).toBe(false);
+    expect(await storage.listKeys(NS_RECORDS)).toEqual([recordKey(namespace!)]);
+  });
+
+  it("a failed insert leaves the save's response unchanged and writes one row", async () => {
+    const storage = new MemoryStorage();
+    const { booted, call } = await bootOn(storage, { createIdentity: true });
+    failRecordWrites(storage);
+    const body = JSON.parse((await call("sanctuary_remember", { key: "cup", value: "blue" })).content[0].text);
+    expect(Object.keys(body).sort()).toEqual(["audit_ref", "key", "namespace_handle"]);
+    expect(body.key).toBe("cup");
+    expect(body.denied).toBeUndefined();
+    const rows = (await booted.auditLog.query({})).entries.filter((e) => e.operation === "baseline_namespace_persist_failed");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ identity_id: "system", result: "failure" });
+    expect(rows[0]!.details).toEqual({ code: "write_failed", count: 1 });
+    expect(await storage.listKeys(NS_RECORDS)).toEqual([]);
+  });
+
+  it("a pending insert is persisted by the next successful save to the same namespace", async () => {
+    const storage = new MemoryStorage();
+    const { call, masterKey } = await bootOn(storage, { createIdentity: true });
+    const control = failRecordWrites(storage);
+    await call("sanctuary_remember", { key: "cup", value: "blue" });
+    expect(await storage.listKeys(NS_RECORDS)).toEqual([]);
+    control.armed = false;
+    await call("sanctuary_remember", { key: "cup", value: "green" });
+    const [namespace] = await memoryNamespaces(storage);
+    expect(await storage.listKeys(NS_RECORDS)).toEqual([recordKey(namespace!)]);
+    expect((await freshTracker(storage, masterKey)).isNewNamespace(namespace!)).toBe(false);
+  });
+
+  it("a failed insert whose failure row also fails leaves the save unchanged", async () => {
+    const storage = new MemoryStorage();
+    const { booted, call } = await bootOn(storage, { createIdentity: true });
+    failRecordWrites(storage);
+    const appendCritical = booted.auditLog.appendCritical.bind(booted.auditLog);
+    vi.spyOn(booted.auditLog, "appendCritical").mockImplementation(async (entry) => {
+      if (entry.operation === "baseline_namespace_persist_failed") throw new Error("injected row failure");
+      return appendCritical(entry);
+    });
+    const lines: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse((await call("sanctuary_remember", { key: "cup", value: "blue" })).content[0].text);
+    } finally {
+      stderr.mockRestore();
+    }
+    expect(Object.keys(body).sort()).toEqual(["audit_ref", "key", "namespace_handle"]);
+    expect(lines.filter((line) => line ===
+      "Sanctuary: a memory namespace could not be recorded for the next session, and the failure could not be audited.\n",
+    )).toHaveLength(1);
+  });
+
+  it("a refused save writes no insert record", async () => {
+    const storage = new MemoryStorage();
+    const { call } = await bootOn(storage, { createIdentity: true });
+    // A key the storage cannot address is refused by the primitive after the gate passed the save.
+    const body = JSON.parse((await call("sanctuary_remember", { key: "cup-中", value: "blue" })).content[0].text);
+    expect(body.denied).toBe(true);
+    expect(await storage.listKeys(NS_RECORDS)).toEqual([]);
+  });
+
+  it("remember, kill-equivalent restart without cleanup, recall with no approval request", async () => {
+    const storage = new MemoryStorage();
+    const first = await bootOn(storage, { createIdentity: true });
+    expect(JSON.parse((await first.call("sanctuary_remember", { key: "cup", value: "blue" })).content[0].text).key).toBe("cup");
+    expect(first.captured).toHaveLength(0);
+    // The first server is dropped with no cleanup, so no snapshot is saved before the second boot.
+    const second = await bootOn(storage, { createIdentity: false });
+    const recalled = JSON.parse((await second.call("sanctuary_recall", { key: "cup" })).content[0].text);
+    expect(second.captured).toEqual([]);
+    expect(recalled.value).toBe("blue");
+  });
+
+  it("a fortress with more insert records than the bound boots with none of them, one system row and one stderr line", async () => {
+    const storage = new MemoryStorage();
+    const { masterKey, booted: seedServer } = await bootOn(storage, { createIdentity: true });
+    await seedServer.cleanup();
+    cleanups.pop();
+    const purposeKey = derivePurposeKey(masterKey, "principal-baseline");
+    const seeded: string[] = [];
+    // 1,025 = one record past the 1,024-record load bound.
+    for (let index = 0; index < 1025; index++) {
+      const namespace = `seeded-${index}`;
+      seeded.push(namespace);
+      await storage.write(NS_RECORDS, recordKey(namespace), stringToBytes(JSON.stringify(encrypt(stringToBytes(namespace), purposeKey))));
+    }
+    const trackers: BaselineTracker[] = [];
+    const load = BaselineTracker.prototype.load;
+    vi.spyOn(BaselineTracker.prototype, "load").mockImplementation(async function (this: BaselineTracker) {
+      trackers.push(this);
+      return load.call(this);
+    });
+    const lines: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    let booted: Awaited<ReturnType<typeof createSanctuaryServer>>;
+    try {
+      ({ booted } = await bootOn(storage, { createIdentity: false }));
+    } finally {
+      stderr.mockRestore();
+    }
+    const rows = (await booted.auditLog.query({})).entries.filter((e) => e.operation === "baseline_namespace_load_bounded");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ identity_id: "system", details: { code: "enumeration_over_bound", count: 0 } });
+    expect(lines.filter((line) =>
+      line === "Sanctuary: saved memory namespaces were not loaded (enumeration_over_bound); a namespace outside the saved baseline asks for approval again.\n",
+    )).toHaveLength(1);
+    expect(trackers).toHaveLength(1);
+    expect(seeded.filter((namespace) => !trackers[0]!.isNewNamespace(namespace))).toEqual([]);
+  });
 });

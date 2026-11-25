@@ -1,3 +1,4 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 /**
  * F2 BLOCKER-1 (adversarial re-gate round 3, 2026-07-14) REQUIRED REPRO.
@@ -22,6 +23,7 @@
  */
 // fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 
 
@@ -92,7 +94,7 @@ async function migratedFortressWithSurface() {
   const identityId = identity.identity_id as string;
   active = { identity_id: identityId, requester_identity_fingerprint: fingerprintIdentityId(identityId) };
 
-  const { tools: facadeTools } = createAgentNativeCooperativeTools({
+  const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
     identityManager,
     namespaceRegistry,
     auditLog,

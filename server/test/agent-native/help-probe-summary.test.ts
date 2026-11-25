@@ -1,6 +1,8 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: the synthetic probe origins now read as loaded identities, because a cooperative session is confirmed against the identity manager; probe cadence and unbound assertions are unchanged.
 /** Help probe summaries retain bounded state and reserve audit rows synchronously. */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import * as surface from "../../src/agent-native/cooperative-surface.js";
 import { classifyIntent, HELP_NEEDLES, HELP_INTENT_MAX_CHARS, HELP_MAX_VARIANTS } from "../../src/agent-native/intent-classifier.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
@@ -31,7 +33,7 @@ function setup(storage = new MemoryStorage(), checkpointInterval?: number) {
   const { tools, identityManager, namespaceRegistry } = createL1Tools(new StateStore(storage, key), storage, key, "recovery-key", auditLog);
   // Test-only manager: each synthetic origin is a loaded identity, so its binding is a confirmed session.
   vi.spyOn(identityManager, "get").mockImplementation((id: string) => ({ identity_id: id }) as ReturnType<typeof identityManager.get>);
-  const help = surface.createAgentNativeCooperativeTools({ identityManager, namespaceRegistry, auditLog,
+  const help = surface.createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), identityManager, namespaceRegistry, auditLog,
     primitiveTools: tools, currentSessionBinding: () => binding, now: () => now,
   }).tools.find(tool => tool.name === "sanctuary_help")!;
   const call = async (intent: string) => JSON.parse((await help.handler({ intent })).content[0]!.text);

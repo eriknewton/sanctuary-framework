@@ -1,5 +1,7 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: cognitive tools now take a session binding together with its boot decision; this file supplies a named boot decision beside its existing binding and asserts no new behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -71,7 +73,7 @@ async function setup() {
   await identityManager.load();
   const identity = await callTool(l1Tools, "identity_create", { label: "agent-a" });
   active = session(identity.identity_id as string);
-  const { tools: facadeTools } = createAgentNativeCooperativeTools({
+  const { tools: facadeTools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
     identityManager,
     namespaceRegistry,
     auditLog,

@@ -32,7 +32,7 @@ import type {
   ApprovalResponse,
   PrincipalPolicy,
 } from "./principal-policy/types.js";
-import { BaselineTracker } from "./principal-policy/baseline.js";
+import { BaselineNamespaceInserts, BaselineTracker, reportBaselineInsertLoad } from "./principal-policy/baseline.js";
 import {
   StderrApprovalChannel,
   type ApprovalChannel,
@@ -1305,7 +1305,17 @@ export async function createSanctuaryServer(options?: {
     throw err;
   }
   const baseline = new BaselineTracker(storage, masterKey);
-  await baseline.load();
+  const baselineLoadReport = await baseline.load();
+  // SAFETY: no structured logger module is wired in server/src/ yet; raw stderr is the runtime warning channel here.
+  await reportBaselineInsertLoad(baselineLoadReport, auditLog, (line) => { process.stderr.write(line); });
+  const baselineNamespaceInserts = new BaselineNamespaceInserts({
+    storage,
+    masterKey,
+    auditLog,
+    // SAFETY: no structured logger module is wired in server/src/ yet; raw stderr is the runtime warning channel here.
+    stderr: (line) => { process.stderr.write(line); },
+    now: Date.now,
+  });
 
   let approvalChannel: ApprovalChannel;
   let dashboard: DashboardApprovalChannel | undefined;
@@ -2264,6 +2274,7 @@ export async function createSanctuaryServer(options?: {
     resolveBrokerProducerKey: () => dashboard?.resolveBrokerProducerKey()
       ?? Promise.resolve({ keyB64url: null, observation: "unknown" }),
     approvalProofStore,
+    baselineNamespaceInserts,
   });
 
   // 16c. HABEAS PORT distress emission surface (agent-side sovereignty,
@@ -2560,6 +2571,8 @@ export async function createSanctuaryServer(options?: {
         try { await constructionWork.drain(); } catch (e) { errors.push(e); }
         // Flush persistence last; audit flush must follow inbox and baseline.
         try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
+        // Pending namespace inserts are retried before the snapshot is saved.
+        try { await baselineNamespaceInserts.flushPending(); } catch (e) { errors.push(e); }
         try { await baseline.save(); } catch (e) { errors.push(e); }
         // The ledger closes its windows (summaries within budget) and waits a bounded time before the final audit flush.
         try { await denialLedger.close(); } catch (e) { errors.push(e); }

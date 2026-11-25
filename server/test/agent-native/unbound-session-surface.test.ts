@@ -1,5 +1,7 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 /** A session with no identity says so, and its bound-only cooperative tools refuse before the gate. */
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createSanctuaryServer } from "../../src/index.js";
@@ -209,7 +211,7 @@ async function direct(binding: () => SessionBinding | undefined) {
   const created = await l1Tools.find((tool) => tool.name === "identity_create")!.handler({ label: "direct-subject" });
   const id = JSON.parse(created.content[0]!.text).identity_id as string;
   primitiveBinding = { identity_id: id, requester_identity_fingerprint: fingerprintIdentityId(id) };
-  const { tools } = createAgentNativeCooperativeTools({
+  const { tools } = createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(),
     identityManager, namespaceRegistry, auditLog, currentSessionBinding: binding, primitiveTools: l1Tools, storage, stateStore,
   });
   const call = async (name: string) => body(await tools.find((tool) => tool.name === name)!.handler({}));
