@@ -23,9 +23,10 @@ import { assertStorageNamespacePathComponent } from "./namespace-component.js";
 
 export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabilities {
   private store = new Map<string, { data: Uint8Array; modified_at: string }>();
-  // Composite store keys are `${namespace}/${key}` and a namespace or key may
-  // itself contain "/", so each live namespace's keys are indexed exactly
-  // rather than re-parsed out of composite keys. The index changes in step with
+  // Composite store keys are `${namespace.length}:${namespace}/${key}` (see
+  // storageKey): a namespace or key may itself contain "/", and the length
+  // prefix keeps every (namespace, key) pair on its own entry. Each live
+  // namespace's keys are also indexed exactly; the index changes in step with
   // every insert and delete of a store entry.
   private namespaceKeys = new Map<string, Set<string>>();
   private namespaceLockTails = new Map<string, Promise<void>>();
@@ -71,7 +72,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
 
   private storageKey(namespace: string, key: string): string {
     assertStorageNamespacePathComponent(namespace);
-    return `${namespace}/${key}`;
+    return `${namespacePrefix(namespace)}${key}`;
   }
 
   async writeIfAbsent(
@@ -159,7 +160,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
     assertStorageNamespacePathComponent(namespace);
     const entries: StorageEntryMeta[] = [];
-    const nsPrefix = `${namespace}/`;
+    const nsPrefix = namespacePrefix(namespace);
 
     for (const [storeKey, entry] of this.store) {
       if (!storeKey.startsWith(nsPrefix)) continue;
@@ -180,7 +181,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   /** Must match the complete, code-unit ordered listKeys contract in interface.ts. */
   async listKeys(namespace: string, prefix?: string): Promise<string[]> {
     assertStorageNamespacePathComponent(namespace);
-    const nsPrefix = `${namespace}/`;
+    const nsPrefix = namespacePrefix(namespace);
     const keys: string[] = [];
     for (const storeKey of this.store.keys()) {
       if (!storeKey.startsWith(nsPrefix)) continue;
@@ -223,7 +224,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     let total = 0;
     for (const [key, entry] of this.store) {
       // The predicate sees the namespace component of the composite key (see storageKey), never the key itself.
-      const namespace = key.slice(0, key.indexOf("/"));
+      const namespace = namespaceOfStorageKey(key);
       if (!isAgentAggregateReservedNamespace(namespace)) total += entry.data.length;
     }
     return total;
@@ -256,6 +257,22 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     this.store.clear();
     this.namespaceKeys.clear();
   }
+}
+
+/**
+ * The composite-key prefix for one namespace. The decimal length before the colon makes the prefix
+ * unambiguous: no two namespaces share a prefix, and no (namespace, key) pair shares an entry with another,
+ * even when either part contains "/". Must match namespaceOfStorageKey below.
+ */
+function namespacePrefix(namespace: string): string {
+  return `${namespace.length}:${namespace}/`;
+}
+
+/** The namespace a composite store key belongs to. Must match namespacePrefix above. */
+function namespaceOfStorageKey(storageKey: string): string {
+  const colon = storageKey.indexOf(":");
+  const length = Number(storageKey.slice(0, colon));
+  return storageKey.slice(colon + 1, colon + 1 + length);
 }
 
 async function waitForNamespaceLockTurn(

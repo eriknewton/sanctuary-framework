@@ -185,7 +185,7 @@ export interface CapabilityError {
   errors?: CapabilityError[];
   cause?: CapabilityError;
   /** Names a typed storage error the parent rebuilds as that class; absent for every other failure. */
-  type?: typeof CAPABILITY_ERROR_TYPE_READ_BOUND | typeof CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND;
+  type?: typeof CAPABILITY_ERROR_TYPE_READ_BOUND | typeof CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND | typeof CAPABILITY_ERROR_TYPE_RANGE;
 }
 
 /**
@@ -201,6 +201,13 @@ const CAPABILITY_ERROR_TYPE_READ_BOUND = "storage_read_bound";
  */
 const CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND = "storage_enumeration_bound";
 
+/**
+ * The wire discriminator for a plain RangeError, such as an invalid bound refused by
+ * assertEnumerationBound in interface.ts. Must match on both sides of the worker IPC,
+ * as CAPABILITY_ERROR_TYPE_READ_BOUND does.
+ */
+const CAPABILITY_ERROR_TYPE_RANGE = "range";
+
 /** Preserve every strict failure across the private worker IPC boundary. */
 export function serializeCapabilityError(error: unknown): CapabilityError {
   const value: CapabilityError = { message: error instanceof Error ? error.message : String(error) };
@@ -208,6 +215,8 @@ export function serializeCapabilityError(error: unknown): CapabilityError {
   // classifies a bounded-read refusal with instanceof must see the same type on every backend path.
   if (error instanceof StorageReadBoundError) value.type = CAPABILITY_ERROR_TYPE_READ_BOUND;
   if (error instanceof StorageEnumerationBoundError) value.type = CAPABILITY_ERROR_TYPE_ENUMERATION_BOUND;
+  // A refusal of an invalid argument keeps its RangeError type across the worker, as on the direct backend.
+  if (value.type === undefined && error instanceof RangeError) value.type = CAPABILITY_ERROR_TYPE_RANGE;
   if (error instanceof Error) {
     for (const key of ["code", "kind", "rawName", "rawNamespace"] as const) {
       const field = (error as unknown as Record<string, unknown>)[key];
@@ -228,7 +237,9 @@ export function deserializeCapabilityError(value: CapabilityError): Error {
   const options = value.cause ? { cause: deserializeCapabilityError(value.cause) } : undefined;
   const error = value.errors
     ? new AggregateError(value.errors.map(deserializeCapabilityError), value.message, options)
-    : new Error(value.message, options);
+    : value.type === CAPABILITY_ERROR_TYPE_RANGE
+      ? new RangeError(value.message, options)
+      : new Error(value.message, options);
   for (const key of ["code", "kind", "rawName", "rawNamespace"] as const) {
     if (value[key] !== undefined) Object.assign(error, { [key]: value[key] });
   }

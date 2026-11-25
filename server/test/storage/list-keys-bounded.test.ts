@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { FilesystemStorage, deserializeCapabilityError } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { ReadOnlyStorageGuard } from "../../src/storage/read-only-guard.js";
 import { StorageEnumerationBoundError, type StorageBackend } from "../../src/storage/interface.js";
@@ -188,12 +188,15 @@ describe("capability worker", () => {
       await expect(direct.listKeysBounded(NAMESPACE, bound as never)).rejects.toThrow(
         "Enumeration bound must be a non-negative safe integer",
       );
-      // Across the worker the refusal carries the same message and no enumeration-bound discriminator.
+      // Across the worker the refusal carries the same message and its RangeError type, never the enumeration-bound type.
       const refusal = await call("listKeysBounded", [bound]).then(
         (value) => ({ accepted: value }),
         (error: { message: string; type?: string }) => ({ message: error.message, type: error.type }),
       );
-      expect(refusal).toEqual({ message: "Enumeration bound must be a non-negative safe integer", type: undefined });
+      expect(refusal).toEqual({ message: "Enumeration bound must be a non-negative safe integer", type: "range" });
+      const rebuilt = deserializeCapabilityError(refusal as { message: string; type?: "range" });
+      expect(rebuilt).toBeInstanceOf(RangeError);
+      expect(rebuilt).not.toBeInstanceOf(StorageEnumerationBoundError);
     }
   }, 30_000); // One real worker startup includes the production CLI import graph.
 });
@@ -204,6 +207,21 @@ describe("memory namespace boundaries and work", () => {
     await storage.write("parent/child", "key", new Uint8Array([1]));
     expect(await storage.listKeysBounded("parent", 10)).toEqual([]);
     expect(await storage.listKeysBounded("parent/child", 10)).toEqual(["key"]);
+  });
+
+  it("two pairs whose namespace and key join to the same text keep separate entries on the memory backend", async () => {
+    const storage = new MemoryStorage();
+    await storage.write("parent/child", "key", new Uint8Array([1]));
+    await storage.write("parent", "child/key", new Uint8Array([2]));
+    expect(await storage.read("parent/child", "key")).toEqual(new Uint8Array([1]));
+    expect(await storage.read("parent", "child/key")).toEqual(new Uint8Array([2]));
+    expect(await storage.listKeysBounded("parent", 10)).toEqual(["child/key"]);
+    expect(await storage.listKeys("parent")).toEqual(["child/key"]);
+    expect(await storage.delete("parent", "child/key")).toBe(true);
+    expect(await storage.read("parent/child", "key")).toEqual(new Uint8Array([1]));
+    expect(await storage.listKeysBounded("parent/child", 10)).toEqual(["key"]);
+    expect(await storage.listKeysBounded("parent", 10)).toEqual([]);
+    expect((await storage.list("parent/child")).map((entry) => entry.key)).toEqual(["key"]);
   });
 
   it("listing one namespace with bound 1 visits at most two entries beside 10,000 unrelated ones", async () => {
