@@ -35,6 +35,24 @@ afterEach(async () => {
 
 const NAMESPACE = "fixture";
 
+/** Count every entry a memory listing visits, whether it walks the whole store or a namespace's own index. */
+function countMemoryVisits(storage: StorageBackend): { seen: () => number } {
+  let seen = 0;
+  const counted = <T>(iterator: Iterator<T>): IterableIterator<T> =>
+    (function* () { for (let next = iterator.next(); !next.done; next = iterator.next()) { seen++; yield next.value; } })();
+  const internals = storage as unknown as { store: Map<string, unknown>; namespaceKeys?: Map<string, Set<string>> };
+  const store = internals.store;
+  const keys = store.keys.bind(store);
+  const entries = store[Symbol.iterator].bind(store);
+  store.keys = (() => counted(keys())) as typeof store.keys;
+  store[Symbol.iterator] = (() => counted(entries())) as typeof store[typeof Symbol.iterator];
+  for (const set of internals.namespaceKeys?.values() ?? []) {
+    const iterate = set[Symbol.iterator].bind(set);
+    set[Symbol.iterator] = (() => counted(iterate())) as typeof set[typeof Symbol.iterator];
+  }
+  return { seen: () => seen };
+}
+
 interface Backend {
   name: string;
   make(): StorageBackend;
@@ -46,13 +64,7 @@ const backends: Backend[] = [
   {
     name: "MemoryStorage",
     make: () => new MemoryStorage(),
-    countSeen(storage) {
-      let seen = 0;
-      const store = (storage as unknown as { store: Map<string, unknown> }).store;
-      const keys = store.keys.bind(store);
-      store.keys = function* () { for (const key of keys()) { seen++; yield key; } } as typeof store.keys;
-      return { seen: () => seen };
-    },
+    countSeen: countMemoryVisits,
   },
   {
     name: "FilesystemStorage",
@@ -119,7 +131,7 @@ describe("FilesystemStorage scan bound", () => {
   });
 });
 
-async function worker(cwd: string) {
+async function worker(cwd: string, { boundNamespace = true }: { boundNamespace?: boolean } = {}) {
   const identity = await stat(cwd, { bigint: true });
   const child = spawn(process.execPath, ["--import", createRequire(import.meta.url).resolve("tsx"),
     fileURLToPath(new URL("../../src/storage/directory-capability-worker.ts", import.meta.url)),
@@ -144,7 +156,7 @@ async function worker(cwd: string) {
         else reject(Object.assign(new Error(message.error!.message), message.error));
       };
       child.on("message", receive);
-      child.send({ id: requestId, op, args, boundNamespace: true });
+      child.send({ id: requestId, op, args, ...(boundNamespace ? { boundNamespace: true } : {}) });
     });
   };
 }
@@ -183,5 +195,88 @@ describe("capability worker", () => {
       );
       expect(refusal).toEqual({ message: "Enumeration bound must be a non-negative safe integer", type: undefined });
     }
+  }, 30_000); // One real worker startup includes the production CLI import graph.
+});
+
+describe("memory namespace boundaries and work", () => {
+  it("a key stored under a nested namespace name is not listed under its parent", async () => {
+    const storage = new MemoryStorage();
+    await storage.write("parent/child", "key", new Uint8Array([1]));
+    expect(await storage.listKeysBounded("parent", 10)).toEqual([]);
+    expect(await storage.listKeysBounded("parent/child", 10)).toEqual(["key"]);
+  });
+
+  it("listing one namespace with bound 1 visits at most two entries beside 10,000 unrelated ones", async () => {
+    const storage = new MemoryStorage();
+    for (let index = 0; index < 10_000; index++) {
+      await storage.write(`unrelated-${index % 100}`, `key-${index}`, new Uint8Array([1]));
+    }
+    await storage.write("_principal_ns", "first", new Uint8Array([1]));
+    const one = countMemoryVisits(storage);
+    expect(await storage.listKeysBounded("_principal_ns", 1)).toEqual(["first"]);
+    expect(one.seen()).toBeLessThanOrEqual(2);
+    await storage.write("_principal_ns", "second", new Uint8Array([1]));
+    const two = countMemoryVisits(storage);
+    await expect(storage.listKeysBounded("_principal_ns", 1)).rejects.toBeInstanceOf(StorageEnumerationBoundError);
+    expect(two.seen()).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("bounded listing parity", () => {
+  const WRITES: Array<[string, string]> = [
+    ["parent/child", "key"],
+    ["parent", "plain"],
+    ["slashkey", "child/key"],
+    ...["x1", "x2", "x3", "x4", "x5"].map((key): [string, string] => ["other", key]),
+  ];
+  const NAMESPACES = ["parent", "parent/child", "slashkey", "other", "missing"];
+  const BOUNDS: unknown[] = [0, 1, 5, 10, -1, null];
+  const INVALID = "Enumeration bound must be a non-negative safe integer";
+
+  type Outcome = string[] | "over_bound" | "invalid_bound" | string;
+  const classify = (error: unknown): Outcome => {
+    if (error instanceof StorageEnumerationBoundError) return "over_bound";
+    const { message, type } = error as { message?: string; type?: string };
+    if (type === "storage_enumeration_bound") return "over_bound";
+    if (message === INVALID) return "invalid_bound";
+    return `other: ${String(message)}`;
+  };
+  const table = async (list: (namespace: string, bound: unknown) => Promise<unknown>) => {
+    const rows: Array<[string, unknown, Outcome]> = [];
+    for (const namespace of NAMESPACES) {
+      for (const bound of BOUNDS) {
+        rows.push([namespace, bound, await list(namespace, bound).then((keys) => keys as string[], classify)]);
+      }
+    }
+    return rows;
+  };
+  const expected = (() => {
+    const keys: Record<string, string[]> = {
+      parent: ["plain"], "parent/child": ["key"], slashkey: ["child/key"], other: ["x1", "x2", "x3", "x4", "x5"], missing: [],
+    };
+    return NAMESPACES.flatMap((namespace) => BOUNDS.map((bound): [string, unknown, Outcome] => [
+      namespace,
+      bound,
+      typeof bound !== "number" || bound < 0 ? "invalid_bound" : keys[namespace]!.length > bound ? "over_bound" : keys[namespace]!,
+    ]));
+  })();
+
+  it("every backend lists the same keys and gives the same refusals for nested names and unrelated namespaces", async () => {
+    const memory = new MemoryStorage();
+    const base = join(root, "parity");
+    const filesystem = new FilesystemStorage(base);
+    for (const [namespace, key] of WRITES) {
+      await memory.write(namespace, key, new Uint8Array([1]));
+      await filesystem.write(namespace, key, new Uint8Array([1]));
+    }
+    const call = await worker(base, { boundNamespace: false });
+    const results = {
+      memory: await table((namespace, bound) => memory.listKeysBounded(namespace, bound as never)),
+      filesystem: await table((namespace, bound) => filesystem.listKeysBounded(namespace, bound as never)),
+      readOnlyMemory: await table((namespace, bound) => new ReadOnlyStorageGuard(memory).listKeysBounded!(namespace, bound as never)),
+      readOnlyFilesystem: await table((namespace, bound) => new ReadOnlyStorageGuard(filesystem).listKeysBounded!(namespace, bound as never)),
+      worker: await table((namespace, bound) => call("listKeysBounded", [namespace, bound])),
+    };
+    for (const rows of Object.values(results)) expect(rows).toEqual(expected);
   }, 30_000); // One real worker startup includes the production CLI import graph.
 });
