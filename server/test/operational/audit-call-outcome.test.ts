@@ -6,11 +6,13 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  agentVisibleEntries,
   AuditLog,
   CALL_OUTCOME_SUCCESS_OPERATION,
   ReservedAuditOperationError,
   runInCallScope,
   settleCallOutcome,
+  visibleCallRefs,
   writeCallOutcomeMarkers,
   type AuditEntry,
   type AuditEntryInput,
@@ -240,7 +242,7 @@ describe("success markers", () => {
   });
 
   it("a row its call appends after the marker keeps its reference and lands after the marker", async () => {
-    // Its visibility once durable is witnessed in test/operational/audit-call-visibility.test.ts.
+    // Its visibility once durable is witnessed under "agent visibility" below.
     const { log } = freshLog();
     let callRef = "";
     await runInCallScope(async (scope) => {
@@ -394,5 +396,155 @@ describe("marker faults and reopen", () => {
     expect(after).toEqual(before);
     expect(after[0]!.call_ref).toBe(callRef);
     expect(markers(after)[0]!.details).toEqual({ call_ref: callRef, outcome: "success" });
+  });
+});
+
+describe("agent visibility", () => {
+  async function markedCall(log: AuditLog, operation: string, outcome: "succeeded" | "refused"): Promise<string> {
+    let callRef = "";
+    await runInCallScope(async (scope) => {
+      callRef = scope.call_ref;
+      await own(log, operation);
+      settleCallOutcome(scope, outcome);
+      writeCallOutcomeMarkers(scope);
+    });
+    await log.flush();
+    return callRef;
+  }
+
+  it("agent-visible query returns a stamped row only when its marker is in the retained window; an unstamped row is returned as today", async () => {
+    const { log } = freshLog();
+    await own(log, "outside");
+    await markedCall(log, "succeeded_call", "succeeded");
+    await markedCall(log, "refused_call", "refused");
+    const visible = await log.query({ limit: 100, agent_visible: true });
+    expect(visible.entries.map((row) => row.operation)).toEqual(["outside", "succeeded_call"]);
+    const operator = await log.query({ limit: 100 });
+    expect(operator.entries.map((row) => row.operation)).toEqual(["outside", "succeeded_call", "refused_call"]);
+  });
+
+  it("a normal row whose details carry a call reference makes nothing visible", async () => {
+    const { log } = freshLog();
+    const callRef = await markedCall(log, "refused_call", "refused");
+    await log.append("l2", "lookalike", "system", { call_ref: callRef, outcome: "success" });
+    await log.append("l2", "lookalike_agent", "agent:one", { call_ref: callRef, outcome: "success" });
+    await log.flush();
+    const visible = await log.query({ limit: 100, agent_visible: true });
+    expect(visible.entries.map((row) => row.operation)).not.toContain("refused_call");
+  });
+
+  it("the visibility filter runs before the limit", async () => {
+    const { log } = freshLog();
+    await markedCall(log, "visible_row", "succeeded");
+    for (let i = 0; i < 5; i++) await markedCall(log, `hidden_${i}`, "refused");
+    const visible = await log.query({ limit: 1, agent_visible: true, identity_id: "agent:one" });
+    expect(visible.entries.map((row) => row.operation)).toEqual(["visible_row"]);
+  });
+
+  it("every number query returns is taken after visibility", async () => {
+    const { log } = freshLog();
+    await markedCall(log, "visible_row", "succeeded");
+    for (let i = 0; i < 3; i++) await markedCall(log, `hidden_${i}`, "refused");
+    const visible = await log.query({ limit: 100, agent_visible: true, identity_id: "agent:one" });
+    expect(visible.total).toBe(1);
+    expect(visible.entries).toHaveLength(1);
+  });
+
+  it("retention that prunes a call's rows but keeps its marker exposes nothing", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    // Two retained rows: the call's last row and its marker survive, its first row is pruned.
+    const log = new AuditLog(storage, masterKey, { maxEntries: 2, maxInMemoryEntries: 2 });
+    await runInCallScope(async (scope) => {
+      await own(log, "pruned_row");
+      await own(log, "kept_row");
+      settleCallOutcome(scope, "succeeded");
+      writeCallOutcomeMarkers(scope);
+    });
+    await log.flush();
+    const raw = (await log.query({ limit: 100, include_outcome_markers: true })).entries.map((row) => row.operation);
+    const visible = (await log.query({ limit: 100, agent_visible: true })).entries.map((row) => row.operation);
+    for (const operation of visible) expect(raw).toContain(operation);
+    expect(visible).not.toContain("pruned_row");
+    expect(visible.every((operation) => operation === "kept_row")).toBe(true);
+  });
+
+  it("retention that prunes a marker but keeps a late row of its call hides that row", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const log = new AuditLog(storage, masterKey, { maxEntries: 2, maxInMemoryEntries: 2 });
+    await runInCallScope(async (scope) => {
+      await own(log, "in_call");
+      settleCallOutcome(scope, "succeeded");
+      writeCallOutcomeMarkers(scope);
+      await log.flush();
+      await own(log, "late_row");
+    });
+    await own(log, "outside");
+    await log.flush();
+    const raw = (await log.query({ limit: 100, include_outcome_markers: true })).entries.map((row) => row.operation);
+    expect(raw).toEqual(["late_row", "outside"]);
+    const visible = (await log.query({ limit: 100, agent_visible: true })).entries.map((row) => row.operation);
+    expect(visible).toEqual(["outside"]);
+  });
+
+  it("the visibility rule reads each retained row at most twice", () => {
+    const WINDOW = 1_000;
+    const rows: AuditEntry[] = Array.from({ length: WINDOW }, (_, i) => i % 3 === 0
+      ? { timestamp: "t", layer: "l2", operation: CALL_OUTCOME_SUCCESS_OPERATION, identity_id: "system", result: "success", details: { call_ref: `ref-${i}`, outcome: "success" } }
+      : { timestamp: "t", layer: "l2", operation: "row", identity_id: "agent:one", result: "success", call_ref: `ref-${i - (i % 3)}` });
+    let reads = 0;
+    const counted = new Proxy(rows, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) reads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const visible = agentVisibleEntries(counted);
+    expect(reads).toBeLessThanOrEqual(2 * WINDOW);
+    expect(visibleCallRefs(rows).size).toBeLessThanOrEqual(WINDOW);
+    expect(visible).toHaveLength(WINDOW);
+  });
+
+  it("a marker written by one AuditLog instance makes the rows visible to an agent reader on another instance over the same storage", async () => {
+    const { storage, masterKey, log } = freshLog();
+    await markedCall(log, "cross_instance", "succeeded");
+    const reader = new AuditLog(storage, masterKey);
+    const visible = await reader.query({ limit: 100, agent_visible: true });
+    expect(visible.entries.map((row) => row.operation)).toEqual(["cross_instance"]);
+  });
+
+  it("a reader instance never shows a stamped row whose marker is not yet persisted", async () => {
+    const { storage, masterKey, log } = freshLog();
+    const reader = new AuditLog(storage, masterKey);
+    await runInCallScope(async (scope) => {
+      await own(log, "not_yet_marked");
+      expect((await reader.query({ limit: 100, agent_visible: true })).entries).toEqual([]);
+      settleCallOutcome(scope, "succeeded");
+      writeCallOutcomeMarkers(scope);
+    });
+    await log.flush();
+    expect((await reader.query({ limit: 100, agent_visible: true })).entries.map((row) => row.operation)).toEqual(["not_yet_marked"]);
+  });
+
+  it("a row its call appends after the marker is visible once durable, and a late row of a refused call stays hidden", async () => {
+    const { log } = freshLog();
+    let lateSucceeded!: Promise<void>;
+    let lateRefused!: Promise<void>;
+    await runInCallScope(async (scope) => {
+      await own(log, "succeeded_call");
+      settleCallOutcome(scope, "succeeded");
+      writeCallOutcomeMarkers(scope);
+      lateSucceeded = new Promise<void>((resolve, reject) => { setTimeout(() => { own(log, "late_of_success").then(resolve, reject); }, 5); });
+    });
+    await runInCallScope(async (scope) => {
+      await own(log, "refused_call");
+      settleCallOutcome(scope, "refused");
+      lateRefused = new Promise<void>((resolve, reject) => { setTimeout(() => { own(log, "late_of_refusal").then(resolve, reject); }, 5); });
+    });
+    await Promise.all([lateSucceeded, lateRefused]);
+    await log.flush();
+    expect((await log.query({ limit: 100, agent_visible: true })).entries.map((row) => row.operation))
+      .toEqual(["succeeded_call", "late_of_success"]);
   });
 });

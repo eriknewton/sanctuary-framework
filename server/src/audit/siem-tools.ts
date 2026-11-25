@@ -21,7 +21,7 @@ import {
   formatAsXDM,
   agentDecision,
 } from "./siem-formatter.js";
-import { redactAuditEntryForAgent } from "../operational/agent-audit-redaction.js";
+import { AGENT_AUDIT_READ_MAX_LIMIT, redactAuditEntryForAgent } from "../operational/agent-audit-redaction.js";
 
 export type SIEMExportFormat = "cef" | "ocsf" | "ecs" | "xdm";
 
@@ -166,7 +166,7 @@ export function createSIEMTools(
         // Parse limit (default 100, max 1000)
         let limit = 100;
         if (typeof args.limit === "number") {
-          limit = Math.max(1, Math.min(1000, args.limit));
+          limit = Math.max(1, Math.min(AGENT_AUDIT_READ_MAX_LIMIT, args.limit));
         }
 
         // Parse optional filters
@@ -224,7 +224,9 @@ export function createSIEMTools(
           layer: filterLayer,
           operation_type: undefined, // Will filter after
           identity_id: binding.identity_id,
-          limit: 1000,
+          // Agent readers ask for agent-visible rows only.
+          agent_visible: true,
+          limit: AGENT_AUDIT_READ_MAX_LIMIT,
         });
 
         const totalAvailable = result.total;

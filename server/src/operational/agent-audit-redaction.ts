@@ -44,6 +44,13 @@ import type { AuditEntry } from "./audit-log.js";
  * withheld by construction. `has_details` is a coarse boolean so an agent can
  * tell an entry carried operator-side detail without learning what it was.
  */
+/**
+ * The per-call ceiling the SIEM export already applies; one agent read never
+ * returns more rows than one SIEM batch. Must match the clamp in
+ * audit/siem-tools.ts and monitor_audit_log in index.ts.
+ */
+export const AGENT_AUDIT_READ_MAX_LIMIT = 1000;
+
 export const AGENT_AUDIT_VIEW_FIELDS = [
   "timestamp",
   "operation",

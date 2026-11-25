@@ -1897,6 +1897,41 @@ export function readCallScopeNote(scope: CallScopeHandle): CallScopeNote | undef
   return callScopeRecord(scope).note;
 }
 
+/**
+ * The calls whose success marker is in `window`. One pass; the set never holds
+ * more entries than the window has rows.
+ */
+export function visibleCallRefs(window: readonly AuditEntry[]): Set<string> {
+  const visible = new Set<string>();
+  // Only reserved-operation rows can make a call visible, and only the marker writer can append one.
+  for (let i = 0; i < window.length; i++) {
+    const entry = window[i]!;
+    if (entry.operation !== CALL_OUTCOME_SUCCESS_OPERATION || entry.identity_id !== "system") continue;
+    const callRef = entry.details?.call_ref;
+    if (entry.details?.outcome === "success" && typeof callRef === "string") visible.add(callRef);
+  }
+  return visible;
+}
+
+/** An in-call row is agent-visible only when its call's success marker is in the set. */
+export function isAgentVisibleEntry(entry: AuditEntry, visible: ReadonlySet<string>): boolean {
+  return entry.call_ref === undefined || visible.has(entry.call_ref);
+}
+
+/**
+ * The agent-visible rows of `window`: one pass to build the visible-call set
+ * and one to filter, so the work is bounded by the window's length.
+ */
+export function agentVisibleEntries(window: readonly AuditEntry[]): AuditEntry[] {
+  const visible = visibleCallRefs(window);
+  const kept: AuditEntry[] = [];
+  for (let i = 0; i < window.length; i++) {
+    const entry = window[i]!;
+    if (isAgentVisibleEntry(entry, visible)) kept.push(entry);
+  }
+  return kept;
+}
+
 // ── F2 Option A: split-boundary record (shared read/write logic) ───────────
 //
 // These are module-level (not `AuditLog` methods) because BOTH the class's
@@ -4714,6 +4749,8 @@ export class AuditLog {
     evidence_agent?: string;
     /** Return call outcome markers too; integrity, export, verify and completeness paths that count stored rows set it. */
     include_outcome_markers?: boolean;
+    /** Return only rows an agent reader may see: a row written in a call only once its success marker is retained. */
+    agent_visible?: boolean;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
@@ -4736,7 +4773,12 @@ export class AuditLog {
       await this.reloadPersistedEntries();
     }
 
-    let filtered = this.entries;
+    // Order: field filters, marker exclusion, identity, evidence_agent, then agent visibility; `total` and the slice
+    // come last, so callers' text search, offsets and counts all run on the visible rows. The visible-call set is
+    // built from the whole retained window before any filter; with the filter that is two passes over at most
+    // maxInMemoryEntries rows.
+    const retained = this.entries;
+    let filtered = retained;
 
     if (options.since) {
       const sinceDate = new Date(options.since);
@@ -4769,6 +4811,14 @@ export class AuditLog {
         (MEMORY_SAVE_AUDIT_OPERATIONS.includes(e.operation) && e.details?.agent_id === options.evidence_agent));
     }
 
+    if (options.agent_visible === true) {
+      // An in-call row is agent-visible only when its call's marker is in the same retained window, so a lost marker
+      // hides rows and never exposes them.
+      const visible = visibleCallRefs(retained);
+      filtered = filtered.filter((e) => isAgentVisibleEntry(e, visible));
+    }
+
+    // Every number this query returns is taken after the visibility rule, so a hidden row moves no count.
     const total = filtered.length;
     const limit = options.limit ?? 50;
     // Must match renderActivityScreen in server/src/dashboard/v1_1/client.ts, which lists this oldest-first page newest first.

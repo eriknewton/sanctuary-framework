@@ -1048,6 +1048,8 @@ export function createAgentNativeCooperativeTools(
             options.auditLog.query({
               operation_type: cursor.operation,
               identity_id: activeIdentity.identity_id,
+              // Agent readers ask for agent-visible rows only.
+              agent_visible: true,
               limit: 500,
             })
           );
@@ -1117,6 +1119,8 @@ export function createAgentNativeCooperativeTools(
           const queried = await options.auditLog.runAllowingIntegrityFindings(() =>
             options.auditLog.query({
               identity_id: activeIdentity.identity_id,
+              // Agent readers ask for agent-visible rows only.
+              agent_visible: true,
               limit: 500,
             })
           );
