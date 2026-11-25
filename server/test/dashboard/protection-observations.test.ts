@@ -1,7 +1,9 @@
+// fail-before-exempt: the cooperative factory now requires a namespace insert store, so this file passes a recording no-op; its assertions are unchanged.
 // fail-before-exempt: Dashboard construction assertions select a loaded identity and compare the two views by subject.
 // fail-before-exempt: this change hardens existing dashboard tests (inner-oracle assertions, finally-block shutdown, shared free-port helper) over a behavior-preserving refactor; the observations they check already shipped, so they pass against pre-change source by construction.
 /** Protection observations through the dashboard. */
 import { afterEach, expect, it, vi } from "vitest";
+import { recordingNamespaceInserts } from "../helpers/cooperative-test-options.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createCognitiveTools, IdentityManager } from "../../src/cognitive/tools.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -49,7 +51,7 @@ async function fixture() {
   const custodyRead = vi.spyOn(custodySource, "buildCustodyExitPanel").mockResolvedValue(custody);
   const chain = await auditLog.getAuditChainVerdict();
   const chainRead = vi.spyOn(auditLog, "getAuditChainVerdict").mockRejectedValue(new Error("chain unavailable"));
-  const makeTool = (sources = runtime) => createAgentNativeCooperativeTools({ ...primitives, ...sources,
+  const makeTool = (sources = runtime) => createAgentNativeCooperativeTools({ baselineNamespaceInserts: recordingNamespaceInserts(), ...primitives, ...sources,
     primitiveTools: primitives.tools, auditLog, storage,
     resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "absent" })
   }).tools.find(tool => tool.name === "sanctuary_active_protections")!;

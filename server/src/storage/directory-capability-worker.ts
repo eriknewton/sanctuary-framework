@@ -14,6 +14,7 @@ import { Writable } from "node:stream";
 import { isAbsolute, join, normalize, sep } from "node:path";
 
 import { storageNamespacePathComponent } from "./namespace-component.js";
+import { assertEnumerationBound } from "./interface.js";
 // Must match createDirectoryCapabilityWorkerStorage in filesystem.ts, the only construction path for the worker exemption.
 import { createDirectoryCapabilityWorkerStorage, type FilesystemStorage, serializeCapabilityError } from "./filesystem.js";
 import {
@@ -201,6 +202,15 @@ async function perform(
       // prefix stays undefined on both bound-namespace and base-directory routes.
       const { namespace, args } = requestNamespaceArg(request);
       return storage.listKeys(namespace, args[0] === undefined ? undefined : String(args[0]));
+    }
+    case "listKeysBounded": {
+      // Must match FilesystemStorage.listKeysBounded in filesystem.ts: the worker
+      // validates the bound itself and streams its own scan, stopping at bound plus one.
+      // The request argument reaches the bound check uncoerced: it must be a number; must match assertEnumerationBound in interface.ts.
+      const { namespace, args } = requestNamespaceArg(request);
+      const maxKeys: unknown = args[0];
+      assertEnumerationBound(maxKeys);
+      return storage.listKeysBounded(namespace, maxKeys);
     }
     case "exists": {
       const { namespace, args } = requestNamespaceArg(request);

@@ -18,15 +18,17 @@ import type {
 import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 import { SdwValidationError } from "../sdw/errors.js";
-import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, StorageReadBoundError } from "./interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, StorageReadBoundError, StorageEnumerationBoundError, assertEnumerationBound } from "./interface.js";
 import { assertStorageNamespacePathComponent } from "./namespace-component.js";
 
 export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabilities {
   private store = new Map<string, { data: Uint8Array; modified_at: string }>();
-  // Composite store keys are `${namespace}/${key}` and a namespace may itself
-  // contain "/", so live namespaces are tracked explicitly (entry counts)
-  // rather than re-parsed out of composite keys.
-  private namespaceCounts = new Map<string, number>();
+  // Composite store keys are `${namespace.length}:${namespace}/${key}` (see
+  // storageKey): a namespace or key may itself contain "/", and the length
+  // prefix keeps every (namespace, key) pair on its own entry. Each live
+  // namespace's keys are also indexed exactly; the index changes in step with
+  // every insert and delete of a store entry.
+  private namespaceKeys = new Map<string, Set<string>>();
   private namespaceLockTails = new Map<string, Promise<void>>();
 
   async withNamespaceLock<T>(
@@ -62,9 +64,15 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     }
   }
 
+  private indexKey(namespace: string, key: string): void {
+    const keys = this.namespaceKeys.get(namespace);
+    if (keys === undefined) this.namespaceKeys.set(namespace, new Set([key]));
+    else keys.add(key);
+  }
+
   private storageKey(namespace: string, key: string): string {
     assertStorageNamespacePathComponent(namespace);
-    return `${namespace}/${key}`;
+    return `${namespacePrefix(namespace)}${key}`;
   }
 
   async writeIfAbsent(
@@ -77,10 +85,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     // Deliberately no await between the check and set: this is the in-memory
     // backend's atomic create-if-absent critical section.
     if (this.store.has(storageKey)) return false;
-    this.namespaceCounts.set(
-      namespace,
-      (this.namespaceCounts.get(namespace) ?? 0) + 1,
-    );
+    this.indexKey(namespace, key);
     this.store.set(storageKey, {
       data: new Uint8Array(checkedData),
       modified_at: new Date().toISOString(),
@@ -116,12 +121,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   ): Promise<void> {
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const storageKey = this.storageKey(namespace, key);
-    if (!this.store.has(storageKey)) {
-      this.namespaceCounts.set(
-        namespace,
-        (this.namespaceCounts.get(namespace) ?? 0) + 1
-      );
-    }
+    if (!this.store.has(storageKey)) this.indexKey(namespace, key);
     this.store.set(storageKey, {
       data: checkedData,
       modified_at: new Date().toISOString(),
@@ -150,12 +150,9 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   ): Promise<boolean> {
     const deleted = this.store.delete(this.storageKey(namespace, key));
     if (deleted) {
-      const count = (this.namespaceCounts.get(namespace) ?? 1) - 1;
-      if (count <= 0) {
-        this.namespaceCounts.delete(namespace);
-      } else {
-        this.namespaceCounts.set(namespace, count);
-      }
+      const keys = this.namespaceKeys.get(namespace);
+      keys?.delete(key);
+      if (keys?.size === 0) this.namespaceKeys.delete(namespace);
     }
     return deleted;
   }
@@ -163,7 +160,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
     assertStorageNamespacePathComponent(namespace);
     const entries: StorageEntryMeta[] = [];
-    const nsPrefix = `${namespace}/`;
+    const nsPrefix = namespacePrefix(namespace);
 
     for (const [storeKey, entry] of this.store) {
       if (!storeKey.startsWith(nsPrefix)) continue;
@@ -184,12 +181,26 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   /** Must match the complete, code-unit ordered listKeys contract in interface.ts. */
   async listKeys(namespace: string, prefix?: string): Promise<string[]> {
     assertStorageNamespacePathComponent(namespace);
-    const nsPrefix = `${namespace}/`;
+    const nsPrefix = namespacePrefix(namespace);
     const keys: string[] = [];
     for (const storeKey of this.store.keys()) {
       if (!storeKey.startsWith(nsPrefix)) continue;
       const key = storeKey.slice(nsPrefix.length);
       if (prefix && !key.startsWith(prefix)) continue;
+      keys.push(key);
+    }
+    return keys.sort();
+  }
+
+  /** Must match StorageBackend.listKeysBounded in interface.ts. */
+  async listKeysBounded(namespace: string, maxKeys: number): Promise<string[]> {
+    assertEnumerationBound(maxKeys);
+    assertStorageNamespacePathComponent(namespace);
+    const keys: string[] = [];
+    // The scan reads only this namespace's exact index, so its work depends on the namespace's own entries and
+    // no other; an enumeration holds at most bound plus one names, then throws.
+    for (const key of this.namespaceKeys.get(namespace) ?? []) {
+      if (keys.length >= maxKeys) throw new StorageEnumerationBoundError();
       keys.push(key);
     }
     return keys.sort();
@@ -213,7 +224,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     let total = 0;
     for (const [key, entry] of this.store) {
       // The predicate sees the namespace component of the composite key (see storageKey), never the key itself.
-      const namespace = key.slice(0, key.indexOf("/"));
+      const namespace = namespaceOfStorageKey(key);
       if (!isAgentAggregateReservedNamespace(namespace)) total += entry.data.length;
     }
     return total;
@@ -223,7 +234,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     // read-only: classified in STORAGE_READ_ONLY in test/structure/read-tool-mutation-reachability.ts
     // Must match isAgentDiscoverySkippedNamespace in storage/agent-discovery.ts and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
     const namespaces: string[] = [];
-    for (const namespace of this.namespaceCounts.keys()) {
+    for (const namespace of this.namespaceKeys.keys()) {
       // Local stores consume no agent-visible namespace budget.
       if (isAgentDiscoverySkippedNamespace(namespace)) continue;
       if (namespaces.length >= MAX_DISCOVERED_NAMESPACES) throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
@@ -235,17 +246,33 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   async listNamespaces(): Promise<string[]> {
     // Must match listNamespaces in interface.ts: refuse before allocating an
     // attacker-sized snapshot; filtering internal names cannot bypass the cap.
-    if (this.namespaceCounts.size > MAX_DISCOVERED_NAMESPACES) {
+    if (this.namespaceKeys.size > MAX_DISCOVERED_NAMESPACES) {
       throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
     }
-    return [...this.namespaceCounts.keys()].sort();
+    return [...this.namespaceKeys.keys()].sort();
   }
 
   /** Clear all stored data (useful in tests) */
   clear(): void {
     this.store.clear();
-    this.namespaceCounts.clear();
+    this.namespaceKeys.clear();
   }
+}
+
+/**
+ * The composite-key prefix for one namespace. The decimal length before the colon makes the prefix
+ * unambiguous: no two namespaces share a prefix, and no (namespace, key) pair shares an entry with another,
+ * even when either part contains "/". Must match namespaceOfStorageKey below.
+ */
+function namespacePrefix(namespace: string): string {
+  return `${namespace.length}:${namespace}/`;
+}
+
+/** The namespace a composite store key belongs to. Must match namespacePrefix above. */
+function namespaceOfStorageKey(storageKey: string): string {
+  const colon = storageKey.indexOf(":");
+  const length = Number(storageKey.slice(0, colon));
+  return storageKey.slice(colon + 1, colon + 1 + length);
 }
 
 async function waitForNamespaceLockTurn(
