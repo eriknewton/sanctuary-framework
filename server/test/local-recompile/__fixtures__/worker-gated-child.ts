@@ -112,6 +112,7 @@ function deliverLateInit(): void {
   const late = {
     type: "init",
     storage_root: "/fixture-late-init",
+    custody_lock_root: "/fixture-late-lock-root",
     oplog_key: new Uint8Array(LATE_KEY_BYTES).fill(LATE_KEY_FILL),
     results_key: new Uint8Array(LATE_KEY_BYTES).fill(LATE_KEY_FILL),
   };

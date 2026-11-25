@@ -48,6 +48,10 @@ import os from "node:os";
 import { randomBytes } from "node:crypto";
 // Must match isLoopbackOllamaEndpoint in intelligence/loopback-endpoint.ts.
 import { isLoopbackOllamaEndpoint } from "./loopback-endpoint.js";
+// The local job descriptor's literal connect target; must match resolveLoopbackConnectTarget in intelligence/loopback-endpoint.ts.
+import { resolveLoopbackConnectTarget } from "./loopback-endpoint.js";
+// The local job descriptor's shape rule; must match the worker-side parse in local-recompile/binding.ts.
+import { isLocalBindingDescriptorShape } from "../local-recompile/descriptor-shape.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
@@ -67,6 +71,7 @@ import {
 import { ARMED_DIGEST_PREFIX_CHARS } from "./provisioning.js";
 import {
   IMMUNE_MODEL_LOAD_SURFACES,
+  deriveOllamaRuntimeTag,
   type LocalIntegrityStateV2,
   type ModelLoadIntegrityFailureReason,
   type VerifiedLocalBindingV2,
@@ -357,6 +362,28 @@ export interface SelectorConfig {
   /** Monotonic/wall clock seam for deterministic six-hour cadence tests. */
   integrityClock?: ImmuneVerificationClock;
 }
+
+/** A verified local binding as the local job worker needs it; frozen. */
+export interface LocalBindingDescriptor {
+  readonly runtime_tag: string;
+  readonly manifest_digest: string;
+  readonly endpoint: { readonly address: string; readonly port: number };
+}
+
+/** Closed refusals of `describeVerifiedLocalBinding`. */
+export const LOCAL_BINDING_REFUSALS = [
+  "unarmed",
+  "binding_absent",
+  "epoch_changed",
+  "assurance_mismatch",
+  "not_loopback",
+  "identity_mismatch",
+] as const;
+export type LocalBindingRefusal = (typeof LOCAL_BINDING_REFUSALS)[number];
+
+export type LocalBindingDescription =
+  | { ok: true; epoch: number; descriptor: LocalBindingDescriptor }
+  | { ok: false; refusal: LocalBindingRefusal };
 
 export class SubstrateSelector {
   private store: IntelligenceConfigStore;
@@ -2438,6 +2465,50 @@ export class SubstrateSelector {
       );
     }
     return completed;
+  }
+
+  /**
+   * Quiet, in-memory read of one surface's verified local binding. It applies
+   * the same armed-state, epoch, assurance and loopback checks as
+   * `integrityAuthorityMatches`, makes no network call and writes no audit row.
+   * `expectedEpoch`, when given, is the epoch an earlier read returned; a
+   * configuration change since then refuses with `epoch_changed`.
+   * Must match `LocalBindingDescription` consumers in local-recompile/binding.ts.
+   */
+  describeVerifiedLocalBinding(surface: Surface, expectedEpoch?: number): LocalBindingDescription {
+    if (this.config.version !== 2) return { ok: false, refusal: "unarmed" };
+    const epoch = this.integrityConfigEpoch;
+    // Presence, assurance, loopback and identity are checked before the epoch, so each refusal names
+    // its own cause; epoch_changed means only that a binding which would otherwise pass has changed.
+    const binding = this.config.localIntegrityState.bindings[surface];
+    if (binding === undefined) return { ok: false, refusal: "binding_absent" };
+    const expectedAssurance = IMMUNE_SURFACE_SET.has(surface) ? "immune" : "light";
+    if (binding.assurance !== expectedAssurance) return { ok: false, refusal: "assurance_mismatch" };
+    const endpoint = this.config.ollamaEndpoint ?? DEFAULT_OLLAMA_ENDPOINT;
+    const target = resolveLoopbackConnectTarget(endpoint);
+    if (!isLoopbackOllamaEndpoint(endpoint) || !target.ok) return { ok: false, refusal: "not_loopback" };
+    // The worker generates against this tag only, and confirms the digest itself before generating;
+    // both are read from the signed identity, so a binding whose stored tag disagrees with it is refused.
+    const runtimeTag = deriveOllamaRuntimeTag(binding.ollama_identity);
+    const manifestDigest = binding.ollama_identity.ollama_manifest_sha256;
+    if (binding.runtime_tag !== runtimeTag || typeof manifestDigest !== "string") {
+      return { ok: false, refusal: "identity_mismatch" };
+    }
+    // The worker applies this same shape rule to the descriptor it receives (local-recompile/binding.ts).
+    if (!isLocalBindingDescriptorShape(runtimeTag, manifestDigest, target.target.address, target.target.port)) {
+      return { ok: false, refusal: "identity_mismatch" };
+    }
+    if (expectedEpoch !== undefined && expectedEpoch !== epoch) return { ok: false, refusal: "epoch_changed" };
+    if (!this.integrityAuthorityMatches(surface, binding, epoch)) return { ok: false, refusal: "assurance_mismatch" };
+    return {
+      ok: true,
+      epoch,
+      descriptor: Object.freeze({
+        runtime_tag: runtimeTag,
+        manifest_digest: manifestDigest,
+        endpoint: Object.freeze({ address: target.target.address, port: target.target.port }),
+      }),
+    };
   }
 
   private integrityAuthorityMatches(

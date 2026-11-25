@@ -784,6 +784,10 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_events_close",
     "sanctuary_audit_search",
     "sanctuary_distress", // HABEAS PORT: guaranteed distress lane - always allowed, always audited
+    // The local summary task answers only fixed acknowledgements and never returns record text or a
+    // result to the agent; its output goes to the operator surface. Must match LOCAL_TASK_TOOL_NAME in
+    // local-recompile/responses.ts. A policy file that does not list it leaves it unclassified (Tier 1).
+    "sanctuary_local_task",
     // Governed File-Grant v1 (2026-07-07): revoke is safe-direction (it only
     // reduces access) and list is read-only, so both auto-allow+audit at
     // Tier 3. The mint operation (file_grant) is force-pinned Tier 1 via

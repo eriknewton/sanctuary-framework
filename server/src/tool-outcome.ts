@@ -243,6 +243,7 @@ export const TOOL_OUTCOME_SHAPES: Readonly<Record<string, ToolOutcomeShape>> = O
   "sanctuary_help": "standard",
   "sanctuary_hide": "standard",
   "sanctuary_link_to_human": "standard",
+  "sanctuary_local_task": "standard",
   "sanctuary_policy_status": "standard",
   "sanctuary_recall": "standard",
   "sanctuary_remember": "standard",

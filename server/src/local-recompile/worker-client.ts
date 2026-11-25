@@ -10,6 +10,7 @@ import { fork, type ChildProcess, type ForkOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { WORKER_QUEUE_MAX } from "./limits.js";
 import { copyStoreKey } from "./store-record.js";
 import {
   WORKER_ENV_NAMES,
@@ -19,7 +20,11 @@ import {
   WORKER_RESPAWN_MAX_MS,
   acceptMessage,
   assertSendable,
+  type AuthorityReply,
+  type JobState,
+  type LocalTaskJob,
   type ParentMessage,
+  type WorkerLimits,
   type WorkerFaultKind,
   type WorkerMessage,
   type WorkerState,
@@ -36,18 +41,50 @@ export type WorkerClientEvent =
   | { type: "state"; state: WorkerState | "state_CLOSED"; pid?: number }
   | { type: "status"; status: Extract<WorkerMessage, { type: "status" }> }
   | { type: "fault"; kind: WorkerFaultKind }
-  | { type: "respawn_scheduled"; delay_ms: number };
+  | { type: "respawn_scheduled"; delay_ms: number }
+  | { type: "job_state"; request_id: string; state: JobState }
+  /** Jobs the worker took and never ended, released when that worker died or was closed. */
+  | { type: "jobs_lost"; request_ids: string[] };
+
+/** How a job hand-off went: sent, refused because the tracked set is full, or refused because no worker can take it. */
+export type JobSubmitOutcome = "sent" | "queue_full" | "unavailable";
+
+// The worker sends one of these for every job it reads; either ends the server's watch for that job.
+const TERMINAL_JOB_STATES: ReadonlySet<JobState> = new Set<JobState>(["state_DONE", "state_REFUSED"]);
 
 export interface LocalWorkerClientOptions {
   /** Fortress storage root the worker opens; required. */
   storageRoot: string;
+  /** The lock rendezvous root this process resolved; the worker takes its store locks under exactly this root. */
+  custodyLockRoot: string;
   /** Derived operator-log key; required. The master key is never accepted. */
   oplogKey: Uint8Array;
   /** Derived results-store key; required. */
   resultsKey: Uint8Array;
+  /** Test seam only: shortened job bounds the worker applies; each must not exceed its production value. */
+  limits?: WorkerLimits;
   timers?: WorkerTimers;
   spawn?: WorkerSpawn;
   onEvent?: (event: WorkerClientEvent) => void;
+  /**
+   * Answers a worker's authority request from memory. Absent, every request is
+   * refused as unknown, so a client built without it can never grant a job.
+   */
+  answerAuthority?: (requestId: string) => AuthorityReply;
+  /**
+   * Drop rows the server has not yet made durable for jobs a worker lost, across worker generations.
+   * Admission counts them with the jobs the current worker holds. Absent, there are none.
+   */
+  pendingDrops?: () => number;
+}
+
+function refuseUnknown(requestId: string): AuthorityReply {
+  return { type: "authority_reply", request_id: requestId, outcome: "refused", cause: "request_unknown" };
+}
+
+/** Zero the key bytes a granted reply carried, once it has been written or refused. */
+function zeroAuthorityReply(reply: AuthorityReply): void {
+  if (reply.outcome === "granted") for (const key of reply.keys) key.fill(0);
 }
 
 const realTimers: WorkerTimers = {
@@ -74,9 +111,13 @@ export class LocalWorkerClient {
   private readonly oplogKey: Uint8Array;
   private readonly resultsKey: Uint8Array;
   private readonly storageRoot: string;
+  private readonly custodyLockRoot: string;
+  private readonly limits: WorkerLimits | undefined;
   private readonly timers: WorkerTimers;
   private readonly spawnWorker: WorkerSpawn;
   private readonly onEvent: (event: WorkerClientEvent) => void;
+  private readonly answerAuthority: (requestId: string) => AuthorityReply;
+  private readonly pendingDrops: () => number;
   private child: ChildProcess | undefined;
   private currentState: WorkerState | "state_CLOSED" = "state_DEAD";
   private backoffMs = WORKER_RESPAWN_INITIAL_MS;
@@ -90,6 +131,11 @@ export class LocalWorkerClient {
   private backlogWrite = 0;
   private writes = 0;
   private closing = false;
+  /**
+   * Jobs handed to the current worker with no terminal state yet. Bounded by WORKER_QUEUE_MAX, the
+   * worker's own queue cap (running job included), so the worker can never hold a job this set lacks.
+   */
+  private readonly outstanding = new Set<string>();
   malformedMessages = 0;
 
   constructor(options: LocalWorkerClientOptions) {
@@ -97,6 +143,8 @@ export class LocalWorkerClient {
       throw new TypeError("local worker requires a storage root");
     }
     this.storageRoot = options.storageRoot;
+    this.custodyLockRoot = options.custodyLockRoot;
+    this.limits = options.limits === undefined ? undefined : { ...options.limits };
     // Required, exactly 32 bytes each, copied so the caller can zero its own.
     let oplogKey: Uint8Array | undefined;
     let resultsKey: Uint8Array | undefined;
@@ -117,6 +165,8 @@ export class LocalWorkerClient {
     this.timers = options.timers ?? realTimers;
     this.spawnWorker = options.spawn ?? fork;
     this.onEvent = options.onEvent ?? (() => undefined);
+    this.answerAuthority = options.answerAuthority ?? refuseUnknown;
+    this.pendingDrops = options.pendingDrops ?? (() => 0);
   }
 
   get state(): WorkerState | "state_CLOSED" {
@@ -138,12 +188,47 @@ export class LocalWorkerClient {
    * operator-side drop.
    */
   send(message: ParentMessage): boolean {
+    if (message.type === "job") return this.submit(message) === "sent";
     assertSendable("to_worker", message);
+    const child = this.sendableChild();
+    return child === undefined ? false : this.write(child, message);
+  }
+
+  /** The number of jobs handed to the current worker that have not ended. */
+  get outstandingJobs(): number {
+    return this.outstanding.size;
+  }
+
+  /**
+   * Hand one job to a ready worker and watch it until the worker reports a terminal state. A job the
+   * worker never ends, because it died or was closed, is released in a jobs_lost event.
+   */
+  submit(job: LocalTaskJob): JobSubmitOutcome {
+    assertSendable("to_worker", job);
+    const child = this.sendableChild();
+    if (child === undefined) return "unavailable";
+    // Jobs the worker holds and drop rows not yet durable together never exceed the seat cap, across
+    // worker generations: a lost job moves from the first count to the second, so the sum never grows.
+    if (this.outstanding.size + this.pendingDrops() >= WORKER_QUEUE_MAX) return "queue_full";
+    if (!this.write(child, job)) return "unavailable";
+    this.outstanding.add(job.request_id);
+    return "sent";
+  }
+
+  private sendableChild(): ChildProcess | undefined {
     const child = this.child;
     // Only the ready child that has not faulted receives work, and nothing is sent once close begins.
-    if (this.closing || this.currentState !== "state_READY" || child === undefined || child !== this.readyChild) return false;
-    if (!child.connected || this.backlogged) return false;
-    return this.write(child, message);
+    if (this.closing || this.currentState !== "state_READY" || child === undefined || child !== this.readyChild) return undefined;
+    if (!child.connected || this.backlogged) return undefined;
+    return child;
+  }
+
+  /** Release every watched job: its worker is gone, so the caller records each as dropped. */
+  private releaseOutstanding(): void {
+    if (this.outstanding.size === 0) return;
+    const lost = [...this.outstanding];
+    this.outstanding.clear();
+    this.onEvent({ type: "jobs_lost", request_ids: lost });
   }
 
   /** Ask the worker to stop, then SIGKILL after WORKER_READY_TIMEOUT_MS; resolves once it has exited. */
@@ -164,6 +249,8 @@ export class LocalWorkerClient {
       await exited;
       this.timers.clearTimeout(kill);
     }
+    this.child = undefined;
+    this.releaseOutstanding();
     this.oplogKey.fill(0);
     this.resultsKey.fill(0);
     this.setState("state_CLOSED");
@@ -199,7 +286,14 @@ export class LocalWorkerClient {
   }
 
   private initMessage(oplogKey: Uint8Array, resultsKey: Uint8Array): ParentMessage {
-    return { type: "init", storage_root: this.storageRoot, oplog_key: oplogKey, results_key: resultsKey };
+    return {
+      type: "init",
+      storage_root: this.storageRoot,
+      custody_lock_root: this.custodyLockRoot,
+      oplog_key: oplogKey,
+      results_key: resultsKey,
+      ...(this.limits === undefined ? {} : { limits: this.limits }),
+    };
   }
 
   private setState(state: WorkerState | "state_CLOSED"): void {
@@ -278,6 +372,18 @@ export class LocalWorkerClient {
       }, WORKER_RESPAWN_MAX_MS);
     } else if (message.type === "status") {
       this.onEvent({ type: "status", status: message });
+    } else if (message.type === "job_state") {
+      if (TERMINAL_JOB_STATES.has(message.state)) {
+        // The parent forgets a job only once its terminal row is durable or the parent has taken over
+        // writing it: a row the worker reports unwritten is released through jobs_lost, which writes it.
+        // row_written must match the job_state shape in worker-protocol.ts.
+        const watched = this.outstanding.delete(message.request_id);
+        if (watched && message.row_written === false) this.onEvent({ type: "jobs_lost", request_ids: [message.request_id] });
+      }
+      this.onEvent({ type: "job_state", request_id: message.request_id, state: message.state });
+    } else if (message.type === "authority_request") {
+      // Answered on a later turn of the event loop, so it never shares a turn with an agent call.
+      setImmediate(() => this.replyAuthority(child, message.request_id));
     } else {
       // A fault ends the child's turn at once, before its exit arrives: it gets no more work, leaves
       // state_SPAWNING or state_READY for state_DEAD, and its ready and stable timers stop, so it can
@@ -293,6 +399,54 @@ export class LocalWorkerClient {
     }
   }
 
+  /**
+   * Runs from setImmediate, so nothing may throw out of it. Invariant: a reply that cannot be written
+   * has its keys zeroed and is never retried with keys. The refusal is written instead when the channel
+   * still takes it; when it does not, the worker is treated as dead (killed, its watched jobs released
+   * as dropped, and respawned).
+   */
+  private replyAuthority(child: ChildProcess, requestId: string): void {
+    try {
+      // Only the ready child that asked receives the answer; a reply computed for anyone else is never built.
+      if (child !== this.readyChild || this.closing || this.currentState !== "state_READY") return;
+      let reply: AuthorityReply;
+      try {
+        reply = this.answerAuthority(requestId);
+      } catch {
+        reply = refuseUnknown(requestId);
+      }
+      let written = false;
+      try {
+        assertSendable("to_worker", reply);
+        written = this.write(child, reply);
+      } catch {
+        written = false;
+      } finally {
+        // Advanced serialization copied the bytes when send returned; the server keeps no key copy.
+        zeroAuthorityReply(reply);
+      }
+      if (written) return;
+      let refused = false;
+      try {
+        refused = this.write(child, refuseUnknown(requestId));
+      } catch {
+        refused = false;
+      }
+      if (!refused) this.abandon(child);
+    } catch {
+      this.abandon(child);
+    }
+  }
+
+  /** A worker the server can no longer answer is killed; its exit releases its jobs and drives the respawn. */
+  private abandon(child: ChildProcess): void {
+    try {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    } catch {
+      // A child that cannot be signalled has already gone; its exit, or close, releases its jobs.
+    }
+  }
+
   private onExit(child: ChildProcess): void {
     if (child !== this.child) return;
     this.readyChild = undefined;
@@ -301,6 +455,7 @@ export class LocalWorkerClient {
     }
     this.readyTimer = this.stableTimer = undefined;
     this.child = undefined;
+    this.releaseOutstanding();
     if (this.closing) return;
     this.setState("state_DEAD");
     const delay = this.backoffMs;

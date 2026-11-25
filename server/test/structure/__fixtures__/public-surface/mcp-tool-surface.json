@@ -1968,6 +1968,34 @@
     }
   },
   {
+    "name": "sanctuary_local_task",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "summarize"
+          ],
+          "description": "The task kind. Only summarize is available."
+        },
+        "sources": {
+          "type": "object",
+          "description": "The records to summarize, as { \"refs\": [{ \"namespace\": \"...\", \"key\": \"...\" }] }, 1 to 32 refs."
+        },
+        "instruction": {
+          "type": "string",
+          "description": "What the summary should focus on, at most 500 characters."
+        }
+      },
+      "required": [
+        "kind",
+        "sources",
+        "instruction"
+      ]
+    }
+  },
+  {
     "name": "sanctuary_policy_status",
     "inputSchema": {
       "type": "object",

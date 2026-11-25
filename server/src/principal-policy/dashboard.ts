@@ -275,6 +275,12 @@ import {
   SENTINEL_API_PREFIX,
   handleSentinelRoute,
 } from "../sentinel/sentinel-routes.js";
+import {
+  handleLocalRoute,
+  LOCAL_API_PREFIX,
+  LOCAL_PAGE_PATH,
+  type LocalDashboardSurface,
+} from "../local-recompile/dashboard-routes.js";
 import type { DistressInbox } from "../distress/inbox.js";
 import {
   DISTRESS_API_PREFIX,
@@ -894,7 +900,9 @@ function isFleetPostureReadRoute(method: string, path: string): boolean {
  * carries the same rule, but it is gated in {@link dispatchApprovalInbox}
  * instead, because `handleRequest` routes that prefix to its own router BEFORE
  * `handleLegacyRequest` runs, so a path added here would never be evaluated for
- * it. Adding one would be dead code that reads like coverage.
+ * it. Adding one would be dead code that reads like coverage. The local task
+ * surface (`/local`, `/api/local/*`) is routed the same way and carries the same
+ * rule in {@link dispatchLocal}.
  */
 export function isOperatorOnlyReadRoute(method: string, path: string): boolean {
   return (
@@ -1474,6 +1482,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * local listener (127.0.0.1:8741) populates. No write/delete surface.
    */
   private distressInbox: DistressInbox | null = null;
+  private localSurface: LocalDashboardSurface | null = null;
 
   /**
    * v1.3 WP-V1.3-3 Omega-1 Coordination Handoff Visualization.
@@ -1794,6 +1803,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Bind the local task operator surface. Once set, `/local` and
+   * `/api/local/*` route through `handleLocalRoute`. Pass `null` to detach.
+   */
+  setLocalSurface(surface: LocalDashboardSurface | null): void {
+    this.localSurface = surface;
+  }
+
+  /**
    * v1.3 WP-V1.3-3 Omega-1: bind the Coordination handoff log +
    * event bridge + audit log + operator id. Once set, requests to
    * `/api/coordination/*` route through `handleCoordinationRoute`.
@@ -2075,6 +2092,38 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
     if (!this.checkAuth(req, url, res, { allowSession: true })) return true;
     return handleDistressRoute({ inbox: this.distressInbox }, req, res);
+  }
+
+  private async dispatchLocal(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (!this.localSurface) return false;
+    // Invariant: loopback position is not operator identity, because the agent can share the
+    // loopback interface. Every route in LOCAL_DASHBOARD_ROUTES, the page included, admits only an
+    // operator-derived credential (the bearer, or a session or cookie minted from it). This is the
+    // one gate for the prefix: handleRequest routes it here before handleLegacyRequest's gate runs.
+    // A dashboard with no operator token has no operator credential to tell the operator from the agent,
+    // so its local routes refuse rather than fall back to "auth disabled".
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+    const admission = this.resolveAuthAdmission(req, url, { allowSession: true, denyLoopbackAutoAuth: true });
+    if (admission !== "operator_credential") {
+      this.denyAuth(res);
+      return true;
+    }
+    // Invariant: SameSite=Lax treats another port on the same loopback host as the same site, so the
+    // browser alone does not stop a page on another local port from sending the operator's cookie.
+    // A request that changes state and was admitted by cookie or ?session= is served only when it
+    // shows it came from the dashboard's own origin; neither header present refuses. A bearer header
+    // cannot be set by a cross-origin page, so the origin rule applies to cookie and session admission
+    // only. The refusal comes before handleLocalRoute, so it writes no operator-log row and touches
+    // no store.
+    const method = req.method ?? "GET";
+    if (method !== "GET" && method !== "HEAD" && !this.hasOperatorBearer(req) && !this.isOwnOriginRequest(req)) {
+      denyForbidden(res);
+      return true;
+    }
+    return handleLocalRoute(this.localSurface, req, res);
   }
 
   private async dispatchSentinel(
@@ -6134,6 +6183,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return false;
   }
 
+  /** True only when the request's Authorization header carries the configured operator bearer. */
+  private hasOperatorBearer(req: IncomingMessage): boolean {
+    const authHeader = req.headers.authorization;
+    const parts = authHeader?.split(" ");
+    return (
+      !!this.authToken &&
+      parts?.length === 2 &&
+      parts[0] === "Bearer" &&
+      constantTimeEquals(parts[1]!, this.authToken)
+    );
+  }
+
+  /**
+   * True when the browser says the request came from this dashboard's own origin: `Sec-Fetch-Site`
+   * is `same-origin`, or, when that header is absent, `Origin` equals the dashboard's own origin
+   * exactly (scheme, host and port). Neither header present is false.
+   */
+  private isOwnOriginRequest(req: IncomingMessage): boolean {
+    const site = req.headers["sec-fetch-site"];
+    if (site !== undefined) return site === "same-origin";
+    return req.headers.origin !== undefined && req.headers.origin === this.getBaseUrl();
+  }
+
   /**
    * Classify dashboard authentication without writing a response.
    *
@@ -6150,13 +6222,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       denyLoopbackAutoAuth?: boolean;
     },
   ): DashboardAuthAdmission | null {
-    const authHeader = req.headers.authorization;
-    const parts = authHeader?.split(" ");
-    const hasValidBearer =
-      !!this.authToken &&
-      parts?.length === 2 &&
-      parts[0] === "Bearer" &&
-      constantTimeEquals(parts[1]!, this.authToken);
+    const hasValidBearer = this.hasOperatorBearer(req);
 
     if (opts?.requireToken) {
       return hasValidBearer ? "operator_credential" : null;
@@ -6778,6 +6844,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname.startsWith(SENTINEL_API_PREFIX)
     ) {
       this.dispatchSentinel(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    // Local task operator surface at `/local` and `/api/local/*`; must match
+    // LOCAL_DASHBOARD_ROUTES in local-recompile/dashboard-routes.ts.
+    if (
+      this.localSurface &&
+      (url.pathname === LOCAL_PAGE_PATH || url.pathname.startsWith(LOCAL_API_PREFIX))
+    ) {
+      this.dispatchLocal(req, res)
         .then((handled) => {
           if (handled) return;
           this.handleLegacyRequest(req, res, url, method);
