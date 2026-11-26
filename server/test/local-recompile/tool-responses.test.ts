@@ -169,7 +169,7 @@ describe("local task responses", () => {
     }
   });
 
-  it("a submitting call adds the gate row and one fixed submission row; busy and invalid calls add only the gate row", async () => {
+  it("a submitting call adds the gate row, one fixed submission row and its success marker; busy and invalid calls add only the gate row and the marker", async () => {
     nextWindow();
     const sizes: number[][] = [];
     const counts: number[] = [];
@@ -185,11 +185,14 @@ describe("local task responses", () => {
       sizes.push(added.map((entry) => entry.size));
       operations.push(await newOperations(beforeOps));
     }
-    expect(counts).toEqual([2, 2, 1, 2, 2, 1]);
+    // Every call here succeeds, so each also stores its call's success marker, which the audit query does not return.
+    expect(counts).toEqual([3, 3, 2, 3, 3, 2]);
+    expect(operations.map((ops) => ops.length)).toEqual([2, 2, 1, 2, 2, 1]);
     for (const index of [0, 1, 3, 4]) expect(operations[index]).toContain("local_request_submitted");
     for (const index of [2, 5]) expect(operations[index]).not.toContain("local_request_submitted");
-    // The submission row's stored size does not depend on the request.
-    expect(sizes[1]).toEqual(sizes[0]);
+    // The gate and submission rows' stored sizes do not depend on the request. The marker's details are only the
+    // call reference and a fixed outcome, so its size moves only with the log's own sequence width.
+    expect(sizes[1].slice(0, 2)).toEqual(sizes[0].slice(0, 2));
   });
 
   it("the submission row is durable before the acknowledgement", async () => {
