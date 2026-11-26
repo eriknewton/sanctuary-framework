@@ -81,7 +81,7 @@ To compare the promises in two versions, run `git diff v<older> v<newer> -- COMM
 - Enforced: cooperative code
 - Holds on: Cross-platform server audit log
 - Limit: Some kinds of deletion can be caught only by checking a copy on another machine, and that independent check has not been run and published yet.
-- Check it yourself: `sanctuary audit-chain export --output chain.jsonl`, then `sanctuary audit-chain verify --input chain.jsonl`
+- Check it yourself: `sanctuary audit-chain export --output chain.jsonl`, then `sanctuary audit-chain verify --input chain.jsonl --public-key <key>`, where `<key>` is your identity's public key from a copy you keep somewhere other than this machine (`sanctuary identity show` prints it). Without `--public-key`, signed checkpoints are reported as not verified. If a root daemon keeps its own record on this machine, the export needs `--operator-only`, and the check then covers only the operator record, not the daemon's.
 
 ## C-08. You can take your data and leave.
 

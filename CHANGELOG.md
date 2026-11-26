@@ -32,7 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - C-01: added. Sanctuary does not update itself.
 - C-02: added. Every 1.8 release carries a signature you can check yourself.
-- C-03: added. Sanctuary makes no network connection you did not ask for.
+- C-03: added. In a recorded drill, Sanctuary made no network connection you did not ask for (observed on one Linux host for version 1.8.4 only; the limits are in COMMITMENTS.md).
 - C-04: added. Your keys are created on your machine, and no copy is sent to us.
 - C-05: added. What Sanctuary stores is encrypted, and a tampered entry fails to open.
 - C-06: added. Actions you require approval for wait for you, and are refused if you cannot be reached.
