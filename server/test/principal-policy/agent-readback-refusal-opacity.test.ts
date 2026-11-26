@@ -3,7 +3,8 @@
  * no row, count, match or page in any agent reader, while the operator view
  * still holds the call's rows. Each case builds two identically seeded
  * servers with the same setup; only the treatment makes the measured call,
- * then both run the same observation schedule and must read back the same.
+ * then both run the same observation schedule, under one frozen clock, and
+ * must read back the same, SIEM event contents included.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -14,12 +15,15 @@ import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js"
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
 import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { CALL_OUTCOME_SUCCESS_OPERATION } from "../../src/operational/audit-log.js";
+import { AuditLogPersistenceError, BROKER_OPS, CALL_OUTCOME_SUCCESS_OPERATION } from "../../src/operational/audit-log.js";
 import { SIEM_EXPORT_FORMATS } from "../../src/audit/siem-tools.js";
 import { AGENT_AUDIT_READ_MAX_LIMIT } from "../../src/operational/agent-audit-redaction.js";
 import { INTERNAL_SIGNING_DOMAIN_PREFIXES } from "../../src/core/signing-domains.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { buildAuditDigest } from "../../src/principal-policy/posture.js";
+import { Broker } from "../../src/disclosure/broker/broker.js";
+import { SecretNotFoundError, type Backend } from "../../src/disclosure/broker/backend-interface.js";
+import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 import { expectedRefusal } from "../helpers/expected-refusal.js";
 
@@ -146,12 +150,44 @@ async function observe(world: World): Promise<unknown> {
       count: head.count,
       total_available: head.total_available,
       events: format === "cef" ? events.split("\n").filter((line) => line.length > 0).length : (JSON.parse(events) as unknown[]).length,
+      // The serialized events themselves, so a refused row cannot hide behind an equal count.
+      contents: normalizeTimes(events),
     };
   }
   return { pages, search, monitor, siem };
 }
 
-async function operatorRows(world: World): Promise<Array<{ operation: string; identity_id: string; call_ref?: string }>> {
+// Rows written before observation carry each world's own write time; only their order and contents are compared.
+const ISO_TIMESTAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
+// 13 digits = epoch milliseconds from 2001 to 2286, the SIEM formats' numeric time fields.
+const EPOCH_MILLIS = /\b\d{13}\b/g;
+
+function normalizeTimes(text: string): string {
+  return text.replace(ISO_TIMESTAMP, "<timestamp>").replace(EPOCH_MILLIS, "<epoch_ms>");
+}
+
+/** Both worlds' observation passes under one frozen clock, so no reading depends on when a world was observed. */
+async function observeFrozen(treatment: World, control: World): Promise<{ treatment: unknown; control: unknown }> {
+  vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+  try {
+    return { treatment: await observe(treatment), control: await observe(control) };
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** The cause the ledger recorded for the treatment's refused call of `tool`, so each case is the class it names. */
+async function ledgerCause(world: World, tool: string): Promise<unknown> {
+  let cause: unknown;
+  await vi.waitFor(async () => {
+    const row = (await operatorRows(world)).find((r) => r.operation === "denial_cause" && r.details?.tool === tool);
+    expect(row).toBeDefined();
+    cause = row!.details?.cause;
+  });
+  return cause;
+}
+
+async function operatorRows(world: World): Promise<Array<{ operation: string; identity_id: string; call_ref?: string; details?: Record<string, unknown> }>> {
   await world.app.auditLog.flush();
   return (await world.app.auditLog.query({ limit: 100_000 })).entries;
 }
@@ -162,6 +198,15 @@ interface Case {
   measured: (world: World) => Promise<CallResult>;
   /** The measured call writes at least one row under the agent's own identity. */
   writesOwnRow: boolean;
+  /** The refusal class this case drives, as the ledger records it, with the tool it is recorded under. */
+  ledger?: { tool: string; cause: string };
+}
+
+/** Fault injection for one measured call only; every other call in the world runs unfaulted. */
+function duringMeasured<T>(arm: (on: { active: boolean }) => void, measured: () => Promise<T>): Promise<T> {
+  const on = { active: true };
+  arm(on);
+  return measured().finally(() => { on.active = false; });
 }
 
 const CASES: Case[] = [
@@ -201,6 +246,55 @@ const CASES: Case[] = [
     measured: (w) => call(w, "state_write", { namespace: "_reputation", key: "k", value: "v" }),
     writesOwnRow: false,
   },
+  {
+    label: "pre-gate refusal of a bound-only tool in a session with no identity",
+    setup: async () => undefined,
+    measured: async (w) => {
+      delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
+      return w.client.callTool({ name: "sanctuary_events_open_cursor", arguments: {} });
+    },
+    writesOwnRow: false,
+    ledger: { tool: "sanctuary_events_open_cursor", cause: "session_not_bound" },
+  },
+  {
+    label: "write stop on audit integrity findings",
+    setup: async () => undefined,
+    measured: (w) => duringMeasured((on) => {
+      // The prototype's method, so a world that already carries a spy from an earlier case is not re-entered.
+      const read = Object.getPrototypeOf(w.app.auditLog).getIntegrityFindings.bind(w.app.auditLog) as typeof w.app.auditLog.getIntegrityFindings;
+      vi.spyOn(w.app.auditLog, "getIntegrityFindings").mockImplementation(async () =>
+        on.active ? [{ kind: "entry_hash_mismatch", message: "injected finding", sequence: 1 }] as Awaited<ReturnType<typeof read>> : read());
+    }, () => call(w, "sanctuary_remember", { key: "stopped", value: "v" })),
+    writesOwnRow: false,
+    ledger: { tool: "sanctuary_remember", cause: "write_integrity_stop" },
+  },
+  {
+    label: "integrity read fault",
+    setup: async () => undefined,
+    measured: (w) => duringMeasured((on) => {
+      // The prototype's method, so a world that already carries a spy from an earlier case is not re-entered.
+      const read = Object.getPrototypeOf(w.app.auditLog).getIntegrityFindings.bind(w.app.auditLog) as typeof w.app.auditLog.getIntegrityFindings;
+      vi.spyOn(w.app.auditLog, "getIntegrityFindings").mockImplementation(async () => {
+        if (on.active) throw new Error("injected integrity read fault");
+        return read();
+      });
+    }, () => call(w, "sanctuary_remember", { key: "unread", value: "v" })),
+    writesOwnRow: false,
+    ledger: { tool: "sanctuary_remember", cause: "integrity_read_fault" },
+  },
+  {
+    label: "handler throw",
+    setup: async () => undefined,
+    measured: (w) => duringMeasured((on) => {
+      const write = (Object.getPrototypeOf(w.storage).write as MemoryStorage["write"]).bind(w.storage);
+      vi.spyOn(w.storage, "write").mockImplementation(async (namespace, key, value) => {
+        if (on.active && key.includes("thrown")) throw new Error("injected store fault");
+        return write(namespace, key, value);
+      });
+    }, () => call(w, "state_write", { namespace: "opacity", key: "thrown", value: "v" })),
+    writesOwnRow: false,
+    ledger: { tool: "state_write", cause: "handler_error" },
+  },
 ];
 
 describe("a refused call adds nothing to any agent reader", () => {
@@ -210,8 +304,9 @@ describe("a refused call adds nothing to any agent reader", () => {
     for (const world of [a, b]) {
       for (let i = 0; i < BOUNDARY_SETUP_SAVES; i += 1) await succeed(world, "sanctuary_remember", { key: `k-${i}`, value: "v" });
     }
-    const oa = await observe(a) as { pages: unknown[][]; search: unknown[] };
-    const ob = await observe(b);
+    const observed = await observeFrozen(a, b);
+    const oa = observed.treatment as { pages: unknown[][]; search: unknown[] };
+    const ob = observed.control;
     expect(oa.pages[0]).toHaveLength(EVENTS_PER_PAGE);
     expect(oa.pages[1]!.length).toBeGreaterThan(0);
     expect(oa.search).toHaveLength(AUDIT_SEARCH_MAX_LIMIT);
@@ -232,7 +327,9 @@ describe("a refused call adds nothing to any agent reader", () => {
         expect(added.some((row) => row.identity_id === treatment.identityId), c.label).toBe(true);
       }
       expect(added.some((row) => row.operation === CALL_OUTCOME_SUCCESS_OPERATION)).toBe(false);
-      expect(await observe(treatment)).toEqual(await observe(control));
+      if (c.ledger) expect(await ledgerCause(treatment, c.ledger.tool), c.label).toBe(c.ledger.cause);
+      const observed = await observeFrozen(treatment, control);
+      expect(observed.treatment).toEqual(observed.control);
     }, 240_000);
   }
 
@@ -264,7 +361,8 @@ describe("a refused call adds nothing to any agent reader", () => {
       const rows = await operatorRows(treatment);
       expect(rows.some((row) => row.operation === "denial_cause")).toBe(true);
     });
-    expect(await observe(treatment)).toEqual(await observe(control));
+    const observed = await observeFrozen(treatment, control);
+    expect(observed.treatment).toEqual(observed.control);
   }, 240_000);
 });
 
@@ -292,6 +390,8 @@ describe("successful calls and lost markers", () => {
     const result = await call(treatment, "sanctuary_remember", { key: "unmarked", value: "v" });
     expect(result).not.toEqual(expectedRefusal());
     expect(Object.keys(body(result)).sort()).toEqual(Object.keys(body(await succeed(control, "sanctuary_remember", { key: "unmarked", value: "v" }))).sort());
+    // The refused marker is reported by the next flush, once.
+    await expect(treatment.app.auditLog.flush()).rejects.toBeInstanceOf(AuditLogPersistenceError);
     refuseMarkers = false;
     const own = (await operatorRows(treatment)).filter((row) => row.identity_id === treatment.identityId && row.call_ref !== undefined);
     expect(own.length).toBeGreaterThan(0);
@@ -320,6 +420,7 @@ describe("successful calls and lost markers", () => {
     });
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     await succeed(first, "sanctuary_remember", { key: "crash-key", value: "v" });
+    await expect(first.app.auditLog.flush()).rejects.toBeInstanceOf(AuditLogPersistenceError);
     await first.client.close();
     await first.app.cleanup();
     worlds.splice(worlds.indexOf(first), 1);
@@ -412,3 +513,85 @@ describe("the operator dashboard's activity counts", () => {
   }, 240_000);
 });
 
+// Retention headroom above the rows already stored when the cap is set: enough successes to pass the cap and prune,
+// with the refused calls landing after pruning has begun.
+const RETENTION_HEADROOM_ROWS = 12;
+const RETENTION_FILL_SAVES = RETENTION_HEADROOM_ROWS * 2;
+// Few enough successes after the refused calls that their rows are still retained when the readers run.
+const RETENTION_TAIL_SAVES = 2;
+
+function emptyBackend(): Backend {
+  return {
+    async ensureInitialized() {},
+    async unlock() {},
+    async isUnlocked() { return true; },
+    async addSecret() {},
+    async readSecret(n) { throw new SecretNotFoundError(n); },
+    async rotateSecret() {},
+    async deleteSecret() {},
+    async listSecretNames() { return []; },
+  };
+}
+
+describe("agent readers at the retention limit", () => {
+  for (const boundary of ["count", "bytes"] as const) {
+    it(`at the ${boundary} cap, no agent reader returns or counts a refused call's row`, async () => {
+      const world = await boot();
+      const log = world.app.auditLog;
+      const broker = new Broker({ backend: emptyBackend(), auditLog: log, surrogateBoundSecrets: new Set(), grants: [{ skill: "gmail-triage", secret: "granted-key", scope: "read" }], principalIdentityId: world.identityId });
+      const brokerServer = createBrokerMcpServer(broker, {
+        skill: "gmail-triage", agentId: "nsa", identityId: world.identityId,
+        tenantId: "tenant-alpha", fortressId: "fortress-alpha", audience: "sanctuary-broker",
+      });
+      type Handler = (req: unknown, extra: unknown) => Promise<{ isError?: boolean }>;
+      const brokerCall = (brokerServer as unknown as { _requestHandlers: Map<string, Handler> })._requestHandlers.get("tools/call")!;
+      await succeed(world, "sanctuary_remember", { key: "hidden-key", value: "v" });
+      await succeed(world, "sanctuary_hide", { key: "hidden-key" });
+      await log.flush();
+      const usage = await log.getRetentionUsage();
+      // The test sets the live log's retention caps; every other retention rule runs as configured.
+      const caps = log as unknown as { maxEntries: number; maxTotalSizeBytes: number; rotationHysteresis: number };
+      if (boundary === "count") {
+        caps.maxEntries = usage.entryCount + RETENTION_HEADROOM_ROWS;
+        caps.rotationHysteresis = 1;
+      } else {
+        caps.maxTotalSizeBytes = usage.totalSizeBytes + Math.ceil(usage.totalSizeBytes / usage.entryCount) * RETENTION_HEADROOM_ROWS;
+      }
+      for (let i = 0; i < RETENTION_FILL_SAVES; i += 1) await succeed(world, "sanctuary_remember", { key: `fill-${i}`, value: "v" });
+      await log.flush();
+      expect((await log.getRetentionUsage()).everPruned).toBe(true);
+
+      // Two refused calls at the cap: a hidden recall through the server and a no-grant broker request on the same log.
+      // Pruning shifts positions, so the refused calls' rows are found by the call references they add.
+      const refsBefore = new Set((await operatorRows(world)).map((r) => r.call_ref));
+      expect(await call(world, "sanctuary_recall", { key: "hidden-key" })).toEqual(expectedRefusal());
+      expect((await brokerCall({ method: "tools/call", params: { name: "broker/request_token", arguments: { skill: "gmail-triage", secret: "never-granted" } } }, { signal: new AbortController().signal })).isError).toBe(true);
+      const refusedRefs = new Set((await operatorRows(world)).map((r) => r.call_ref).filter((ref): ref is string => ref !== undefined && !refsBefore.has(ref)));
+      for (let i = 0; i < RETENTION_TAIL_SAVES; i += 1) await succeed(world, "sanctuary_remember", { key: `tail-${i}`, value: "v" });
+      const retained = await operatorRows(world);
+      const refusedRows = retained.filter((r) => r.call_ref !== undefined && refusedRefs.has(r.call_ref));
+      const otherOps = new Set(retained.filter((r) => !refusedRows.includes(r)).map((r) => r.operation));
+      // Operations only the refused calls wrote, so their presence in any reader is a refused row.
+      const refusedOps = new Set(refusedRows.filter((r) => r.identity_id === world.identityId).map((r) => r.operation).filter((op) => !otherOps.has(op)));
+      expect(refusedOps.has(BROKER_OPS.TOKEN_DENIED)).toBe(true);
+      expect(refusedOps.size).toBeGreaterThan(1);
+
+      const observed = await observe(world) as { pages: Array<Array<[unknown, unknown, unknown, unknown]>>; search: Array<[unknown, unknown, unknown, unknown]>; monitor: { count: number; rows: Array<[unknown, unknown, unknown]> }; siem: Record<string, { count: number; total_available: number; events: number; contents: string }> };
+      for (const page of observed.pages) for (const [, operation] of page) expect(refusedOps.has(operation as string), `events ${String(operation)}`).toBe(false);
+      for (const [, operation] of observed.search) expect(refusedOps.has(operation as string), `search ${String(operation)}`).toBe(false);
+      for (const [operation] of observed.monitor.rows) expect(refusedOps.has(operation as string), `monitor ${String(operation)}`).toBe(false);
+      // Every limit is above the visible total, so each count is the number of rows the reader returned.
+      expect(observed.monitor.count).toBe(observed.monitor.rows.length);
+      for (const [format, siem] of Object.entries(observed.siem)) {
+        expect(siem.count, format).toBe(siem.events);
+        expect(siem.total_available, format).toBe(siem.count);
+        for (const op of refusedOps) expect(siem.contents.includes(op), `${format} ${op}`).toBe(false);
+      }
+      const brokerRead = await broker.queryAudit({ limit: 1_000 });
+      expect(brokerRead.total).toBe(brokerRead.entries.length);
+      expect(brokerRead.entries.map((e) => e.operation)).not.toContain(BROKER_OPS.TOKEN_DENIED);
+      // The operator view still holds the refused rows at the cap.
+      expect(refusedRows.length).toBeGreaterThan(0);
+    }, 240_000);
+  }
+});

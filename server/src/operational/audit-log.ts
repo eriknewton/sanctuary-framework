@@ -1807,6 +1807,8 @@ interface CallScopeRecord {
   readonly stamped: Map<AuditLog, number>;
   /** Logs whose marker was already enqueued. */
   readonly marked: Set<AuditLog>;
+  /** Logs that admitted a row of this call inside runAllowingIntegrityFindings (the router's read-tool bypass). */
+  readonly admittedOverFindings: Set<AuditLog>;
   note?: CallScopeNote;
 }
 
@@ -1830,6 +1832,7 @@ export function runInCallScope<T>(fn: (scope: CallScopeHandle) => Promise<T>): P
     state: "scope_OPEN",
     stamped: new Map(),
     marked: new Set(),
+    admittedOverFindings: new Set(),
   };
   const handle: CallScopeHandle = Object.freeze({
     call_ref: record.call_ref,
@@ -1881,7 +1884,13 @@ export function writeCallOutcomeMarkers(scope: CallScopeHandle): void {
   for (const [log, count] of record.stamped) {
     if (count <= 0 || record.marked.has(log)) continue;
     record.marked.add(log);
-    log[enqueueCallOutcomeMarker](record.call_ref);
+    // A marker is admitted under the integrity context its call's rows were admitted under, so a read call on a chain
+    // with findings marks the rows it was allowed to write; a marker can only make already-written rows visible.
+    if (record.admittedOverFindings.has(log)) {
+      auditIntegrityContext.run({ allowIntegrityFindings: true }, () => log[enqueueCallOutcomeMarker](record.call_ref));
+    } else {
+      log[enqueueCallOutcomeMarker](record.call_ref);
+    }
   }
 }
 
@@ -2690,6 +2699,11 @@ export class AuditLog {
   // A load may publish its sized observation only while this mutation generation matches.
   private retentionGeneration = 0;
   private readonly pendingWrites = new Set<Promise<void>>();
+  /**
+   * The first success-marker failure no drain has reported yet. A marker has no awaiting caller, so flush() is its
+   * only observer; one kept failure is enough to make the drain reject, so later ones are not kept (bounded state).
+   */
+  private unreportedMarkerFailure: { readonly error: unknown } | undefined;
   private pendingVisibleEntries = 0;
   private appendQueue: Promise<void> = Promise.resolve();
   private loaded = false;
@@ -3231,8 +3245,9 @@ export class AuditLog {
   /**
    * Wait for every in-flight `append()` persist (and its rotation pass) to
    * settle. Rejects with `AuditLogPersistenceError` if any tracked persist
-   * failed. Safe to call multiple times — newly-appended entries during a
-   * flush are also awaited. Re-entrant only at the granularity of "drain
+   * failed, or if a call's success marker failed since the last drain that
+   * reported one (the request boundary never awaits a marker). Safe to call
+   * multiple times — newly-appended entries during a flush are also awaited. Re-entrant only at the granularity of "drain
    * everything queued so far". Short-lived CLIs MUST call this before
    * `process.exit()` to keep audit writes durable.
    */
@@ -3270,6 +3285,11 @@ export class AuditLog {
         if (result.status === "rejected") failures.push(result.reason);
       }
     }
+    // A failed success marker is reported like a failed append, even when it settled before this drain began.
+    if (this.unreportedMarkerFailure !== undefined) {
+      failures.push(this.unreportedMarkerFailure.error);
+      this.unreportedMarkerFailure = undefined;
+    }
     if (failures.length > 0) {
       throw new AuditLogPersistenceError(failures);
     }
@@ -3290,11 +3310,13 @@ export class AuditLog {
       result: "success",
       details: { call_ref: callRef, outcome: "success" },
     }, { verifyDurability: false, critical: false, outcomeMarker: true });
-    // A marker that never lands leaves its call's rows hidden from agent readers; the operator view is unaffected.
-    void writePromise.catch(() => {
+    // A marker that never lands leaves its call's rows hidden from agent readers; the operator view is unaffected,
+    // and the next flush() rejects, so a failed marker is never a silent success.
+    this.trackPendingWrite(writePromise.catch((error: unknown) => {
+      this.unreportedMarkerFailure ??= { error };
       // SAFETY: stderr names only the failed marker operation, without entry content or audit-backed logging.
       console.error(`[audit-log] ${CALL_OUTCOME_SUCCESS_OPERATION} append failed`);
-    });
+    }));
   }
 
   private enqueueAppend(
@@ -3308,7 +3330,10 @@ export class AuditLog {
       const scope = callScopeContext.getStore();
       if (scope) {
         callRef = scope.call_ref;
-        if (scope.state === "scope_OPEN") scope.stamped.set(this, (scope.stamped.get(this) ?? 0) + 1);
+        if (scope.state === "scope_OPEN") {
+          scope.stamped.set(this, (scope.stamped.get(this) ?? 0) + 1);
+          if (auditIntegrityContext.getStore()?.allowIntegrityFindings === true) scope.admittedOverFindings.add(this);
+        }
       }
     }
     const task = this.appendQueue
@@ -4757,7 +4782,10 @@ export class AuditLog {
     evidence_agent?: string;
     /** Return call outcome markers too; integrity, export, verify and completeness paths that count stored rows set it. */
     include_outcome_markers?: boolean;
-    /** Return only rows an agent reader may see: a row written in a call only once its success marker is retained. */
+    /**
+     * Return only rows an agent reader may see: a row written in a call only once its success marker is retained.
+     * Must match agent_visible in FeatureHealthAuditReader (principal-policy/feature-health.ts).
+     */
     agent_visible?: boolean;
     /** Return `sequences`, each returned row's key, parallel to `entries`. */
     with_sequences?: boolean;

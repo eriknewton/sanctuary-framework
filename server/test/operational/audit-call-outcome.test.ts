@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentVisibleEntries,
   AuditLog,
+  AuditLogPersistenceError,
   CALL_OUTCOME_SUCCESS_OPERATION,
   ReservedAuditOperationError,
   runInCallScope,
@@ -322,6 +323,8 @@ describe("marker faults and reopen", () => {
       return "handler result";
     });
     expect(returned).toBe("handler result");
+    // The failed marker is reported by the next flush, once.
+    await expect(log.flush()).rejects.toBeInstanceOf(AuditLogPersistenceError);
     await log.flush();
     await new Promise((resolve) => setImmediate(resolve));
     const rows = await allRows(log);
@@ -351,7 +354,7 @@ describe("marker faults and reopen", () => {
       settleCallOutcome(scope, "succeeded");
       writeCallOutcomeMarkers(scope);
     });
-    await log.flush();
+    await expect(log.flush()).rejects.toBeInstanceOf(AuditLogPersistenceError);
     const reopened = new AuditLog(storage, masterKey);
     const result = await reopened.query({ limit: 100, include_outcome_markers: true });
     expect(result.integrity_findings).toEqual([]);

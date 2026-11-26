@@ -77,6 +77,22 @@ function rig(read?: () => Promise<void>) {
   return { auditLog, broker, server, callTool };
 }
 
+// A client deadline short enough to land while the backend read is held.
+const DEADLINE_MS = 20;
+
+/** Each server-side request signal, with its abort-listener count before the broker's request boundary sees it. */
+function observeServerSignals(server: unknown): Array<{ signal: AbortSignal; listenersBefore: number }> {
+  const seen: Array<{ signal: AbortSignal; listenersBefore: number }> = [];
+  const handlers = (server as { _requestHandlers: Map<string, Handler> })._requestHandlers;
+  const inner = handlers.get("tools/call")!;
+  handlers.set("tools/call", (req, extra) => {
+    const signal = (extra as { signal: AbortSignal }).signal;
+    seen.push({ signal, listenersBefore: getEventListeners(signal, "abort").length });
+    return inner(req, extra);
+  });
+  return seen;
+}
+
 function parse(result: { content: Array<{ text: string }> }): Record<string, unknown> {
   return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
 }
@@ -152,6 +168,7 @@ describe("broker audit_query follows each request's outcome", () => {
     let gate = new Promise<void>((resolve) => { release = resolve; });
     const r = rig(async () => { entered += 1; await gate; });
     const issued = parse(await r.callTool("broker/request_token", { skill: "gmail-triage", secret: "openai-api-key" }));
+    const seen = observeServerSignals(r.server);
     const client = new Client({ name: "broker-cancel", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await r.server.connect(serverTransport);
@@ -159,7 +176,9 @@ describe("broker audit_query follows each request's outcome", () => {
     cleanups.push(async () => { await client.close(); await r.server.close(); });
     for (let wave = 0; wave < 3; wave++) {
       entered = 0;
+      seen.length = 0;
       const before = await markers(r.auditLog);
+      const visibleBefore = (await r.broker.queryAudit({ limit: 1_000 })).total;
       const controllers = Array.from({ length: 4 }, () => new AbortController());
       const pending = controllers.map((c) =>
         client.callTool({ name: "broker/read_secret", arguments: { token: issued.token } }, undefined, { signal: c.signal })
@@ -172,8 +191,44 @@ describe("broker audit_query follows each request's outcome", () => {
       expect(await Promise.all(pending)).toEqual(Array(controllers.length).fill("rejected"));
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(await markers(r.auditLog)).toBe(before);
+      // The cancelled reads' rows stay out of the agent's broker audit read.
+      expect((await r.broker.queryAudit({ limit: 1_000 })).total).toBe(visibleBefore);
+      // Every server-side request signal is back to the abort listeners it had before the broker's request boundary ran.
+      expect(seen).toHaveLength(controllers.length);
+      for (const s of seen) expect(getEventListeners(s.signal, "abort")).toHaveLength(s.listenersBefore);
       gate = new Promise<void>((resolve) => { release = resolve; });
     }
+  });
+
+  it("a broker read past its SDK deadline writes no marker, keeps its rows hidden and leaves no listener", async () => {
+    let release!: () => void;
+    let entered = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let blocking = false;
+    const r = rig(async () => { if (blocking) { entered += 1; await gate; } });
+    const issued = parse(await r.callTool("broker/request_token", { skill: "gmail-triage", secret: "openai-api-key" }));
+    const seen = observeServerSignals(r.server);
+    const client = new Client({ name: "broker-deadline", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await r.server.connect(serverTransport);
+    await client.connect(clientTransport);
+    cleanups.push(async () => { await client.close(); await r.server.close(); });
+    const before = await markers(r.auditLog);
+    const visibleBefore = (await r.broker.queryAudit({ limit: 1_000 })).total;
+    const operatorBefore = (await r.broker.queryAuditOperator({ limit: 1_000 })).total;
+    blocking = true;
+    // The SDK's request timeout cancels the request, which reaches the broker's boundary as its abort signal.
+    await expect(client.callTool({ name: "broker/read_secret", arguments: { token: issued.token } }, undefined, { timeout: DEADLINE_MS })).rejects.toThrow();
+    for (let i = 0; i < 2_000 && !(seen[0]?.signal.aborted === true); i++) await new Promise((resolve) => setImmediate(resolve));
+    expect(entered).toBe(1);
+    expect(seen[0]!.signal.aborted).toBe(true);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, DEADLINE_MS));
+    expect(await markers(r.auditLog)).toBe(before);
+    expect((await r.broker.queryAudit({ limit: 1_000 })).total).toBe(visibleBefore);
+    // The read did write its rows; only the agent's read leaves them out.
+    expect((await r.broker.queryAuditOperator({ limit: 1_000 })).total).toBeGreaterThan(operatorBefore);
+    expect(getEventListeners(seen[0]!.signal, "abort")).toHaveLength(seen[0]!.listenersBefore);
   });
 
   it("broker audit_query entries carry exactly the four redacted fields and no call reference", async () => {

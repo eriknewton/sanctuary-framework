@@ -857,6 +857,8 @@ export interface FeatureHealthAuditReader {
     layer?: AuditEntry["layer"];
     operation_type?: string;
     identity_id?: string;
+    /** Must match agent_visible in AuditLog.query (operational/audit-log.ts). */
+    agent_visible?: boolean;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
@@ -868,6 +870,13 @@ export interface FeatureHealthAuditReader {
 
 export interface BuildFeatureHealthInput {
   auditLog: FeatureHealthAuditReader;
+  /**
+   * Read only the rows an agent reader may see. Agent-callable tools set it;
+   * must match the sanctuary_active_protections call in
+   * agent-native/cooperative-surface.ts. Operator surfaces leave it unset and
+   * keep every row.
+   */
+  agentVisible?: boolean;
   originMachine: string;
   /** Registry to evaluate. Defaults to the Slice-1 registry; injectable for tests. */
   registry?: ReadonlyArray<FeatureRegistryEntry>;
@@ -1771,6 +1780,8 @@ export async function buildFeatureHealthPanel(
   // The audit query pages with a fixed limit and returns the most-recent slice;
   // a full page means older entries in the range were dropped (truncation).
   const AUDIT_PAGE_LIMIT = 10_000;
+  // Every audit read below takes the same view; an operator panel (unset) keeps every row.
+  const agentVisible = input.agentVisible === true;
 
   let entries: AuditEntry[];
   let integrityOk: boolean;
@@ -1789,6 +1800,8 @@ export async function buildFeatureHealthPanel(
     // count reflects the full window, not a recent slice.
     const result = await input.auditLog.query({
       since: windowStart,
+      // An agent caller's panel is built only from rows it may see, so a refused call moves no row status.
+      agent_visible: agentVisible,
       limit: AUDIT_PAGE_LIMIT,
     });
     entries = result.entries;
@@ -1819,6 +1832,8 @@ export async function buildFeatureHealthPanel(
         since: windowStart,
         layer: spec.layer,
         operation_type: spec.operation_type,
+        // Same view as the window read above, so lifecycle evidence and completeness follow the caller's view.
+        agent_visible: agentVisible,
         limit: AUDIT_PAGE_LIMIT,
       });
       entries.push(...lifecycle.entries);
@@ -1851,6 +1866,8 @@ export async function buildFeatureHealthPanel(
   try {
     const fresh = await input.auditLog.query({
       since: freshnessFloorIso,
+      // Same view as the window read above, so the fault decision follows the caller's view.
+      agent_visible: agentVisible,
       limit: AUDIT_PAGE_LIMIT,
     });
     freshnessEntries = fresh.entries;

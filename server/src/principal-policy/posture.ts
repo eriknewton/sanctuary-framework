@@ -1689,6 +1689,13 @@ export interface CustodyExitPanel {
 export interface BuildCustodyExitPanelInput {
   auditLog: AuditLog;
   originMachine: string;
+  /**
+   * Read only the rows an agent reader may see. Agent-callable tools set it;
+   * must match the sanctuary_active_protections call in
+   * agent-native/cooperative-surface.ts. Operator surfaces leave it unset and
+   * keep every row.
+   */
+  agentVisible?: boolean;
   now?: number;
   /** Window over which custody evidence is read (defaults to the digest window). */
   windowMs?: number;
@@ -1747,7 +1754,13 @@ export async function buildCustodyExitPanel(
   let entries;
   let integrityOk: boolean;
   try {
-    const result = await input.auditLog.query({ since, limit: 50_000 });
+    const result = await input.auditLog.query({
+      since,
+      // An agent caller's panel is built only from rows it may see, so a refused call moves no custody signal.
+      agent_visible: input.agentVisible === true,
+      // The panel reads the digest window, under the digest's per-request bound.
+      limit: DIGEST_QUERY_ENTRY_LIMIT,
+    });
     entries = result.entries;
     // BLOCKER-1 (round 3): fold the sealed-region verdict (untampered collapse:
     // fail closed only on active tamper, not on an armed box's unreadable sealed

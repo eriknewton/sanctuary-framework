@@ -147,9 +147,15 @@ export interface CooperativeSurfaceOptions {
   baselineNamespaceInserts: Pick<BaselineNamespaceInserts, "record">;
 }
 
+/** A read-only view of one server's open-cursor table, for tests that sample it while an open is in flight. */
+export interface EventCursorTableView {
+  readonly size: number;
+  ids(): string[];
+}
+
 export function createAgentNativeCooperativeTools(
   options: CooperativeSurfaceOptions
-): { tools: ToolDefinition[] } {
+): { tools: ToolDefinition[]; eventCursorTable: EventCursorTableView } {
   const hidden = new Map<string, HiddenMarker>();
   const cursors = new Map<string, EventCursor>();
   const helpProbeSummaries = new Map<string, HelpProbeSummary>();
@@ -966,8 +972,11 @@ export function createAgentNativeCooperativeTools(
               protectionClaimSubject: null,
               brokerPinnedProducerKeyB64url: brokerKey?.keyB64url ?? null,
               brokerProducerKeyExpectedButUnavailable: brokerKeyUnavailable,
+              // Agent readers ask for agent-visible rows only; must match agentVisible in BuildFeatureHealthInput.
+              agentVisible: true,
             }),
-            buildCustodyExitPanel({ auditLog: options.auditLog, originMachine: "local" }),
+            // Agent readers ask for agent-visible rows only; must match agentVisible in BuildCustodyExitPanelInput.
+            buildCustodyExitPanel({ auditLog: options.auditLog, originMachine: "local", agentVisible: true }),
             options.auditLog.getAuditChainVerdict(),
           ]);
           // Must match observeProtections in protection-observations.ts: supply raw consumers (the identity manager
@@ -1040,6 +1049,13 @@ export function createAgentNativeCooperativeTools(
             reads: 0,
           };
           cursors.set(cursor.cursor_id, cursor);
+          // Read at each check, since cancellation can land during any await of the open.
+          const cancelled = (): boolean => context?.signal?.aborted === true;
+          // An open that does not return its cursor frees the entry it inserted, so a failed open never holds a slot.
+          const discard = (): void => {
+            // Only this open's own entry is removed; a later entry under the same id is never touched.
+            if (cursors.get(cursor.cursor_id) === cursor) cursors.delete(cursor.cursor_id);
+          };
           try {
             // A cursor pages through the rows visible when it was opened, so a row that becomes visible later is never
             // inserted ahead of the read position.
@@ -1053,16 +1069,17 @@ export function createAgentNativeCooperativeTools(
                 limit: EVENTS_CURSOR_WINDOW_ROWS,
               })
             );
-            if (context?.signal?.aborted === true) throw new Error("cursor open cancelled");
+            if (cancelled()) throw new Error("cursor open cancelled");
             cursor.keys = (snapshot.sequences ?? []).slice(0, EVENTS_CURSOR_SNAPSHOT_ROWS);
             cursor.pending = false;
+            const auditRef = await audit("sanctuary_events_open_cursor", { operation: cursor.operation });
+            // A cancelled call is refused at the boundary, so its cursor would never reach the caller.
+            if (cancelled()) throw new Error("cursor open cancelled");
+            return toolResult({ cursor: cursor.cursor_id, audit_ref: auditRef });
           } catch (error) {
-            // Only this open's own entry is removed; a later entry under the same id is never touched.
-            if (cursors.get(cursor.cursor_id) === cursor) cursors.delete(cursor.cursor_id);
+            discard();
             throw error;
           }
-          const auditRef = await audit("sanctuary_events_open_cursor", { operation: cursor.operation });
-          return toolResult({ cursor: cursor.cursor_id, audit_ref: auditRef });
         } catch {
           return deny("audit:sanctuary_events_open_cursor", "wait");
         }
@@ -1376,5 +1393,9 @@ export function createAgentNativeCooperativeTools(
     },
   ];
 
-  return { tools };
+  const eventCursorTable: EventCursorTableView = {
+    get size() { return cursors.size; },
+    ids: () => [...cursors.keys()],
+  };
+  return { tools, eventCursorTable };
 }

@@ -23,9 +23,9 @@ import {
 } from "../../src/operational/audit-log.js";
 import { redactAuditEntryForAgent } from "../../src/operational/agent-audit-redaction.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import type { ToolDefinition } from "../../src/router.js";
+import { toolResult, type ToolDefinition } from "../../src/router.js";
 import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
-import { ApprovalProofStore, fingerprintIdentityId, type SessionBinding } from "../../src/agent-native/safety-base.js";
+import { ApprovalProofStore, fingerprintIdentityId, fixedDenial, type SessionBinding } from "../../src/agent-native/safety-base.js";
 
 const OWN = "own_row";
 // Must match the events cursor's caps in agent-native/cooperative-surface.ts.
@@ -47,7 +47,7 @@ async function setup(config?: { maxEntries?: number; maxInMemoryEntries?: number
   const created = JSON.parse((await l1Tools.find((t) => t.name === "identity_create")!.handler({ label: "cursor" })).content[0]!.text);
   const identityId = created.identity_id as string;
   active = { identity_id: identityId, requester_identity_fingerprint: fingerprintIdentityId(identityId) };
-  const { tools } = createAgentNativeCooperativeTools({
+  const { tools, eventCursorTable } = createAgentNativeCooperativeTools({
     baselineNamespaceInserts: recordingNamespaceInserts(),
     identityManager,
     namespaceRegistry,
@@ -58,8 +58,8 @@ async function setup(config?: { maxEntries?: number; maxInMemoryEntries?: number
     approvalProofStore: new ApprovalProofStore(),
   });
   const tool = (name: string): ToolDefinition => tools.find((t) => t.name === name)!;
-  const run = async (name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> =>
-    JSON.parse((await tool(name).handler(args, `agent:cursor`, {})).content[0]!.text) as Record<string, unknown>;
+  const run = async (name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> =>
+    JSON.parse((await tool(name).handler(args, `agent:cursor`, signal ? { signal } : {})).content[0]!.text) as Record<string, unknown>;
   const ownRows = async (n: number, tag = "") => {
     for (let i = 0; i < n; i++) await auditLog.append("l2", OWN, identityId, { tag: `${tag}${i}` });
     await auditLog.flush();
@@ -77,7 +77,7 @@ async function setup(config?: { maxEntries?: number; maxInMemoryEntries?: number
     }
     return events;
   };
-  return { auditLog, storage, masterKey, identityId, run, ownRows, visibleAtOpen, open, read, readAll, tool };
+  return { auditLog, storage, masterKey, identityId, run, ownRows, visibleAtOpen, open, read, readAll, tool, eventCursorTable };
 }
 
 function expected(rows: readonly AuditEntry[]): Array<Record<string, unknown>> {
@@ -274,6 +274,9 @@ describe("the open-cursor cap", () => {
         return query(options);
       });
       const pending = Array.from({ length: MAX_OPEN_CURSORS + 8 }, () => r.run("sanctuary_events_open_cursor", {}));
+      // Sampled while every snapshot query is still blocked: the pending entries count toward the cap.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(r.eventCursorTable.size).toBe(MAX_OPEN_CURSORS);
       release();
       const results = await Promise.all(pending);
       spy.mockRestore();
@@ -313,3 +316,105 @@ describe("the open-cursor cap", () => {
     expect(typeof (await r.run("sanctuary_events_open_cursor", {})).cursor).toBe("string");
   });
 });
+
+const OPEN_OPERATION = "sanctuary_events_open_cursor";
+
+/** Holds the cursor open's own audit append until released, or makes it reject. */
+function holdOpeningAppend(log: AuditLog, mode: { reject: boolean }) {
+  let release!: () => void;
+  let gate = new Promise<void>((resolve) => { release = resolve; });
+  let held = 0;
+  const appendCritical = log.appendCritical.bind(log);
+  vi.spyOn(log, "appendCritical").mockImplementation(async (entry) => {
+    if (entry.operation === OPEN_OPERATION) {
+      held += 1;
+      await gate;
+      if (mode.reject) throw new Error("injected append refusal");
+    }
+    return appendCritical(entry);
+  });
+  return {
+    held: () => held,
+    release: () => { release(); gate = new Promise<void>((resolve) => { release = resolve; }); },
+  };
+}
+
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 2_000 && !condition(); i++) await new Promise((resolve) => setImmediate(resolve));
+  expect(condition()).toBe(true);
+}
+
+describe("a cursor that fails to open frees its slot", () => {
+  it("an open cancelled while its own audit append is held, then released, leaves the table as it was", async () => {
+    const r = await setup();
+    await r.ownRows(3);
+    const before = r.eventCursorTable.size;
+    const hold = holdOpeningAppend(r.auditLog, { reject: false });
+    const controller = new AbortController();
+    const pending = r.run(OPEN_OPERATION, { filter: { operation: OWN } }, controller.signal);
+    await until(() => hold.held() === 1);
+    expect(r.eventCursorTable.size).toBe(before + 1);
+    controller.abort();
+    hold.release();
+    expect((await pending).cursor).toBeUndefined();
+    expect(r.eventCursorTable.size).toBe(before);
+  });
+
+  it("an open whose own audit append rejects leaves the table as it was", async () => {
+    const r = await setup();
+    const before = r.eventCursorTable.size;
+    const hold = holdOpeningAppend(r.auditLog, { reject: true });
+    const pending = r.run(OPEN_OPERATION, {});
+    await until(() => hold.held() === 1);
+    hold.release();
+    expect((await pending).cursor).toBeUndefined();
+    expect(r.eventCursorTable.size).toBe(before);
+  });
+
+  it("64 failed opens, cancelled or rejected, are followed by a healthy open that succeeds", async () => {
+    const r = await setup();
+    const mode = { reject: false };
+    const hold = holdOpeningAppend(r.auditLog, mode);
+    for (let i = 0; i < MAX_OPEN_CURSORS; i++) {
+      mode.reject = i % 2 === 1;
+      const controller = new AbortController();
+      const pending = r.run(OPEN_OPERATION, {}, controller.signal);
+      await until(() => hold.held() === i + 1);
+      if (!mode.reject) controller.abort();
+      hold.release();
+      expect((await pending).cursor).toBeUndefined();
+    }
+    expect(r.eventCursorTable.size).toBe(0);
+    vi.mocked(r.auditLog.appendCritical).mockRestore();
+    expect(typeof (await r.open())).toBe("string");
+    expect(r.eventCursorTable.size).toBe(1);
+  });
+});
+
+describe("a pending cursor", () => {
+  it("a read against a cursor whose snapshot query is still blocked refuses with the existing envelope", async () => {
+    const r = await setup();
+    await r.ownRows(3);
+    const query = r.auditLog.query.bind(r.auditLog);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let blocked = 0;
+    vi.spyOn(r.auditLog, "query").mockImplementation(async (options) => {
+      if (options.with_sequences === true && options.limit === WINDOW_ROWS) {
+        blocked += 1;
+        await gate;
+      }
+      return query(options);
+    });
+    const pending = r.run(OPEN_OPERATION, { filter: { operation: OWN } });
+    await until(() => blocked === 1);
+    const [id] = r.eventCursorTable.ids();
+    expect(id).toBeDefined();
+    const refused = await r.tool("sanctuary_events_read").handler({ cursor: id, opts: { limit: PAGE } }, "agent:cursor", {});
+    expect(refused).toEqual(toolResult(fixedDenial("audit:sanctuary_events_read", "wait", null)));
+    release();
+    expect((await pending).cursor).toBe(id);
+    expect(((await r.read(id!)).events as unknown[]).length).toBe(3);
+  });
+});
+
