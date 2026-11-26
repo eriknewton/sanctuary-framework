@@ -141,6 +141,7 @@ export async function computeAuditPeriodSummary(
   // the end date. The audit log query API supports `since` but not
   // `until` — so we pull everything since period_start and filter
   // by period_end in memory.
+  // DEBT(AGENT-SEAT-COMPLIANCE-COUNT): the approved bundle counts every principal's rows, including rows from calls that ended refused.
   const { entries: rawEntries } = await auditLog.query({
     since: periodStart,
     limit: 1_000_000, // effectively unbounded for this period

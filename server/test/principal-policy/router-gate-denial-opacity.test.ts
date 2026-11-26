@@ -1,3 +1,4 @@
+// fail-before-exempt: teardown restores the ledger clock shift the readback block makes, and a comment now names where the per-refusal readback check lives; no assertion changes.
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -572,6 +573,8 @@ describe("one refusal through the production composition root", () => {
     try {
       try { await booted?.client.close(); } finally { await booted?.app.cleanup(); }
     } finally {
+      // The ledger clock shift below is this block's own; later blocks see the real clock.
+      ledgerClock.offsetMs = 0;
       for (const mock of mocks.splice(0)) mock.mockRestore();
       if (previousSessionId === undefined) delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
       else process.env.SANCTUARY_SESSION_IDENTITY_ID = previousSessionId;
@@ -652,8 +655,8 @@ describe("one refusal through the production composition root", () => {
     // denial_cause_summary rows and the pre-gate gate_deny row): after a fresh
     // refusal in every boundary stage in this one server, no agent-callable
     // audit surface returns one of them or any of their operator-side fields.
-    // Dropped from this run: a check that the readback tools show no new row
-    // after each refused call.
+    // That a refused call adds no row, count or page to any reader is witnessed
+    // in test/principal-policy/agent-readback-refusal-opacity.test.ts.
     const stageRefusal = (label: string) => REFUSAL_CASES.find((candidate) => candidate.label === label)!;
     for (const label of STAGE_REFUSALS) {
       expect(await stageRefusal(label).run(booted), label).toEqual(expectedRefusal());

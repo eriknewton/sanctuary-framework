@@ -21,8 +21,10 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Broker } from "../disclosure/broker/broker.js";
+import { runInCallScope, settleCallOutcome, writeCallOutcomeMarkers } from "../operational/audit-log.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import {
   BrokerDeniedError,
@@ -151,7 +153,7 @@ export function createBrokerMcpServer(
     ],
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const handleBrokerRequest = async (request: CallToolRequest) => {
     const { name, arguments: rawArgs } = request.params;
     const args = (rawArgs ?? {}) as Record<string, unknown>;
 
@@ -241,7 +243,37 @@ export function createBrokerMcpServer(
       // agent-facing broker/audit_query tool).
       return genericError("Broker backend unavailable");
     }
-  });
+  };
+
+  // A broker request is one call: its rows follow its outcome. Must match runInCallScope, settleCallOutcome and
+  // writeCallOutcomeMarkers in operational/audit-log.ts and the router's boundary in router.ts.
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) =>
+    runInCallScope(async (scope) => {
+      // A direct handler call may carry no signal; the SDK always supplies one.
+      const signal: AbortSignal | undefined = extra.signal;
+      // Cancellation before the success commits makes the call refused.
+      const onAbort = (): void => {
+        settleCallOutcome(scope, "refused");
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted === true) settleCallOutcome(scope, "refused");
+      try {
+        const result = await handleBrokerRequest(request);
+        // Only ok() bodies carry no isError flag; every genericError() body is a refusal.
+        if ("isError" in result && result.isError === true) {
+          settleCallOutcome(scope, "refused");
+          return result;
+        }
+        if (signal?.aborted !== true && settleCallOutcome(scope, "succeeded") === "succeeded") {
+          writeCallOutcomeMarkers(scope);
+          return result;
+        }
+        return genericError("Broker denied");
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        if (scope.state === "scope_OPEN") settleCallOutcome(scope, "refused");
+      }
+    }));
 
   return server;
 }

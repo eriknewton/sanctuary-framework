@@ -1269,7 +1269,8 @@ async function exportAuditReceipts(
   exportedAt: string,
 ): Promise<{ artifact: ExitAuditReceiptsArtifact; warning?: string }> {
   await auditLog.flush();
-  const result = await auditLog.query({ limit: cap });
+  // This path counts stored rows, so it reads outcome markers too.
+  const result = await auditLog.query({ limit: cap, include_outcome_markers: true });
   // `total` is the full post-filter population; `entries` is the most-recent
   // `cap`-sized slice. When the population exceeds the cap the oldest entries
   // are dropped - mark it honestly so the artifact's `total` does not silently

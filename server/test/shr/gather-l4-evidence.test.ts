@@ -9,7 +9,7 @@
 import { describe, it, expect } from "vitest";
 import { gatherReputationEvidence } from "../../src/shr/tools.js";
 import { ReputationStore } from "../../src/reputation/reputation-store.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, runInCallScope, settleCallOutcome, writeCallOutcomeMarkers } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -96,5 +96,30 @@ describe("gatherReputationEvidence", () => {
     );
     const ev = await gatherReputationEvidence(store, auditLog, identity);
     expect(ev.verascore_linked).toBe(false);
+  });
+});
+
+describe("gatherReputationEvidence follows each publish call's outcome", () => {
+  async function publishIn(auditLog: AuditLog, identityId: string, outcome: "succeeded" | "refused"): Promise<void> {
+    await runInCallScope(async (scope) => {
+      await auditLog.append("l4", "reputation_publish", identityId, { platform: "verascore" }, "success");
+      settleCallOutcome(scope, outcome);
+      writeCallOutcomeMarkers(scope);
+    });
+    await auditLog.flush();
+  }
+
+  it("a publish row persisted in a call that ended refused gives verascore_linked false", async () => {
+    const { store, auditLog, identity } = setup();
+    await publishIn(auditLog, identity.identity_id, "refused");
+    const ev = await gatherReputationEvidence(store, auditLog, identity);
+    expect(ev.verascore_linked).toBe(false);
+  });
+
+  it("a publish whose call succeeded gives verascore_linked true", async () => {
+    const { store, auditLog, identity } = setup();
+    await publishIn(auditLog, identity.identity_id, "succeeded");
+    const ev = await gatherReputationEvidence(store, auditLog, identity);
+    expect(ev.verascore_linked).toBe(true);
   });
 });

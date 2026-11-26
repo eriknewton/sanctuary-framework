@@ -21,7 +21,9 @@ import {
   AuditLockContentionError,
   AuditPersistenceError,
   AuditWriterAuthorityError,
+  noteCallScopeCause,
   type AuditLog,
+  type CallScopeNote,
 } from "../operational/audit-log.js";
 
 /**
@@ -44,6 +46,8 @@ export const DENIAL_CAUSES = [
   // This cause must match argumentStageCause in tool-outcome.ts.
   "session_not_bound",
   "origin_unresolved",
+  // Must match the late-success refusal in runBoundedCall in router.ts.
+  "call_cancelled",
   "other",
 ] as const;
 
@@ -53,6 +57,17 @@ const DENIAL_CAUSE_SET: ReadonlySet<string> = new Set(DENIAL_CAUSES);
 
 export function closedDenialCause(cause: string): DenialCause {
   return DENIAL_CAUSE_SET.has(cause) ? (cause as DenialCause) : "other";
+}
+
+/**
+ * Note why the current call is refusing, for the router to record once at the
+ * end of the call; the first note wins. Must match noteCallScopeCause in
+ * operational/audit-log.ts (this is its one caller) and the note read in
+ * runBoundedCall in router.ts.
+ */
+export function noteRefusalCause(cause: DenialCause, linkedRef?: string): void {
+  const note: CallScopeNote<DenialCause> = { cause, ...(linkedRef !== undefined ? { linked_ref: linkedRef } : {}) };
+  noteCallScopeCause(note);
 }
 
 /** The same minute the baseline's rate windows use. */

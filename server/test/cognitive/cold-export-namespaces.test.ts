@@ -1,4 +1,4 @@
-// fail-before-exempt: passes the origin every state write now requires; asserts no new behaviour
+// fail-before-exempt: teardown waits for the audit log to drain before removing the temp fortress; no assertion changes, so it passes against the source before and after.
 /**
  * Full exports discover durable state and bind its scope before approval.
  * LEGACY-BUG-001
@@ -53,6 +53,8 @@ async function fixture(sessionScoped = false, ambiguousOwner = false, restart = 
   const reopened = new FilesystemStorage(path);
   const cold = new StateStore(reopened, masterKey);
   const audit = new AuditLog(reopened, masterKey);
+  // A successful call's last audit append can settle after its response, so the log drains before the directory goes.
+  cleanup.push(() => audit.flush());
   const baseline = new BaselineTracker(reopened, masterKey);
   await baseline.load();
   const { tools } = createCognitiveTools(cold, reopened, masterKey, "recovery-key", audit, {

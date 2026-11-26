@@ -197,7 +197,7 @@ import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js"
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
 // SEARCH in the cooperative surface. The OPERATOR audit path stays full-fidelity.
-import { redactAuditEntryForAgent } from "./operational/agent-audit-redaction.js";
+import { AGENT_AUDIT_READ_MAX_LIMIT, redactAuditEntryForAgent } from "./operational/agent-audit-redaction.js";
 
 import { ResponseScreen } from "./proxy/response-screen.js";
 
@@ -1036,7 +1036,7 @@ export async function createSanctuaryServer(options?: {
         if (!binding) {
           return toolResult({ entries: [], count: 0 });
         }
-        const limit = Math.max(1, (args.limit as number) ?? 50);
+        const limit = Math.min(AGENT_AUDIT_READ_MAX_LIMIT, Math.max(1, (args.limit as number) ?? 50));
         // Filter to the caller's identity BEFORE the limit (AuditLog.query
         // applies identity_id before its slice), so `limit` bounds the caller's
         // OWN entries — a caller with many other-identity entries ahead of theirs
@@ -1046,6 +1046,8 @@ export async function createSanctuaryServer(options?: {
           layer: args.layer as "l1" | "l2" | "l3" | "l4" | undefined,
           operation_type: args.operation_type as string | undefined,
           identity_id: binding.identity_id,
+          // Agent readers ask for agent-visible rows only.
+          agent_visible: true,
           limit,
         });
         const own = result.entries.map((entry) => redactAuditEntryForAgent(entry));

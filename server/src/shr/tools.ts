@@ -45,6 +45,8 @@ export async function gatherReputationEvidence(
   const published = await auditLog.query({
     layer: "l4",
     operation_type: "reputation_publish",
+    // Agent readers ask for agent-visible rows only: a publish row from a call that ended refused links nothing.
+    agent_visible: true,
     limit: 500,
   });
   const verascoreLinked = published.entries.some(

@@ -68,6 +68,8 @@ export interface AuditEntry {
   result: "success" | "failure";
   details?: Record<string, unknown>;
   contributors?: PluginContribution[];
+  /** The call this row was appended in (16 lowercase hex characters); set only by the call scope, never by a caller. */
+  call_ref?: string;
 }
 
 /** One chained, decrypted, verified entry handed to a streaming consumer. */
@@ -103,7 +105,7 @@ export interface VerifiedChainConsumer {
   reset?: () => void;
 }
 
-export type AuditEntryInput = Omit<AuditEntry, "timestamp"> & {
+export type AuditEntryInput = Omit<AuditEntry, "timestamp" | "call_ref"> & {
   timestamp?: string;
 };
 
@@ -1696,13 +1698,23 @@ export class AuditLockHoldDeadlineError extends Error {
   }
 }
 
+/** The largest success-marker failure count a drain reports: the largest count a number holds exactly; the count saturates here, so its state stays bounded. */
+const MARKER_FAILURE_COUNT_MAX = Number.MAX_SAFE_INTEGER;
+
 export class AuditLogPersistenceError extends AuditPersistenceError {
-  constructor(readonly failures: readonly unknown[]) {
+  /**
+   * `failures` holds each failed tracked write and, when markers failed, only the first marker error;
+   * `markerFailureCount` counts every success marker that failed since the last report, up to MARKER_FAILURE_COUNT_MAX.
+   */
+  constructor(readonly failures: readonly unknown[], readonly markerFailureCount = 0) {
+    // The first marker error is in `failures`; each later counted marker adds one more failed write.
+    const failedWrites = failures.length + Math.max(0, markerFailureCount - 1);
     const message =
-      failures.length === 1
+      failedWrites === 1
         ? failureMessage(failures[0])
-        : `${failures.length} audit persistence writes failed`;
-    super(message, failures.length === 1 ? classifyFailure(failures[0]) : "multiple");
+        : `${failedWrites} audit persistence writes failed` +
+          (markerFailureCount > 0 ? `, ${markerFailureCount} of them success markers` : "");
+    super(message, failedWrites === 1 ? classifyFailure(failures[0]) : "multiple");
     this.name = "AuditLogPersistenceError";
   }
 }
@@ -1771,6 +1783,176 @@ export async function withAuditWriteSettlement<T>(operation: () => Promise<T>): 
  * the strict-mode findings contract is unchanged.
  */
 const auditEagerReadContext = new AsyncLocalStorage<{ eager: boolean }>();
+
+// ── Call scope: one outcome per call, and the rows the call wrote ──────────
+//
+// Must match runBoundedCall in router.ts and the CallToolRequestSchema handler
+// in broker-mcp/broker-server.ts, the only callers of runInCallScope,
+// settleCallOutcome and writeCallOutcomeMarkers.
+
+/** Must match the default exclusion and the visible-call set in AuditLog.query. */
+export const CALL_OUTCOME_SUCCESS_OPERATION = "call_outcome_success";
+/** 8 random bytes = 16 hex characters, the router's tool-error reference width; must match TOOL_ERROR_REF_BYTES in router.ts. */
+export const CALL_REF_BYTES = 8;
+
+export type CallScopeState = "scope_OPEN" | "scope_SUCCEEDED" | "scope_REFUSED";
+export type CallScopeOutcome = "succeeded" | "refused";
+/** Must match noteRefusalCause in agent-native/denial-ledger.ts, which narrows `Cause` to DenialCause. */
+export interface CallScopeNote<Cause extends string = string> {
+  readonly cause: Cause;
+  readonly linked_ref?: string;
+}
+/** A retained row's identity that survives reload and trim: its chain sequence, or a legacy row's storage key. */
+export type CursorKey = { sequence: number } | { legacy_key: string };
+
+export interface CallScopeHandle {
+  readonly call_ref: string;
+  readonly state: CallScopeState;
+}
+
+interface CallScopeRecord {
+  readonly call_ref: string;
+  state: CallScopeState;
+  /** Rows each audit log stamped while the scope was open. */
+  readonly stamped: Map<AuditLog, number>;
+  /** Logs whose marker was already enqueued. */
+  readonly marked: Set<AuditLog>;
+  /** Logs that admitted a row of this call inside runAllowingIntegrityFindings (the router's read-tool bypass). */
+  readonly admittedOverFindings: Set<AuditLog>;
+  note?: CallScopeNote;
+}
+
+const callScopeContext = new AsyncLocalStorage<CallScopeRecord>();
+const callScopeRecords = new WeakMap<CallScopeHandle, CallScopeRecord>();
+/** Module-private: only writeCallOutcomeMarkers reaches the marker append. */
+const enqueueCallOutcomeMarker = Symbol("enqueueCallOutcomeMarker");
+
+/** Public append paths refuse the outcome-marker operation. */
+export class ReservedAuditOperationError extends Error {
+  constructor() {
+    super(`audit operation ${CALL_OUTCOME_SUCCESS_OPERATION} is reserved`);
+    this.name = "ReservedAuditOperationError";
+  }
+}
+
+/** Run `fn` as one call: every audit row appended inside it carries the call's reference. */
+export function runInCallScope<T>(fn: (scope: CallScopeHandle) => Promise<T>): Promise<T> {
+  const record: CallScopeRecord = {
+    call_ref: randomBytes(CALL_REF_BYTES).toString("hex"),
+    state: "scope_OPEN",
+    stamped: new Map(),
+    marked: new Set(),
+    admittedOverFindings: new Set(),
+  };
+  const handle: CallScopeHandle = Object.freeze({
+    call_ref: record.call_ref,
+    get state(): CallScopeState {
+      return record.state;
+    },
+  });
+  callScopeRecords.set(handle, record);
+  return callScopeContext.run(record, () => fn(handle));
+}
+
+function callScopeRecord(scope: CallScopeHandle): CallScopeRecord {
+  const record = callScopeRecords.get(scope);
+  if (!record) throw new Error("not a call scope handle");
+  return record;
+}
+
+/** Settle the call's outcome and return the terminal one. */
+export function settleCallOutcome(scope: CallScopeHandle, outcome: CallScopeOutcome): CallScopeOutcome {
+  const record = callScopeRecord(scope);
+  // A call's outcome is set once; a later settlement, including a handler success after cancellation, never changes it.
+  if (record.state === "scope_OPEN") {
+    switch (outcome) {
+      case "succeeded":
+        record.state = "scope_SUCCEEDED";
+        break;
+      case "refused":
+        record.state = "scope_REFUSED";
+        break;
+      default:
+        throw new Error(`unknown call outcome: ${String(outcome satisfies never)}`);
+    }
+  }
+  switch (record.state) {
+    case "scope_SUCCEEDED":
+      return "succeeded";
+    case "scope_REFUSED":
+      return "refused";
+    default:
+      throw new Error(`unknown call scope state: ${String(record.state satisfies never)}`);
+  }
+}
+
+/** Enqueue one success marker per audit log that stamped a row while the call was open; never awaited. */
+export function writeCallOutcomeMarkers(scope: CallScopeHandle): void {
+  const record = callScopeRecord(scope);
+  // A call's rows become agent-visible only through a success marker written after the outcome is success; a refused call never gets one.
+  if (record.state !== "scope_SUCCEEDED") return;
+  for (const [log, count] of record.stamped) {
+    if (count <= 0 || record.marked.has(log)) continue;
+    record.marked.add(log);
+    // A marker is admitted under the integrity context its call's rows were admitted under, so a read call on a chain
+    // with findings marks the rows it was allowed to write; a marker can only make already-written rows visible.
+    if (record.admittedOverFindings.has(log)) {
+      auditIntegrityContext.run({ allowIntegrityFindings: true }, () => log[enqueueCallOutcomeMarker](record.call_ref));
+    } else {
+      log[enqueueCallOutcomeMarker](record.call_ref);
+    }
+  }
+}
+
+/** Store the first cause noted inside an open call; returns whether this note was stored. */
+export function noteCallScopeCause(note: CallScopeNote): boolean {
+  const record = callScopeContext.getStore();
+  if (!record || record.state !== "scope_OPEN" || record.note !== undefined) return false;
+  record.note = Object.freeze({
+    cause: note.cause,
+    ...(note.linked_ref !== undefined ? { linked_ref: note.linked_ref } : {}),
+  });
+  return true;
+}
+
+export function readCallScopeNote(scope: CallScopeHandle): CallScopeNote | undefined {
+  return callScopeRecord(scope).note;
+}
+
+/**
+ * The calls whose success marker is in `window`. One pass; the set never holds
+ * more entries than the window has rows.
+ */
+export function visibleCallRefs(window: readonly AuditEntry[]): Set<string> {
+  const visible = new Set<string>();
+  // Only reserved-operation rows can make a call visible, and only the marker writer can append one.
+  for (let i = 0; i < window.length; i++) {
+    const entry = window[i]!;
+    if (entry.operation !== CALL_OUTCOME_SUCCESS_OPERATION || entry.identity_id !== "system") continue;
+    const callRef = entry.details?.call_ref;
+    if (entry.details?.outcome === "success" && typeof callRef === "string") visible.add(callRef);
+  }
+  return visible;
+}
+
+/** An in-call row is agent-visible only when its call's success marker is in the set. */
+export function isAgentVisibleEntry(entry: AuditEntry, visible: ReadonlySet<string>): boolean {
+  return entry.call_ref === undefined || visible.has(entry.call_ref);
+}
+
+/**
+ * The agent-visible rows of `window`: one pass to build the visible-call set
+ * and one to filter, so the work is bounded by the window's length.
+ */
+export function agentVisibleEntries(window: readonly AuditEntry[]): AuditEntry[] {
+  const visible = visibleCallRefs(window);
+  const kept: AuditEntry[] = [];
+  for (let i = 0; i < window.length; i++) {
+    const entry = window[i]!;
+    if (isAgentVisibleEntry(entry, visible)) kept.push(entry);
+  }
+  return kept;
+}
 
 // ── F2 Option A: split-boundary record (shared read/write logic) ───────────
 //
@@ -2445,6 +2627,8 @@ export class AuditLog {
   private verifiedUncachedLastPass = 0;
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
+  /** Storage keys of the unchained legacy prefix of `entries`, aligned 1:1 with it. */
+  private legacyEntryKeys: string[] = [];
   private counter = 0;
   /**
    * Per-instance random suffix mixed into every persisted entry key. Two
@@ -2525,6 +2709,11 @@ export class AuditLog {
   // A load may publish its sized observation only while this mutation generation matches.
   private retentionGeneration = 0;
   private readonly pendingWrites = new Set<Promise<void>>();
+  /**
+   * The success-marker failures no drain has reported yet: the first error and a count, never a list. A marker has
+   * no awaiting caller, so flush() is its only observer; the count saturates at MARKER_FAILURE_COUNT_MAX (bounded state).
+   */
+  private unreportedMarkerFailures: { readonly first: unknown; count: number } | undefined;
   private pendingVisibleEntries = 0;
   private appendQueue: Promise<void> = Promise.resolve();
   private loaded = false;
@@ -2885,6 +3074,8 @@ export class AuditLog {
     details?: Record<string, unknown>,
     result: "success" | "failure" = "success"
   ): Promise<void> {
+    // Only the marker writer may append the outcome-marker operation, so no other path can make a call's rows visible.
+    if (operation === CALL_OUTCOME_SUCCESS_OPERATION) throw new ReservedAuditOperationError();
     this.pendingVisibleEntries++;
     const writePromise = this.enqueueAppend({
       layer,
@@ -2912,6 +3103,8 @@ export class AuditLog {
    * failure is rethrown by `flush()`.
    */
   appendCritical(entry: AuditEntryInput): Promise<void> {
+    // Only the marker writer may append the outcome-marker operation, so no other path can make a call's rows visible.
+    if (entry.operation === CALL_OUTCOME_SUCCESS_OPERATION) throw new ReservedAuditOperationError();
     const writePromise = this.enqueueAppend(entry, {
       verifyDurability: true,
       critical: true,
@@ -3062,8 +3255,10 @@ export class AuditLog {
   /**
    * Wait for every in-flight `append()` persist (and its rotation pass) to
    * settle. Rejects with `AuditLogPersistenceError` if any tracked persist
-   * failed. Safe to call multiple times — newly-appended entries during a
-   * flush are also awaited. Re-entrant only at the granularity of "drain
+   * failed, or if any call's success marker failed since the last drain that
+   * reported one (the request boundary never awaits a marker); the error's
+   * `markerFailureCount` counts those markers. Safe to call
+   * multiple times — newly-appended entries during a flush are also awaited. Re-entrant only at the granularity of "drain
    * everything queued so far". Short-lived CLIs MUST call this before
    * `process.exit()` to keep audit writes durable.
    */
@@ -3101,21 +3296,63 @@ export class AuditLog {
         if (result.status === "rejected") failures.push(result.reason);
       }
     }
+    // Every failed success marker is reported like a failed append, even when it settled before this drain began.
+    const markers = this.unreportedMarkerFailures;
+    this.unreportedMarkerFailures = undefined;
+    if (markers !== undefined) failures.push(markers.first);
     if (failures.length > 0) {
-      throw new AuditLogPersistenceError(failures);
+      throw new AuditLogPersistenceError(failures, markers?.count ?? 0);
     }
     await this.appendQueue;
   }
 
+  /**
+   * Append one success marker for `callRef`, as an ordinary append on this
+   * log's queue, so it lands after every row of its call already enqueued.
+   * Must match writeCallOutcomeMarkers, its only caller.
+   */
+  [enqueueCallOutcomeMarker](callRef: string): void {
+    this.pendingVisibleEntries++;
+    const writePromise = this.enqueueAppend({
+      layer: "l2",
+      operation: CALL_OUTCOME_SUCCESS_OPERATION,
+      identity_id: "system",
+      result: "success",
+      details: { call_ref: callRef, outcome: "success" },
+    }, { verifyDurability: false, critical: false, outcomeMarker: true });
+    // A marker that never lands leaves its call's rows hidden from agent readers; the operator view is unaffected,
+    // and the next flush() rejects, so a failed marker is never a silent success.
+    this.trackPendingWrite(writePromise.catch((error: unknown) => {
+      // A failure held unreported must not hide a later one, so each failure counts, saturating at the named maximum.
+      if (this.unreportedMarkerFailures === undefined) this.unreportedMarkerFailures = { first: error, count: 1 };
+      else this.unreportedMarkerFailures.count = Math.min(this.unreportedMarkerFailures.count + 1, MARKER_FAILURE_COUNT_MAX);
+      // SAFETY: stderr names only the failed marker operation, without entry content or audit-backed logging.
+      console.error(`[audit-log] ${CALL_OUTCOME_SUCCESS_OPERATION} append failed`);
+    }));
+  }
+
   private enqueueAppend(
     entry: AuditEntryInput,
-    options: { verifyDurability: boolean; critical: boolean }
+    options: { verifyDurability: boolean; critical: boolean; outcomeMarker?: true }
   ): Promise<void> {
+    // The call reference is taken when the caller appends, never when the queue drains, so a row belongs to the call
+    // that wrote it, including a row that settles after the call returned.
+    let callRef: string | undefined;
+    if (options.outcomeMarker !== true) {
+      const scope = callScopeContext.getStore();
+      if (scope) {
+        callRef = scope.call_ref;
+        if (scope.state === "scope_OPEN") {
+          scope.stamped.set(this, (scope.stamped.get(this) ?? 0) + 1);
+          if (auditIntegrityContext.getStore()?.allowIntegrityFindings === true) scope.admittedOverFindings.add(this);
+        }
+      }
+    }
     const task = this.appendQueue
       .catch(() => {
         // Keep later appends from inheriting a prior append failure.
       })
-      .then(() => this.persistChainedEntry(entry, options));
+      .then(() => this.persistChainedEntry(entry, options, callRef));
     this.appendQueue = task.then(
       () => undefined,
       () => undefined
@@ -3125,10 +3362,11 @@ export class AuditLog {
 
   private async persistChainedEntry(
     entry: AuditEntryInput,
-    options: { verifyDurability: boolean; critical: boolean }
+    options: { verifyDurability: boolean; critical: boolean },
+    callRef: string | undefined
   ): Promise<void> {
     try {
-      const normalized = this.normalizeEntry(entry);
+      const normalized = this.normalizeEntry(entry, callRef);
       await this.reverifyCachedIntegrityFindingsBeforeAppend();
       // C9 (availability, register): resolve the mandatory first-load
       // read-consistency pass BEFORE requesting the cross-process write lock,
@@ -3354,6 +3592,7 @@ export class AuditLog {
       // that, dropped entries are legacy-only and `chainEntries` is left intact.
       const legacyCount = this.entries.length - this.chainEntries.length;
       this.entries.splice(0, overflow);
+      this.legacyEntryKeys.splice(0, Math.min(overflow, legacyCount));
       const chainedDropped = Math.max(0, overflow - legacyCount);
       if (chainedDropped > 0) {
         this.chainEntries.splice(0, chainedDropped);
@@ -3367,7 +3606,7 @@ export class AuditLog {
     }
   }
 
-  private normalizeEntry(entry: AuditEntryInput): AuditEntry {
+  private normalizeEntry(entry: AuditEntryInput, callRef: string | undefined): AuditEntry {
     return {
       timestamp: entry.timestamp ?? new Date().toISOString(),
       layer: entry.layer,
@@ -3376,6 +3615,8 @@ export class AuditLog {
       result: entry.result,
       details: entry.details,
       ...(entry.contributors !== undefined ? { contributors: entry.contributors } : {}),
+      // The call reference comes only from the call scope; a caller-supplied value is never kept.
+      ...(callRef !== undefined ? { call_ref: callRef } : {}),
     };
   }
 
@@ -3403,6 +3644,7 @@ export class AuditLog {
 
   /** Number of oldest entries to prune to bring `metas` (key-sorted ascending)
    * back under the count and size limits. 0 when within budget. */
+  // DEBT(AGENT-SEAT-RETENTION-PRESSURE): retention counts every stored row alike, including rows agent readers do not return.
   private rotationDeleteCount(metas: readonly { size_bytes: number }[]): number {
     const totalSize = metas.reduce((sum, m) => sum + m.size_bytes, 0);
     if (metas.length <= this.maxEntries && totalSize <= this.maxTotalSizeBytes) return 0;
@@ -4550,11 +4792,21 @@ export class AuditLog {
     identity_id?: string;
     /** Operator Evidence display filter; independent of the own-signed identity authorization filter. */
     evidence_agent?: string;
+    /** Return call outcome markers too; integrity, export, verify and completeness paths that count stored rows set it. */
+    include_outcome_markers?: boolean;
+    /**
+     * Return only rows an agent reader may see: a row written in a call only once its success marker is retained.
+     * Must match agent_visible in FeatureHealthAuditReader (principal-policy/feature-health.ts).
+     */
+    agent_visible?: boolean;
+    /** Return `sequences`, each returned row's key, parallel to `entries`. */
+    with_sequences?: boolean;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
     total: number;
     integrity_findings: AuditIntegrityFinding[];
+    sequences?: CursorKey[];
   }> {
     // EAGER SCOPE (posture surface): serve from the eagerly-maintained verified
     // view with the throttled on-disk re-verify, so the high-frequency board
@@ -4572,7 +4824,12 @@ export class AuditLog {
       await this.reloadPersistedEntries();
     }
 
-    let filtered = this.entries;
+    // Order: field filters, marker exclusion, identity, evidence_agent, then agent visibility; `total` and the slice
+    // come last, so callers' text search, offsets and counts all run on the visible rows. The visible-call set is
+    // built from the whole retained window before any filter; with the filter that is two passes over at most
+    // maxInMemoryEntries rows.
+    const retained = this.entries;
+    let filtered = retained;
 
     if (options.since) {
       const sinceDate = new Date(options.since);
@@ -4588,6 +4845,10 @@ export class AuditLog {
         (e) => e.operation === options.operation_type
       );
     }
+    // Outcome markers are bookkeeping, not activity; a reader sees them only by asking.
+    if (options.include_outcome_markers !== true) {
+      filtered = filtered.filter((e) => e.operation !== CALL_OUTCOME_SUCCESS_OPERATION);
+    }
     // Identity filter BEFORE the limit slice (own-identity-read paging fix): the
     // limit must bound the caller's OWN entries, not a global page.
     if (options.identity_id !== undefined) {
@@ -4601,10 +4862,38 @@ export class AuditLog {
         (MEMORY_SAVE_AUDIT_OPERATIONS.includes(e.operation) && e.details?.agent_id === options.evidence_agent));
     }
 
+    if (options.agent_visible === true) {
+      // An in-call row is agent-visible only when its call's marker is in the same retained window, so a lost marker
+      // hides rows and never exposes them.
+      const visible = visibleCallRefs(retained);
+      filtered = filtered.filter((e) => isAgentVisibleEntry(e, visible));
+    }
+
+    // Every number this query returns is taken after the visibility rule, so a hidden row moves no count.
     const total = filtered.length;
     const limit = options.limit ?? 50;
     // Must match renderActivityScreen in server/src/dashboard/v1_1/client.ts, which lists this oldest-first page newest first.
     const entries = filtered.slice(-limit); // Most recent entries
+
+    if (options.with_sequences === true) {
+      // `entries` is [legacy..., chained...]: the legacy prefix aligns with legacyEntryKeys, the chained suffix with chainEntries.
+      const legacyCount = retained.length - this.chainEntries.length;
+      const keys = new Map<AuditEntry, CursorKey>();
+      for (let i = 0; i < retained.length; i++) {
+        const legacyKey = i < legacyCount ? this.legacyEntryKeys[i] : undefined;
+        const chained = i >= legacyCount ? this.chainEntries[i - legacyCount] : undefined;
+        if (chained) keys.set(retained[i]!, { sequence: chained.sequence });
+        else if (legacyKey !== undefined) keys.set(retained[i]!, { legacy_key: legacyKey });
+      }
+      // A row with no key cannot be named again after a reload, so it is left out of a keyed read.
+      const keyed = entries.filter((entry) => keys.has(entry));
+      return {
+        entries: keyed,
+        total,
+        integrity_findings: [...this.integrityFindings],
+        sequences: keyed.map((entry) => keys.get(entry)!),
+      };
+    }
 
     return { entries, total, integrity_findings: [...this.integrityFindings] };
   }
@@ -4721,6 +5010,7 @@ export class AuditLog {
     layer?: AuditEntry["layer"];
     operation_type?: string;
     identity_id?: string;
+    include_outcome_markers?: boolean;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
@@ -6200,13 +6490,16 @@ export class AuditLog {
     const windowCap = this.maxInMemoryEntries;
     const recentEntries: AuditEntry[] = [];
     const recentChained: Array<{ sequence: number; entry_hash: string }> = [];
+    const recentLegacyKeys: string[] = [];
     const pushWindow = (
       entry: AuditEntry,
-      chained: { sequence: number; entry_hash: string } | null
+      chained: { sequence: number; entry_hash: string } | null,
+      legacyKey?: string
     ): void => {
       if (consumer) return; // streaming consumer keeps no window
       recentEntries.push(entry);
       if (chained) recentChained.push(chained);
+      else if (legacyKey !== undefined) recentLegacyKeys.push(legacyKey);
       // Trim the OLDEST entries from the front in lockstep with their aligned
       // chained twins (legacy entries, which have no chained twin, are dropped
       // first) so `recentEntries.length - recentChained.length` stays equal to
@@ -6216,6 +6509,7 @@ export class AuditLog {
       if (overflow > 0) {
         const legacyResident = recentEntries.length - recentChained.length;
         recentEntries.splice(0, overflow);
+        recentLegacyKeys.splice(0, Math.min(overflow, legacyResident));
         const chainedDropped = Math.max(0, overflow - legacyResident);
         if (chainedDropped > 0) recentChained.splice(0, chainedDropped);
       }
@@ -6432,7 +6726,7 @@ export class AuditLog {
         // decrypt try/catch above for the same reason as the chained path: a
         // post-decrypt throw must not be miscategorized as a decrypt failure.
         legacyRawEntries.push({ key: meta.key, raw });
-        pushWindow(legacyEntry, null);
+        pushWindow(legacyEntry, null, meta.key);
       }
 
       const legacyHashes = legacyRawEntries.map((legacy, index) =>
@@ -6494,6 +6788,7 @@ export class AuditLog {
       if (!consumer) {
         this.entries = recentEntries;
         this.chainEntries = recentChained;
+        this.legacyEntryKeys = recentLegacyKeys;
       }
       // F3: continue from the HIGHEST surviving sequence, not the entry count.
       // After rotation prunes a contiguous prefix, count != highest sequence, and

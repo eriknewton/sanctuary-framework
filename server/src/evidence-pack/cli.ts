@@ -21,7 +21,7 @@ import { gatherAuditExport, gatherTransparencyExport } from "./snapshot-gather.j
 import { createSanctuaryServer } from "../index.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { StoredIdentity } from "../core/identity.js";
-import { AuditIntegrityError, type AuditEntry } from "../operational/audit-log.js";
+import { AuditIntegrityError, CALL_OUTCOME_SUCCESS_OPERATION, type AuditEntry } from "../operational/audit-log.js";
 import {
   createDaemonAuditLog,
   errnoAccessReason,
@@ -840,10 +840,13 @@ export function deriveAuditReadOutcome(params: {
     params.censusTakenAt !== undefined
       ? { census_taken_at: params.censusTakenAt }
       : {};
+  // Outcome markers are bookkeeping, not activity: the completeness check above counts them, the activity folds do not.
+  const isActivity = (entry: AuditEntry): boolean => entry.operation !== CALL_OUTCOME_SUCCESS_OPERATION;
+  const activityEntries = mergedEntries.filter(isActivity);
   return populated(
     daemon.status === "included"
-      ? { entries: mergedEntries, retention, daemon_entries: daemon.entries, ...censusFields }
-      : { entries: mergedEntries, retention, ...censusFields }
+      ? { entries: activityEntries, retention, daemon_entries: daemon.entries.filter(isActivity), ...censusFields }
+      : { entries: activityEntries, retention, ...censusFields }
   );
 }
 
@@ -907,7 +910,8 @@ export async function readDaemonStore(
     const daemonLog = createDaemonAuditLog(storage, masterKey, { readOnly: true });
     // Default strict integrity mode: a daemon-store tamper makes query() throw
     // AuditIntegrityError, distinguished below from an access failure.
-    const { entries, total } = await daemonLog.query({ limit: 1_000_000 });
+    // This path counts stored rows, so it reads outcome markers too.
+    const { entries, total } = await daemonLog.query({ limit: 1_000_000, include_outcome_markers: true });
     // D8-1 Leg A: a usage-read throw yields the all-null "usage unavailable"
     // signal (never placeholder figures), so the daemon store's retention
     // position renders not-determinable instead of a signed below-cap claim.
@@ -1239,7 +1243,8 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       // The generation time is stamped LATER (after inventory + discrete-export
       // gathering), so attesting through it would over-claim the intervening gap.
       const censusTakenAt = new Date().toISOString();
-      const { entries, total } = await auditLog.query({ limit: 1_000_000 });
+      // This path counts stored rows, so it reads outcome markers too.
+      const { entries, total } = await auditLog.query({ limit: 1_000_000, include_outcome_markers: true });
       const retentionConfig = auditLog.getRetentionConfig();
       // Read the on-disk usage + ever-pruned so the shortfall detector can tell
       // size-cap pruning from genuine inactivity (sweep HIGH-5). Best-effort:

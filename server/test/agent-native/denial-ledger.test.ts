@@ -420,11 +420,29 @@ describe("denial ledger call sites", () => {
     // through one guarded wrapper whose parameter is typed DenialCause.
     expect(ledgerCalls).toEqual([expect.stringMatching(/router\.ts: cause$/)]);
     expect(sites.length).toBeGreaterThan(0);
+    // The router forwards a noted cause at exactly one site, through the closed-list filter.
+    const noteSites = sites.filter((site) => !site.first.startsWith('"') &&
+      !site.first.startsWith("argumentStageCause(") && !site.first.startsWith("handlerStageCause("));
+    expect(noteSites.map((site) => `${site.file.endsWith("/router.ts") ? "router.ts" : site.file}: ${site.first}`))
+      .toEqual(["router.ts: closedDenialCause(note.cause)"]);
     for (const site of sites) {
       if (site.first.startsWith("argumentStageCause(") || site.first.startsWith("handlerStageCause(")) continue;
+      if (noteSites.includes(site)) continue;
       expect(site.first, site.file).toMatch(/^"[a-z_]+"$/);
       expect(causes.has(site.first.slice(1, -1)), `${site.file}: ${site.first}`).toBe(true);
     }
+    // A cause reaches the note slot only through the one typed helper.
+    const noteSlotCalls: string[] = [];
+    for (const file of sourceFiles(SRC_DIR)) {
+      const text = readFileSync(file, "utf8");
+      for (const match of text.matchAll(/\bnoteCallScopeCause\(/g)) {
+        const before = text.slice(0, match.index);
+        const enclosing = [...before.matchAll(/export function (\w+)/g)].at(-1)?.[1] ?? "";
+        noteSlotCalls.push(`${file.slice(SRC_DIR.length)}: ${enclosing}`);
+      }
+    }
+    expect(noteSlotCalls.filter((call) => !call.startsWith("operational/audit-log.ts:")))
+      .toEqual(["agent-native/denial-ledger.ts: noteRefusalCause"]);
     // The argument-stage and handler-stage helpers return only list literals.
     for (const name of ["argumentStageCause", "handlerStageCause"]) {
       const helper = readFileSync(join(SRC_DIR, "tool-outcome.ts"), "utf8").match(new RegExp(`export function ${name}[\\s\\S]*?\\n}\\n`))![0];

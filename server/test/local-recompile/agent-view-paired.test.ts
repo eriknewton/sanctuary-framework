@@ -4,8 +4,9 @@
  * same way, with the same id source, clock and seat, differ in one hidden
  * fact. The same calls in both must leave identical responses and identical
  * shared-log rows (count, operations, stored sizes, decrypted rows with the
- * timestamp masked, and the rows retention keeps), while each world's
- * operator log does differ, which shows the hidden fact reached the operator.
+ * timestamp and the random call reference masked, and the rows retention
+ * keeps), while each world's operator log does differ, which shows the
+ * hidden fact reached the operator.
  */
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -91,17 +92,25 @@ interface Measure {
   operations: string[];
   sizes: number[];
   rows: unknown[];
+  callRefs: Array<string | undefined>;
   retained: number[];
+}
+
+function entryKey(entry: { timestamp: string; operation: string; details?: unknown; call_ref?: string }): string {
+  return `${entry.timestamp}|${entry.operation}|${JSON.stringify(entry.details)}|${entry.call_ref ?? ""}`;
 }
 
 /** One call and everything it left in the shared log, read with the server's own AuditLog after flush. */
 async function measure(world: World, args: Record<string, unknown>): Promise<Measure> {
   const before = new Set((await auditRows(world)).map((row) => row.seq));
+  const beforeEntries = new Set((await world.server.runtime.auditLog.query({ limit: 1_000 })).entries.map(entryKey));
   const response = await world.server.call(args);
   const after = await auditRows(world);
   const added = after.filter((row) => !before.has(row.seq));
   const { entries } = await world.server.runtime.auditLog.query({ limit: 1_000 });
-  const fresh = added.length === 0 ? [] : entries.slice(-added.length);
+  // The stored rows include the call's success marker, which the query does not return, so the call's rows are the
+  // queried entries that were not there before, not the last `added.length` of them.
+  const fresh = entries.filter((entry) => !beforeEntries.has(entryKey(entry)));
   return {
     text: response.text,
     isError: response.isError,
@@ -109,8 +118,10 @@ async function measure(world: World, args: Record<string, unknown>): Promise<Mea
     added: added.length,
     operations: fresh.map((entry) => entry.operation),
     sizes: added.map((row) => row.size),
-    // The timestamp is the one masked field: a persisted clock reading, not world state.
-    rows: fresh.map((entry) => ({ ...entry, timestamp: "<masked>" })),
+    // Two fields are masked: the timestamp, a persisted clock reading, and the call reference, a random per-call
+    // nonce; neither is world state. expectSameSharedView checks the call reference's shape before it is masked.
+    rows: fresh.map((entry) => ({ ...entry, timestamp: "<masked>", ...(entry.call_ref === undefined ? {} : { call_ref: "<masked>" }) })),
+    callRefs: fresh.map((entry) => entry.call_ref),
     retained: after.map((row) => row.seq),
   };
 }
@@ -126,7 +137,14 @@ const SUBMITTED_OPERATION = "local_request_submitted";
 
 function expectSameSharedView(pairs: Array<[Measure, Measure]>): void {
   pairs.forEach(([a, b], index) => {
-    expect(b, `call ${index + 1}`).toEqual(a);
+    // Each world's rows of one call carry one call reference of the same shape; the two worlds' nonces differ.
+    for (const m of [a, b]) {
+      expect(new Set(m.callRefs).size, `call ${index + 1}`).toBe(1);
+      expect(m.callRefs[0], `call ${index + 1}`).toMatch(/^[0-9a-f]{16}$/);
+    }
+    expect({ ...b, callRefs: [] }, `call ${index + 1}`).toEqual({ ...a, callRefs: [] });
+    // The stored rows are the call's queried rows and its one success marker.
+    expect(a.added, `call ${index + 1}`).toBe(a.operations.length + 1);
     expect(a.items, `call ${index + 1}`).toBe(1);
     expect(a.isError, `call ${index + 1}`).toBe(false);
     // Every added row is the gate's row for this tool, then the submission row on an acknowledgement;

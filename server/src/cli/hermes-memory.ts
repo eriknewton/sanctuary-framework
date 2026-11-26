@@ -635,7 +635,8 @@ interface AuditView {
 async function readAuditView(context: OwnerContext): Promise<AuditView> {
   const reader = createOwnerAuditReader(context.readonlyStorage, context.masterKey);
   // The whole surviving chain is reloaded: the same work class as `sanctuary audit search`; output is capped later.
-  const { entries } = await reader.runAllowingIntegrityFindings(() => reader.query({ limit: Number.MAX_SAFE_INTEGER }));
+  // This path counts stored rows, so it reads outcome markers too.
+  const { entries } = await reader.runAllowingIntegrityFindings(() => reader.query({ limit: Number.MAX_SAFE_INTEGER, include_outcome_markers: true }));
   const verdict = await reader.runAllowingIntegrityFindings(() => reader.getAuditChainVerdict());
   const head = await reader.runAllowingIntegrityFindings(() => reader.getChainHead());
   const usage = await reader.getRetentionUsage();

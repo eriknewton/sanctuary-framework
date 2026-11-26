@@ -334,7 +334,8 @@ export class Broker {
     limit?: number;
     identity_id?: string;
   }): Promise<AuditSummary> {
-    const { entries, total } = await this.mergeBrokerAuditEntries(opts);
+    // Agent readers ask for agent-visible rows only.
+    const { entries, total } = await this.mergeBrokerAuditEntries({ ...opts, agent_visible: true });
     const limit = opts?.limit ?? 1000;
     // Allowlist redaction at the boundary means token scopes, secret names, and denial reasons never reach agent audit reads.
     const redacted = entries.map((e) => redactAuditEntryForAgent(e));
@@ -372,6 +373,8 @@ export class Broker {
     since?: string;
     limit?: number;
     identity_id?: string;
+    /** Set only by the agent-facing queryAudit; the operator view keeps every row. */
+    agent_visible?: boolean;
   }): Promise<{ entries: AuditEntry[]; total: number }> {
     const allOps = Object.values(BROKER_OPS);
     const merged: AuditEntry[] = [];
@@ -382,6 +385,7 @@ export class Broker {
         layer: "l3",
         operation_type: op,
         identity_id: opts?.identity_id,
+        ...(opts?.agent_visible === true ? { agent_visible: true } : {}),
         limit: opts?.limit ?? 1000,
       });
       total += r.total;
