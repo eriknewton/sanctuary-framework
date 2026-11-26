@@ -571,10 +571,14 @@ describe("agent readers at the retention limit", () => {
       const retained = await operatorRows(world);
       const refusedRows = retained.filter((r) => r.call_ref !== undefined && refusedRefs.has(r.call_ref));
       const otherOps = new Set(retained.filter((r) => !refusedRows.includes(r)).map((r) => r.operation));
-      // Operations only the refused calls wrote, so their presence in any reader is a refused row.
-      const refusedOps = new Set(refusedRows.filter((r) => r.identity_id === world.identityId).map((r) => r.operation).filter((op) => !otherOps.has(op)));
-      expect(refusedOps.has(BROKER_OPS.TOKEN_DENIED)).toBe(true);
-      expect(refusedOps.size).toBeGreaterThan(1);
+      // Operations only the refused calls wrote, so their presence in any reader is a refused row. Only the refused
+      // broker request writes a token denial in this world, so that operation is named without a call reference.
+      const refusedOps = new Set([
+        BROKER_OPS.TOKEN_DENIED,
+        ...refusedRows.filter((r) => r.identity_id === world.identityId).map((r) => r.operation).filter((op) => !otherOps.has(op)),
+      ]);
+      // The operator view still holds the refused broker row at the cap, under the agent's identity.
+      expect(retained.some((r) => r.operation === BROKER_OPS.TOKEN_DENIED && r.identity_id === world.identityId)).toBe(true);
 
       const observed = await observe(world) as { pages: Array<Array<[unknown, unknown, unknown, unknown]>>; search: Array<[unknown, unknown, unknown, unknown]>; monitor: { count: number; rows: Array<[unknown, unknown, unknown]> }; siem: Record<string, { count: number; total_available: number; events: number; contents: string }> };
       for (const page of observed.pages) for (const [, operation] of page) expect(refusedOps.has(operation as string), `events ${String(operation)}`).toBe(false);
@@ -590,8 +594,9 @@ describe("agent readers at the retention limit", () => {
       const brokerRead = await broker.queryAudit({ limit: 1_000 });
       expect(brokerRead.total).toBe(brokerRead.entries.length);
       expect(brokerRead.entries.map((e) => e.operation)).not.toContain(BROKER_OPS.TOKEN_DENIED);
-      // The operator view still holds the refused rows at the cap.
-      expect(refusedRows.length).toBeGreaterThan(0);
+      // Both refused calls' rows, the recall's included, are still retained at the cap.
+      expect(refusedRows.filter((r) => r.identity_id === world.identityId).map((r) => r.operation)).toEqual(expect.arrayContaining([BROKER_OPS.TOKEN_DENIED]));
+      expect(refusedOps.size).toBeGreaterThan(1);
     }, 240_000);
   }
 });
