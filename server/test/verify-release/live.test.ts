@@ -1,7 +1,7 @@
-// fail-before-exempt: this test is skipped unless SANCTUARY_VERIFY_RELEASE_LIVE=1, so on any tree without that variable, the base included, it reports skipped rather than failing; its fail-before evidence is the recorded live run.
+// fail-before-exempt: this test is skipped unless SANCTUARY_VERIFY_RELEASE_LIVE=1 and CI is unset, so on any tree without that variable, the base included, it reports skipped rather than failing; its fail-before evidence is the recorded live run.
 /**
  * Live integration, gated: skipped unless SANCTUARY_VERIFY_RELEASE_LIVE=1, and
- * never run in CI. It installs 1.8.4 from npm into a temporary prefix and runs
+ * always skipped when CI is set, whatever that variable says (live-gate.ts). It installs 1.8.4 from npm into a temporary prefix and runs
  * the BUILT verifier from this tree, by absolute path, with `--target` against
  * it: the only complete production-trust success witness. Then it changes one
  * installed file, and points `--target` at a foreign package.
@@ -17,13 +17,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { denyAllNetwork } from "./helpers.js";
+import { liveTestEnabled } from "./live-gate.js";
 
 denyAllNetwork();
 
-const LIVE = process.env.SANCTUARY_VERIFY_RELEASE_LIVE === "1";
 const CLI = join(__dirname, "..", "..", "dist", "cli.js");
 
-describe.skipIf(!LIVE)("live: an npm install of 1.8.4 checked against its signed release record", () => {
+describe.skipIf(!liveTestEnabled(process.env))("live: an npm install of 1.8.4 checked against its signed release record", () => {
   it("verifies the fresh install, refuses a changed file, and refuses a foreign package", () => {
     const work = mkdtempSync(join(tmpdir(), "vr-live-"));
     try {

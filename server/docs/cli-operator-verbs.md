@@ -117,8 +117,11 @@ What it detects:
 - provenance from another repository, another workflow, or a self-hosted runner;
 - a release manifest that is not signed by Sanctuary's pinned release key;
 - any added, removed or changed file in the checked install. It compares the
-  contents and normalized names of regular files and directories, excluding a
-  top-level `node_modules` folder and `.DS_Store` files.
+  contents and normalized names of regular files and directories, excluding
+  exactly a top-level folder named `node_modules` and files named `.DS_Store`.
+  The names must match byte for byte: any other spelling, such as `Node_Modules`
+  or `.ds_store`, is an extra entry and refuses. An excluded name must still be
+  a real folder or a plain file, never a link.
 
 What it does not detect:
 
@@ -134,6 +137,29 @@ the version, one line per step and a verdict line. `--json` prints one object wi
 `verdict`, `version`, `target`, `steps` and, on refusal, `reason`; `version` and
 `target` are `null` when the run stopped before they were known. Paths are printed
 with control and non-ASCII bytes escaped.
+
+<!-- The installed-tree-oversize cap below must match MAX_INSTALLED_ENTRIES in server/src/verify-release/constants.ts. -->
+Refusal reasons for the installed tree that are easy to misread:
+
+- `installed-file-unreadable:<path>`: the file opened and passed its type checks,
+  then a read failed. This is a storage or filesystem error, not evidence that the
+  bytes differ. Failure mode: on a failing disk or a flaky network filesystem it
+  can name a different file on each run.
+- `installed-name-invalid:<path>`: a file or folder name that is not valid UTF-8.
+  The path shows the name's raw bytes, escaped. Failure mode: a tree copied
+  through a tool that rewrote names into a legacy encoding refuses this way on
+  every non-ASCII name, even though the file contents are intact.
+- `installed-tree-oversize`: the install holds more entries than the check reads
+  (2,593: twice the archive's 1,296-entry cap, plus one). The check stops reading
+  rather than listing the rest. Failure mode: it looks like a size limit on the
+  package, but the published package is far smaller; something large was added
+  inside the install.
+
+A release signed outside the windows of the committed Sigstore trusted root, for
+example after a Sigstore key rotation that Sanctuary has not yet shipped, refuses
+as `sigstore-invalid:<code>` like any failed signature check. Failure mode: the
+reason does not say that the root is out of date; look for a newer Sanctuary
+release before treating such a refusal as a substituted package.
 
 Failure mode: a symlink, a hardlinked file or any special file inside the install
 refuses, even when its bytes would match, and so does any network failure. A refusal

@@ -100,7 +100,8 @@ describe("trust material construction", () => {
   });
 
   it("imports no Sigstore client (no TUF, signing, Rekor, Fulcio or CT client package); tar is the only other package", () => {
-    const specifiers = [...all.matchAll(/(?:from|import)\s*\(?\s*"([^"]+)"/g)].map(match => match[1]!);
+    // `from` needs whitespace before the quote, so a call such as Buffer.from("...") is not read as an import.
+    const specifiers = [...all.matchAll(/(?:\bfrom\s+|\bimport\s*\(?\s*)"([^"]+)"/g)].map(match => match[1]!);
     const external = [...new Set(specifiers.filter(s => !s.startsWith(".") && !s.startsWith("node:")))].sort();
     expect(external).toEqual(["@sigstore/bundle", "@sigstore/protobuf-specs", "@sigstore/verify", "tar"]);
   });

@@ -4,7 +4,7 @@
  * foreign-package refusal, and every tampering and proof-shape refusal.
  */
 import { describe, expect, it } from "vitest";
-import { state_BUNDLE_SELECT, state_SIGSTORE, rootIsStaleAt, VERIFIER_THRESHOLDS } from "../../src/verify-release/sigstore.js";
+import { state_BUNDLE_SELECT, state_SIGSTORE, VERIFIER_THRESHOLDS } from "../../src/verify-release/sigstore.js";
 import { state_IDENTITY } from "../../src/verify-release/identity.js";
 import { state_STATEMENT } from "../../src/verify-release/statement.js";
 import type { BundleSelectEvidence, SigstoreEvidence } from "../../src/verify-release/evidence.js";
@@ -187,6 +187,12 @@ describe("trust material", () => {
     expect(await state_SIGSTORE({ state: "state_BUNDLE_SELECT", bundle: publish } as BundleSelectEvidence, trustedRootBytes())).toEqual({ ok: false, reason: "sigstore-invalid:CERTIFICATE_REQUIRED" });
   });
 
+  it("a leaf certificate whose DER is one byte (rawBytes AQ==) refuses sigstore-invalid, not an internal error", async () => {
+    const bundle = slsaBundle184();
+    bundle.verificationMaterial.certificate.rawBytes = "AQ==";
+    expect(await verify(bundle)).toEqual({ ok: false, reason: "sigstore-invalid:BUNDLE_INVALID" });
+  });
+
   it("a bundle the library cannot parse refuses", async () => {
     const bundle = slsaBundle184();
     bundle.mediaType = "application/vnd.dev.sigstore.bundle.v9+json";
@@ -203,27 +209,33 @@ describe("validity windows over the real bundle", () => {
     for (const ca of r.certificateAuthorities) ca.validFor = window;
     for (const log of r.tlogs) log.publicKey.validFor = window;
   });
+  const LIBRARY_REFUSAL = /^sigstore-invalid:[A-Z0-9_]+$/;
 
-  it("a window ending one second before the log time refuses trusted-root-stale", async () => {
-    expect(await verify(slsaBundle184(), windowed(undefined, T - 1))).toEqual({ ok: false, reason: "trusted-root-stale" });
+  it("a window ending one second before the log time refuses with the library's code", async () => {
+    expect((await verify(slsaBundle184(), windowed(undefined, T - 1)) as { reason: string }).reason).toMatch(LIBRARY_REFUSAL);
   });
   it("a window ending exactly at the log time verifies", async () => {
     expect((await verify(slsaBundle184(), windowed(undefined, T))).ok).toBe(true);
   });
-  it("a window starting one second after the log time refuses trusted-root-stale", async () => {
-    expect(await verify(slsaBundle184(), windowed(T + 1, undefined))).toEqual({ ok: false, reason: "trusted-root-stale" });
+  it("a window starting one second after the log time refuses with the library's code", async () => {
+    expect((await verify(slsaBundle184(), windowed(T + 1, undefined)) as { reason: string }).reason).toMatch(LIBRARY_REFUSAL);
   });
   it("a window starting exactly at the log time verifies", async () => {
     expect((await verify(slsaBundle184(), windowed(T, undefined))).ok).toBe(true);
   });
+});
 
-  it("stale needs both sides uncovered: a covering log key alone keeps the failure a library refusal", () => {
-    const at = new Date(T * 1000);
-    const before = { start: new Date(0), end: new Date((T - 1) * 1000) };
-    const covering = { start: new Date(0) };
-    expect(rootIsStaleAt({ certificateAuthorities: [before], tlogs: [before] }, at)).toBe(true);
-    expect(rootIsStaleAt({ certificateAuthorities: [before], tlogs: [covering] }, at)).toBe(false);
-    expect(rootIsStaleAt({ certificateAuthorities: [covering], tlogs: [before] }, at)).toBe(false);
-    expect(rootIsStaleAt({ certificateAuthorities: [{}], tlogs: [{}] }, at)).toBe(true);
+describe("an unauthenticated log time never chooses the refusal", () => {
+  it.each(["1", "1600000000"])("the real bundle with integratedTime %s, outside every committed window, refuses sigstore-invalid with the library's code", async time => {
+    const bundle = slsaBundle184();
+    bundle.verificationMaterial.tlogEntries[0].integratedTime = time;
+    const result = await verify(bundle);
+    expect(result).toMatchObject({ ok: false });
+    expect((result as { reason: string }).reason).toMatch(/^sigstore-invalid:[A-Z0-9_]+$/);
+  });
+
+  it("no library failure is reported as trusted-root-stale, which the vocabulary no longer holds", async () => {
+    const { REFUSAL_REASON_BASES } = await import("../../src/verify-release/reasons.js");
+    expect(REFUSAL_REASON_BASES).not.toContain("trusted-root-stale");
   });
 });

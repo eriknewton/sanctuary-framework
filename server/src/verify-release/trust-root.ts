@@ -6,7 +6,7 @@
  * check cannot supply the keys it is checked against. No TUF client, no
  * `~/.sigstore` cache and no network fetch is involved: a key rotation is a
  * reviewed change to the committed file, and a release signed outside the
- * committed windows refuses as `trusted-root-stale`.
+ * committed windows refuses as `sigstore-invalid:<library code>`.
  */
 
 import { constants as fsConstants } from "node:fs";

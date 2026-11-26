@@ -30,8 +30,11 @@ never from the install it checks. There is no TUF client and no
 | CT log | `https://ctfe.sigstore.dev/2022` | 2022-10-20T00:00:00Z | open |
 | Timestamp authority | `https://timestamp.sigstore.dev/api/v1/timestamp` | 2025-07-04T00:00:00Z | open |
 
-A release whose log time falls outside every certificate authority and
-transparency log window refuses with `trusted-root-stale`.
+A release signed outside these windows refuses with
+`sigstore-invalid:<library code>`, the same reason as any other failed
+verification. The command never names a stale root as the cause: once
+verification fails, the log time it would judge staleness by is not
+authenticated.
 
 ## Rotation
 

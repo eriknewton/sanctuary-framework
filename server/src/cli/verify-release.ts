@@ -55,7 +55,9 @@ What it detects:
   - a release manifest that is not signed by Sanctuary's pinned release key;
   - any added, removed or changed file in the checked install. It compares the
     contents and normalized names of regular files and directories, excluding
-    a top-level node_modules folder and .DS_Store files.
+    exactly a top-level folder named node_modules and files named .DS_Store.
+    Any other spelling of those names, such as Node_Modules or .ds_store, is an
+    extra entry and refuses.
 
 What it does not detect:
   - a malicious change to the release workflow on main, or misuse of the
@@ -70,6 +72,17 @@ Exit codes:
   1  internal error (no verdict)
   2  usage error
   3  refused (the reason is printed)
+
+Refusals that are easy to misread:
+  installed-file-unreadable  the file opened but could not be read, a storage
+                             error; it does not say the bytes differ.
+  installed-name-invalid     a name that is not UTF-8; the path shows its raw
+                             bytes, escaped.
+  installed-tree-oversize    the install holds more entries than the check
+                             reads; it stops rather than list them all.
+  sigstore-invalid           also what a release signed after a Sigstore key
+                             rotation reports until Sanctuary's committed
+                             trusted root is updated.
 `;
 
 export interface VerifyReleaseCommandArgs {

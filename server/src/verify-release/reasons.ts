@@ -18,8 +18,7 @@
  * | `tarball-url-mismatch` | the version document's `dist.tarball` is not the composed registry URL |
  * | `provenance-absent` | no attestation whose SIGNED predicateType is SLSA provenance v1 |
  * | `provenance-ambiguous` | more than one such attestation |
- * | `sigstore-invalid:<code>` | the bundle failed parsing, the local proof-and-SET guard, or the library verifier |
- * | `trusted-root-stale` | the library refused and no Fulcio CA and no log key in the committed root covers the entry's time |
+ * | `sigstore-invalid:<code>` | the bundle or its certificate failed parsing, the local proof-and-SET guard, or the library verifier, including a release signed outside the committed trusted root's windows |
  * | `identity-extension-absent:<name>` | a pinned certificate extension, or the SAN URI, is missing |
  * | `identity-mismatch:<name>` | a pinned certificate value differs, is duplicated or is not a DER UTF8String, or the statement disagrees with the certificate |
  * | `provenance-field-absent:<field>` | a pinned statement field is missing or has the wrong JSON type |
@@ -34,12 +33,15 @@
  * | `archive-entry-type:<path>` | an archive entry that is not a regular file or a directory |
  * | `archive-invalid:<reason>` | gzip or tar error, truncation, a path outside `package/`, absolute, with `..`, empty or `.` segments, a duplicate, a file/directory conflict, or a case-fold collision |
  * | `archive-oversize:<cap>` | an archive cap is exceeded |
- * | `installed-object-type:<path>` | a symlink, special file, hardlinked file, or a root `node_modules` that is not a directory |
- * | `installed-name-collision:<path>` | two installed names that differ only by case folding |
+ * | `installed-object-type:<path>` | a symlink, special file or hardlinked file, an excluded name that is not the excluded type, or a directory that cannot be listed |
+ * | `installed-name-invalid:<path>` | an installed name whose bytes are not UTF-8; the path holds the raw bytes, escaped |
+ * | `installed-name-collision:<path>` | two installed names with one NFC form |
+ * | `installed-tree-oversize` | the target holds more directory entries than the walk's cap |
  * | `installed-file-missing:<path>` | an archive file or directory absent from the target |
- * | `installed-file-extra:<path>` | a regular file in the target that the archive does not list |
+ * | `installed-file-extra:<path>` | a file in the target that the archive does not list and that is not an excluded name |
  * | `installed-dir-extra:<path>` | a directory in the target that the archive does not imply |
  * | `installed-file-differs:<path>` | an installed file's bytes differ from the archive's |
+ * | `installed-file-unreadable:<path>` | an installed file opened and passed its type checks, then failed to read |
  */
 
 export type RefusalReason =
@@ -58,7 +60,6 @@ export type RefusalReason =
   | "provenance-absent"
   | "provenance-ambiguous"
   | `sigstore-invalid:${string}`
-  | "trusted-root-stale"
   | `identity-extension-absent:${string}`
   | `identity-mismatch:${string}`
   | `provenance-field-absent:${string}`
@@ -74,11 +75,14 @@ export type RefusalReason =
   | `archive-invalid:${string}`
   | `archive-oversize:${ArchiveCap}`
   | `installed-object-type:${string}`
+  | `installed-name-invalid:${string}`
   | `installed-name-collision:${string}`
+  | "installed-tree-oversize"
   | `installed-file-missing:${string}`
   | `installed-file-extra:${string}`
   | `installed-dir-extra:${string}`
-  | `installed-file-differs:${string}`;
+  | `installed-file-differs:${string}`
+  | `installed-file-unreadable:${string}`;
 
 export type FetchResource = "version-document" | "attestations" | "tarball" | "manifest";
 export type ArchiveCap = "expanded-bytes" | "entry-count" | "file-size" | "path-length";
@@ -88,12 +92,13 @@ export const REFUSAL_REASON_BASES: readonly string[] = [
   "runtime-unsupported", "target-unreadable", "target-package-json-invalid", "target-package-mismatch",
   "self-version-mismatch", "version-mismatch", "version-malformed", "fetch-failed", "fetch-oversize",
   "fetch-redirect-refused", "deadline-exceeded", "tarball-url-mismatch", "provenance-absent",
-  "provenance-ambiguous", "sigstore-invalid", "trusted-root-stale", "identity-extension-absent",
+  "provenance-ambiguous", "sigstore-invalid", "identity-extension-absent",
   "identity-mismatch", "provenance-field-absent", "provenance-pin-mismatch", "subject-invalid",
   "subject-digest-mismatch", "packument-integrity-mismatch", "digest-malformed", "manifest-invalid",
   "manifest-version-mismatch", "manifest-digest-mismatch", "archive-entry-type", "archive-invalid",
-  "archive-oversize", "installed-object-type", "installed-name-collision", "installed-file-missing",
-  "installed-file-extra", "installed-dir-extra", "installed-file-differs",
+  "archive-oversize", "installed-object-type", "installed-name-invalid", "installed-name-collision",
+  "installed-tree-oversize", "installed-file-missing", "installed-file-extra", "installed-dir-extra",
+  "installed-file-differs", "installed-file-unreadable",
 ];
 
 /** A step's outcome: typed evidence, or one refusal. */
@@ -111,13 +116,14 @@ const BACKSLASH = 0x5c;
 
 /**
  * Escape a path or field for printing: printable ASCII stays, a backslash
- * doubles, and every other UTF-8 byte becomes `\xHH`. A filename therefore
- * cannot carry a newline, a control sequence or a look-alike character onto
- * the terminal, so it cannot forge a step line or a verdict line. A result
- * longer than MAX_DETAIL_CHARS is cut on an escape boundary and ends with
- * TRUNCATION_MARK, still within MAX_DETAIL_CHARS.
+ * doubles, and every other UTF-8 byte becomes `\xHH`. A Buffer is escaped
+ * byte for byte as given, so a name that is not UTF-8 prints its raw bytes.
+ * A filename therefore cannot carry a newline, a control sequence or a
+ * look-alike character onto the terminal, so it cannot forge a step line or a
+ * verdict line. A result longer than MAX_DETAIL_CHARS is cut on an escape
+ * boundary and ends with TRUNCATION_MARK, still within MAX_DETAIL_CHARS.
  */
-export function escapeDetail(value: string): string {
+export function escapeDetail(value: string | Buffer): string {
   const pieces = escapedPieces(value);
   const length = pieces.reduce((sum, piece) => sum + piece.length, 0);
   if (length <= MAX_DETAIL_CHARS) return pieces.join("");
@@ -134,9 +140,9 @@ export function escapePrintable(value: string): string {
   return escapedPieces(value).join("");
 }
 
-function escapedPieces(value: string): string[] {
+function escapedPieces(value: string | Buffer): string[] {
   const pieces: string[] = [];
-  for (const byte of Buffer.from(value, "utf8")) {
+  for (const byte of typeof value === "string" ? Buffer.from(value, "utf8") : value) {
     const piece = byte === BACKSLASH ? "\\\\"
       : byte >= PRINTABLE_MIN && byte <= PRINTABLE_MAX ? String.fromCharCode(byte)
         : `\\x${byte.toString(16).padStart(2, "0")}`;
@@ -148,6 +154,6 @@ function escapedPieces(value: string): string[] {
 const TRUNCATION_MARK = "...";
 
 /** `<base>:<escaped detail>`, the shape every path-bearing reason takes. */
-export function withPath<B extends string>(base: B, path: string): `${B}:${string}` {
+export function withPath<B extends string>(base: B, path: string | Buffer): `${B}:${string}` {
   return `${base}:${escapeDetail(path)}`;
 }

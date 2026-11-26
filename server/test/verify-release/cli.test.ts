@@ -12,8 +12,10 @@ import {
 } from "../../src/cli/verify-release.js";
 import { REFUSAL_REASON_BASES, escapeDetail, escapePrintable } from "../../src/verify-release/reasons.js";
 import { STEP_NAMES } from "../../src/verify-release/evidence.js";
-import { denyAllNetwork, modelledRequester } from "./helpers.js";
-import { VERSION, cleanupTempRoots, deps, install, release, stubProvenance } from "./synthetic.js";
+import { MAX_ARCHIVE_ENTRIES, MAX_INSTALLED_ENTRIES } from "../../src/verify-release/constants.js";
+import { PRODUCTION_PROVENANCE } from "../../src/verify-release/run.js";
+import { denyAllNetwork, fixtureJson, modelledRequester } from "./helpers.js";
+import { VERSION, cleanupTempRoots, deps, install, release, routesFor, stubProvenance } from "./synthetic.js";
 import { readFileSync } from "node:fs";
 
 denyAllNetwork();
@@ -126,6 +128,20 @@ describe("output contract", () => {
     }
   });
 
+  it("a provenance bundle whose leaf certificate DER is malformed refuses at state_SIGSTORE in JSON with exit 3, not the internal-error exit", async () => {
+    const r = release("1.8.4");
+    const attestations = fixtureJson<{ attestations: Array<{ predicateType: string; bundle: any }> }>("attestations-1.8.4.json");
+    const slsa = attestations.attestations.find(a => a.predicateType === "https://slsa.dev/provenance/v1")!;
+    slsa.bundle.verificationMaterial.certificate.rawBytes = "AQ==";
+    const requester = modelledRequester(routesFor(r, { attestations }));
+    const { code, out, err } = await invoke(["--target", install(r.files), "--json"], { provenance: PRODUCTION_PROVENANCE, requester }, r);
+    expect(err).toBe("");
+    expect(code).toBe(VERIFY_RELEASE_REFUSED_EXIT_CODE);
+    const report = JSON.parse(out);
+    expect(report).toMatchObject({ verdict: "refused", reason: "sigstore-invalid:BUNDLE_INVALID" });
+    expect(report.steps.find((s: { result: string }) => s.result === "refused")).toEqual({ step: "sigstore", result: "refused" });
+  });
+
   it("a target path with a newline is escaped in both modes, so it cannot forge a line", async () => {
     const r = release();
     const parent = install({});
@@ -167,6 +183,14 @@ describe("reason vocabulary", () => {
     expect(tabled).toEqual(REFUSAL_REASON_BASES);
     const unionBases = [...source.slice(source.indexOf("export type RefusalReason"), source.indexOf("export type FetchResource")).matchAll(/\| [`"]([a-z-]+)/g)].map(m => m[1]);
     expect(unionBases).toEqual(REFUSAL_REASON_BASES);
-    expect(REFUSAL_REASON_BASES).toHaveLength(36);
+    expect(REFUSAL_REASON_BASES).toHaveLength(38);
+  });
+  it("the operator doc and the help name each installed-tree reason added for the bounded walk, and the doc states the walk's cap", () => {
+    const doc = readFileSync(join(__dirname, "..", "..", "docs", "cli-operator-verbs.md"), "utf8");
+    for (const reason of ["installed-file-unreadable", "installed-name-invalid", "installed-tree-oversize"]) {
+      expect(doc).toContain(`\`${reason}`);
+      expect(VERIFY_RELEASE_HELP).toContain(reason);
+    }
+    expect(doc).toContain(`(${MAX_INSTALLED_ENTRIES.toLocaleString("en-US")}: twice the archive's ${MAX_ARCHIVE_ENTRIES.toLocaleString("en-US")}-entry cap, plus one)`);
   });
 });

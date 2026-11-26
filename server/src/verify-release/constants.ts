@@ -179,6 +179,20 @@ export const STALL_TIMEOUT_MS = 30_000;
 export const MAX_ARCHIVE_EXPANDED_BYTES = 4 * 132_452_876;
 /** 16 x 81 = 1,296 entries. */
 export const MAX_ARCHIVE_ENTRIES = 16 * 81;
+/**
+ * Installed-walk entries the exclusions may add beyond the archive's own:
+ * MAX_ARCHIVE_ENTRIES + 1 = 1,297, that is one top-level `node_modules`, plus
+ * one `.DS_Store` in each directory, sized as if every archive entry were a
+ * directory. The measured 1.8.4 install has 81 files in 17 directories below
+ * its root, so at most 117 entries including every allowed exclusion.
+ */
+export const INSTALLED_EXCLUSION_SLACK = MAX_ARCHIVE_ENTRIES + 1;
+/**
+ * The most directory entries the installed walk reads before it refuses as
+ * `installed-tree-oversize`: 1,296 + 1,297 = 2,593. Must match the cap stated
+ * for that reason in server/docs/cli-operator-verbs.md.
+ */
+export const MAX_INSTALLED_ENTRIES = MAX_ARCHIVE_ENTRIES + INSTALLED_EXCLUSION_SLACK;
 /** 4 x 23,448,089 = 93,792,356 bytes for one file. */
 export const MAX_ARCHIVE_FILE_BYTES = 4 * 23_448_089;
 /** 16 x 74 = 1,184 characters for one entry path. */

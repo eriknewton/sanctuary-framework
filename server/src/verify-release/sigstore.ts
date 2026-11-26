@@ -66,26 +66,6 @@ export function requireProofAndSet(bundle: unknown): `sigstore-invalid:${string}
 /** Library thresholds: one tlog entry, one SCT, one timestamp (the SET-authenticated log time). */
 export const VERIFIER_THRESHOLDS = { tlogThreshold: 1, ctlogThreshold: 1, timestampThreshold: 1 } as const;
 
-const MS_PER_SECOND = 1000;
-
-interface ValidityWindow { start?: Date; end?: Date }
-interface RootWindows { certificateAuthorities: ValidityWindow[]; tlogs: ValidityWindow[] }
-
-function covers(window: ValidityWindow | undefined, at: Date): boolean {
-  if (window?.start === undefined) return false;
-  return window.start <= at && (window.end === undefined || at <= window.end);
-}
-
-/**
- * Stale only when the committed root has no Fulcio CA and no log key whose
- * window covers the entry's time. The time read here is the entry's claimed
- * `integratedTime`, because the library refused before authenticating it; the
- * mapping chooses between two refusals and never between refusal and success.
- */
-export function rootIsStaleAt(windows: RootWindows, at: Date): boolean {
-  return !windows.certificateAuthorities.some(w => covers(w, at)) && !windows.tlogs.some(w => covers(w, at));
-}
-
 function libraryCode(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code;
   return typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code) ? code : "VERIFY_ERROR";
@@ -106,11 +86,9 @@ export async function state_SIGSTORE(
   ]);
 
   if (trustedRootBytes === null) return refuse("sigstore-invalid:TRUSTED_ROOT_UNAVAILABLE");
-  let root: ReturnType<typeof TrustedRoot.fromJSON>;
   let trustMaterial: ReturnType<typeof toTrustMaterial>;
   try {
-    root = TrustedRoot.fromJSON(JSON.parse(trustedRootBytes.toString("utf8")));
-    trustMaterial = toTrustMaterial(root);
+    trustMaterial = toTrustMaterial(TrustedRoot.fromJSON(JSON.parse(trustedRootBytes.toString("utf8"))));
   } catch {
     return refuse("sigstore-invalid:TRUSTED_ROOT_INVALID");
   }
@@ -121,8 +99,11 @@ export async function state_SIGSTORE(
   if (guard !== null) return refuse(guard);
 
   let bundle: ReturnType<typeof bundleFromJSON>;
+  let entity: ReturnType<typeof toSignedEntity>;
   try {
     bundle = bundleFromJSON(selection.bundle);
+    // Entity conversion parses the leaf certificate's DER, so it is parsing too: malformed bytes refuse here.
+    entity = toSignedEntity(bundle);
   } catch {
     return refuse("sigstore-invalid:BUNDLE_INVALID");
   }
@@ -131,17 +112,13 @@ export async function state_SIGSTORE(
   const integratedTime = Number(entry.integratedTime);
   if (!Number.isSafeInteger(integratedTime) || integratedTime <= 0) return refuse("sigstore-invalid:INTEGRATED_TIME");
 
-  const entity = toSignedEntity(bundle);
   // Only a Fulcio certificate carries the workflow identity; a bare public key names no build.
   if (entity.key.$case !== "certificate") return refuse("sigstore-invalid:CERTIFICATE_REQUIRED");
   try {
     new Verifier(trustMaterial, VERIFIER_THRESHOLDS).verify(entity);
   } catch (error) {
-    const windows: RootWindows = {
-      certificateAuthorities: root.certificateAuthorities.map(ca => ca.validFor ?? {}),
-      tlogs: root.tlogs.map(log => log.publicKey?.validFor ?? {}),
-    };
-    if (rootIsStaleAt(windows, new Date(integratedTime * MS_PER_SECOND))) return refuse("trusted-root-stale");
+    // Every library failure reports the library's code: the log time is unauthenticated once verification has
+    // failed, so it can never select a different refusal, such as a claim that the committed root is stale.
     return refuse(`sigstore-invalid:${libraryCode(error)}`);
   }
 
