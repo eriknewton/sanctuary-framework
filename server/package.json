@@ -48,7 +48,7 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "node scripts/copy-catalog-v3-assets.mjs --verify-only && node scripts/copy-model-manifest-v2-asset.mjs --verify-only && node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js && node scripts/copy-catalog-v3-assets.mjs && node scripts/copy-model-manifest-v2-asset.mjs",
+    "build": "node scripts/copy-catalog-v3-assets.mjs --verify-only && node scripts/copy-model-manifest-v2-asset.mjs --verify-only && node scripts/copy-verify-release-trusted-root.mjs --verify-only && node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js && node scripts/copy-catalog-v3-assets.mjs && node scripts/copy-verify-release-trusted-root.mjs && node scripts/copy-model-manifest-v2-asset.mjs",
     "build:evidence-pack": "node scripts/build-evidence-pack.mjs",
     "build:boot-runtime": "tsup --config tsup.boot-runtime.config.ts",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
@@ -108,11 +108,16 @@
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@noble/post-quantum": "0.7.1",
+    "@sigstore/bundle": "5.0.1",
+    "@sigstore/core": "4.0.2",
+    "@sigstore/protobuf-specs": "0.5.2",
+    "@sigstore/verify": "4.1.4",
     "hash-wasm": "4.12.0",
     "it-length-prefixed": "10.0.2",
     "it-pipe": "3.0.1",
     "libp2p": "2.10.0",
     "lmdb": "3.5.9",
+    "tar": "7.5.23",
     "uint8arrays": "6.1.1",
     "viem": "2.57.14"
   },

@@ -39,7 +39,7 @@
     {
       "claim": "Approval gating (Tier 1 / Tier 2 / Tier 3 policy)",
       "platform": "Cross-platform server",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/test/principal-policy/approval-gate.test.ts",
@@ -57,7 +57,7 @@
     {
       "claim": "Critical audit durability (appendCritical)",
       "platform": "Cross-platform server storage",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #271",
@@ -145,7 +145,7 @@
     {
       "claim": "State encryption",
       "platform": "Cross-platform server storage",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/test/security/tamper-detection.test.ts",
@@ -213,7 +213,7 @@
     {
       "claim": "Config/profile fail-closed",
       "platform": "Cross-platform server startup and profile storage",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #269",
@@ -243,7 +243,7 @@
     {
       "claim": "Health and attestation evidence-based",
       "platform": "Cross-platform server tools",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #273",
@@ -411,7 +411,7 @@
     {
       "claim": "Query anonymity (selective disclosure)",
       "platform": "Cross-platform server outbound payloads",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/test/query-anonymity/header-strip.test.ts",
@@ -441,7 +441,7 @@
     {
       "claim": "Context-gate single source of truth",
       "platform": "Cross-platform server tools",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #281",
@@ -471,7 +471,7 @@
     {
       "claim": "Proxy isolation: env (PR #267)",
       "platform": "Cross-platform stdio MCP upstreams",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #267",
@@ -493,7 +493,7 @@
     {
       "claim": "Proxy SSE SSRF protection",
       "platform": "Cross-platform SSE MCP upstreams",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #278",
@@ -511,7 +511,7 @@
     {
       "claim": "Dynamic proxy tool discovery",
       "platform": "Cross-platform MCP upstreams",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #283",
@@ -533,7 +533,7 @@
     {
       "claim": "did:key encoding (PR #268, base58btc compliant)",
       "platform": "Cross-platform identity",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #268",
@@ -555,7 +555,7 @@
     {
       "claim": "Identity signing authority (PR #270, raw identity_sign Tier 1)",
       "platform": "Cross-platform identity",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "PR #270",
@@ -629,7 +629,7 @@
     {
       "claim": "Verifiable transparency checkpoint format and offline verifier",
       "platform": "Cross-platform server and CLI; signing custody macOS helper-as-signer",
-      "status": "proven",
+      "status": "proven (tests)",
       "evidence": [
         {
           "label": "server/src/transparency/checkpoint.ts",
@@ -903,6 +903,40 @@
       "evidence_text": "[docs/audit/zero-outbound-linux-drill-2026-11-20.md](docs/audit/zero-outbound-linux-drill-2026-11-20.md)",
       "bounds": "The observed claim is exactly: with every packet recorded while Sanctuary 1.8.4 installed, set up, protected a Claude Code configuration and served three agent sessions, three times over on Linux in Docker, no network connection opened and no name was looked up outside the install itself, an update check the user asked for, and npm registry contact made before the server's first answer in sessions started through npx. Basis, per the 2026-11-20 drill record (the Evidence link): three runs of eight steps each (install from the registry, install from a local copy, `sanctuary init --no-pin`, `sanctuary protect --claude-code`, two sessions started through npx with 120 and 300 second idle periods, one session started directly, `sanctuary check-updates`) plus a capture probe, 25 captures in all, every one complete with all planted controls seen; verdict PASS with 0 findings; a second reader from a different model family decoded all 25 raw captures itself and agreed. LIMITS, each part of the claim: (1) ONE PLATFORM: Linux in Docker on one x86-64 host; macOS, Windows and host-level desktop behaviour are not evidenced. (2) ONE VERSION: the 1.8.4 bytes only; a later release is not covered until it has its own run. (3) COOPERATIVE-ONLY SETUP: `init --no-pin` with no Castle Wall root helper; nothing about the Castle Wall install path. (4) REMEMBER AND RECALL REFUSED: on 1.8.4 the default policy refuses `sanctuary_remember` and `sanctuary_recall`, so the drill shows the refusal path opens no connection and does not cover the storage write and read path, which did not run. (5) NPX: in sessions started through npx the registry was contacted before the server's first answer, and the capture cannot tell which process sent it; after that answer there was no new connection and no data byte, while the already-open registry connection sent only empty acknowledgements and a close, so say no new connection and no data after the server started, never no packet at all. (6) DOES NOT, NOT CANNOT: this is observed behaviour, not structural inability to connect; the structural claim is Castle Wall egress enforcement, the separate rows above, and this row never stands in for it. Also not covered: uninstall (no uninstall step ran); anything after the observation windows (minutes, no reboot or days of use); a real Claude Code process or a model in the loop; tools other than those the sessions called; federation or peer configuration; and what travelled inside the encrypted install and update-check connections.",
       "next": "A synthetic-coverage fixture that observes no outbound connection on the cooperative path, so the row can read proven; then the same drill rerun on each later release before it inherits this row, first on a release that serves `sanctuary_remember` and `sanctuary_recall` so the storage path is covered; an uninstall step; the equivalent capture on macOS and on Windows; a run with the Castle Wall install path in place; and longer observation windows including a reboot."
+    },
+    {
+      "claim": "Installed package matches its signed release record (`sanctuary verify-release`)",
+      "platform": "Cross-platform CLI; Node.js ^22.22.2, ^24.15.0 or >=26.0.0",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "server/test/verify-release/sigstore.test.ts",
+          "href": "server/test/verify-release/sigstore.test.ts"
+        },
+        {
+          "label": "server/test/verify-release/identity.test.ts",
+          "href": "server/test/verify-release/identity.test.ts"
+        },
+        {
+          "label": "server/test/verify-release/run.test.ts",
+          "href": "server/test/verify-release/run.test.ts"
+        },
+        {
+          "label": "server/test/verify-release/installed.test.ts",
+          "href": "server/test/verify-release/installed.test.ts"
+        },
+        {
+          "label": "server/test/verify-release/cli-dispatch.test.ts",
+          "href": "server/test/verify-release/cli-dispatch.test.ts"
+        },
+        {
+          "label": "server/test/verify-release/live.test.ts",
+          "href": "server/test/verify-release/live.test.ts"
+        }
+      ],
+      "evidence_text": "[server/test/verify-release/sigstore.test.ts](server/test/verify-release/sigstore.test.ts); [server/test/verify-release/identity.test.ts](server/test/verify-release/identity.test.ts); [server/test/verify-release/run.test.ts](server/test/verify-release/run.test.ts); [server/test/verify-release/installed.test.ts](server/test/verify-release/installed.test.ts); [server/test/verify-release/cli-dispatch.test.ts](server/test/verify-release/cli-dispatch.test.ts); [server/test/verify-release/live.test.ts](server/test/verify-release/live.test.ts)",
+      "bounds": "Tests only: the real 1.8.4 provenance verifies offline against the committed Sigstore trusted root through the identity and statement checks; the subject, manifest, archive and installed steps are witnessed over a synthetic release; the complete production path is witnessed only by a network-gated test that does not run in CI. Bounds of the claim: run from a copy the user already trusts with `--target`; without `--target` it detects file drift only and is only as trustworthy as the copy running it. It compares the contents and normalized names of regular files and directories, excluding a top-level `node_modules` folder and `.DS_Store` files. It does not detect a malicious change to the release workflow on `main` or misuse of the signing secret by that workflow (both checks share GitHub workflow administration), changes to dependencies under `node_modules`, file modes or the bin launchers npm writes outside the package, or a writer that changes files while the check runs. A trusted root that Sigstore has since rotated past makes newer releases refuse until the committed root is updated.",
+      "next": "The clean-Mac drill with a verifier built from merged main, captured under `docs/audit/`: install 1.8.4 from npm into a temporary prefix, `verify-release --target` passes, one edited installed file refuses with its path, and `--target` at a foreign package with provenance refuses."
     }
   ]
 }

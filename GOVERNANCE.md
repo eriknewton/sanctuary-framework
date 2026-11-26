@@ -31,6 +31,14 @@ New sovereignty layers, protocol modifications, cryptographic algorithm changes,
 - **SLA:** 4-week review and decision
 - **Merge criteria:** RFC consensus, security audit, maintainer sign-off
 
+### Tier 4: Commitment Changes
+A change to a promise in [COMMITMENTS.md](COMMITMENTS.md), or to the evidence behind one: the status, platform or known gaps of the [Assurance Matrix](ASSURANCE_MATRIX.md) row that backs it.
+
+- **Review:** approved by the project lead
+- **Merge criteria:** the pull request carries the `commitments-changed` label, and `CHANGELOG.md` lists each changed promise by its id under "Commitments changed"
+- **Release:** the change is published in a preview release on npm's `next` channel at least 7 days before it can reach the stable `latest` channel
+- **Corrections:** a change that narrows a promise found to be wider than the truth, and strengthens no evidence, ships at once without the wait. It still carries the label and a changelog line marked "(correction)". If the reason is a security problem whose fix is not yet released, the narrowed wording says what the promise now covers and not why, so that it points no one at the problem
+
 ## Release Process
 
 - Semantic versioning (MAJOR.MINOR.PATCH)

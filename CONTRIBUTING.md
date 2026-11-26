@@ -47,7 +47,7 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 
 ### Development Guidelines
 
-- New to the server? Start with the module map at `server/src/README.md` (the 69-module index; 61 of 69 modules have a barrel; plus confusable-name disambiguations and the frozen-surface list)
+- New to the server? Start with the module map at `server/src/README.md` (the 70-module index; 62 of 70 modules have a barrel; plus confusable-name disambiguations and the frozen-surface list)
 - Document the consumer-facing surface, not every line. Public functions and types get a doc-comment that captures the contract and the *why* (inputs, returns, failure modes, gotchas). **MCP tool `description` fields especially are written for the AI agents that read them** in their tool catalog: what the tool does, when to use it, what it returns, and key constraints. New public surface gets documented; existing gaps are backfilled opportunistically.
 - TypeScript with strict mode, ESM + CJS dual output
 - All MCP tools must include input validation via Zod schemas
@@ -64,6 +64,16 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 3. Run `npm test` and `npm run lint` - tests must pass and lint must report zero errors
 4. Submit PR with description of changes and motivation
 5. Address review feedback; maintainer merges after approval
+
+### Changing a Commitment
+
+[COMMITMENTS.md](COMMITMENTS.md) lists the promises Sanctuary makes to the people who run it. A pull request changes a commitment when it adds, edits or withdraws a promise there, or changes the status, platform or known gaps of the [Assurance Matrix](ASSURANCE_MATRIX.md) row that backs one. Such a pull request:
+
+1. carries the `commitments-changed` label;
+2. adds one line per changed promise under `### Commitments changed` in the `[Unreleased]` section of `CHANGELOG.md`, starting with its id, for example `- C-03: ...`; a correction reads `- C-03 (correction): ...`;
+3. reaches the stable channel only after a preview release carrying the same text has been on npm's `next` channel for at least 7 days. A correction, which narrows a promise and strengthens no evidence, is exempt from the wait.
+
+Never reuse an id. A withdrawn promise moves to the `## Withdrawn` section with the version that withdrew it and a one-sentence reason. While the fix for a security problem is unreleased, a correction says what the promise now covers and not why; see [SECURITY.md](SECURITY.md).
 
 ### Review Tiers
 

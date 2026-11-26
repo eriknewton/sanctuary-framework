@@ -21,6 +21,19 @@ export type AssuranceStatus =
   | "in_flight"
   | "unknown";
 
+/**
+ * The evidence-qualified spelling of `proven` on the matrix's Status enum line.
+ * A `proven (tests)` row is still a proven claim (its proof is tests, pull
+ * requests or source links, with no captured drill), so it parses to `proven`
+ * here: every check that keys on `proven`, including the ratchet rule that a
+ * proven row must have passing fixtures, keeps applying to it. Reading it as an
+ * unrecognized token would downgrade it to `unknown` and silently take those
+ * rows out of that rule. Must match the `proven (tests)` value on the "Status
+ * enum:" line of ASSURANCE_MATRIX.md and PROVEN_TESTS_STATUS in
+ * scripts/check-assurance-matrix.mjs.
+ */
+export const PROVEN_TESTS_STATUS = "proven (tests)";
+
 /** Recognized status tokens, mirroring the `ASSURANCE_MATRIX.md` status enum. */
 const KNOWN_STATUSES: readonly AssuranceStatus[] = [
   "proven",
@@ -31,14 +44,15 @@ const KNOWN_STATUSES: readonly AssuranceStatus[] = [
   "in_flight",
   "unknown",
 ];
-// 29 = the 23 rows pinned when this harness landed, plus the three rows appended
+// 30 = the 23 rows pinned when this harness landed, plus the three rows appended
 // 2026-09-03 (Rung 1 memory custody, catalog v3 verification, fleet licensing),
 // plus the Rung 2 activation row (signed model manifest verified at provisioning),
 // plus the credential surrogacy slice 1a row (row 28, `partial`, 2026-09-30),
-// plus the zero-outbound drill row (row 29, `proven`, Linux 1.8.4 only, 2026-11-22).
+// plus the zero-outbound drill row (row 29, `proven`, Linux 1.8.4 only, 2026-11-22),
+// plus the release verification row (row 30, `partial`, 2026-11-25).
 // Rows are appended at the END of the table so fixture row IDs stay stable.
 // Must match the data-row count of the table in ASSURANCE_MATRIX.md.
-export const EXPECTED_ASSURANCE_ROW_COUNT = 29;
+export const EXPECTED_ASSURANCE_ROW_COUNT = 30;
 
 export interface AssuranceRow {
   id: string;
@@ -62,11 +76,14 @@ function findRepoRoot(start = process.cwd()): string {
   }
 }
 
-function normalizeStatus(status: string): AssuranceStatus {
+export function normalizeStatus(status: string): AssuranceStatus {
   // An unrecognized token becomes `unknown` rather than throwing, so a typo in
   // the matrix degrades the report instead of breaking the whole pipeline. That
   // leniency is why KNOWN_STATUSES must stay in lockstep with the matrix enum:
   // a real status the parser has never heard of is indistinguishable from a typo.
+  if (status === PROVEN_TESTS_STATUS) {
+    return "proven";
+  }
   return KNOWN_STATUSES.includes(status as AssuranceStatus)
     ? (status as AssuranceStatus)
     : "unknown";

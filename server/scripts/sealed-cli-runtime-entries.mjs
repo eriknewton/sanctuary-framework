@@ -74,6 +74,14 @@ export const SEALED_CLI_RUNTIME_DIST_ENTRIES = Object.freeze([
     // The digest manifest every schema in the directory is checked against.
     sentinel: "schemas/schema-digests.json",
   }),
+  // The committed Sigstore trusted root `verify-release` loads relative to
+  // dist/cli.js (src/verify-release/trust-root.ts).
+  Object.freeze({
+    path: "verify-release",
+    kind: "dir",
+    source: "copy-verify-release-trusted-root.mjs",
+    sentinel: "trusted_root.json",
+  }),
   // Lands with PR #1370 (packaged signed model manifest, resolved relative to
   // the module dir by src/intelligence/packaged-model-manifest.ts). Until that
   // PR's copy script exists beside this file the entry is PENDING: the build

@@ -22,19 +22,19 @@
     "Cross-platform server": [
       {
         "claim": "Approval gating (Tier 1 / Tier 2 / Tier 3 policy)",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "The policy engine and fail-closed channel behavior are covered in unit tests. Operator UX timing and every transport-specific approval channel are not covered by one end-to-end drill here."
       }
     ],
     "Cross-platform server storage": [
       {
         "claim": "Critical audit durability (appendCritical)",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Critical Cognitive-layer mutations fail closed on audit write failure in the tested storage adapters. PR #276 migrated 43 additional critical call sites across principal-policy, proxy, Castle Wall blocked-egress, sovereignty-profile, bridge/reputation, broker, and token-issuer. Two synchronous API sites remain flagged for later restructure."
       },
       {
         "claim": "State encryption",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Tests cover AES-GCM tamper rejection and IV uniqueness. They do not by themselves prove host keychain security or hardware-backed key custody."
       },
       {
@@ -53,19 +53,19 @@
     "Cross-platform server startup and profile storage": [
       {
         "claim": "Config/profile fail-closed",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Config and sovereignty profile corruption are classified, quarantined, and fail closed in tested load paths. This does not prove every future config-like store inherits the same behavior automatically."
       }
     ],
     "Cross-platform server tools": [
       {
         "claim": "Health and attestation evidence-based",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "`exec_attest` and `monitor_health` now use structured local evidence reports instead of unsupported self-claims. This does not prove TEE-backed execution or remote attestation."
       },
       {
         "claim": "Context-gate single source of truth",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "The persisted sovereignty profile `features.context_gating` is the source of truth; `ContextGateEnforcer` is initialized from the profile at boot; proxy `contextGateFilter` delegates to the live enforcer instead of returning unchanged args; combined-state status is surfaced through health. This does not prove every future outbound surface automatically registers with the shared enforcer."
       }
     ],
@@ -110,40 +110,40 @@
     "Cross-platform server outbound payloads": [
       {
         "claim": "Query anonymity (selective disclosure)",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Coverage is bounded by the magic-string corpus and the shipped adapter list at drill time; novel PII shapes not represented in the corpus and provider adapters added after this drill require corpus and matrix extension."
       }
     ],
     "Cross-platform stdio MCP upstreams": [
       {
         "claim": "Proxy isolation: env (PR #267)",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Stdio upstreams receive a minimal allowlisted environment with deny filtering. This row does not cover SSE URL SSRF or network isolation."
       }
     ],
     "Cross-platform SSE MCP upstreams": [
       {
         "claim": "Proxy SSE SSRF protection",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "`ssrf-validator.ts` blocks loopback, RFC1918, link-local, multicast, IPv6 loopback/local, and cloud metadata addresses; DNS resolution is validated before connection; the operator escape hatch is audited through `appendCritical`. This does not prove kernel-level network isolation for SSE transports."
       }
     ],
     "Cross-platform MCP upstreams": [
       {
         "claim": "Dynamic proxy tool discovery",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Dynamic tool-list strategy handles `tools/list_changed` notifications; `ClientManager` refreshes the proxy catalog on reconnect; Tier 1 approval gating, context-gate filtering, and critical audit emission are preserved. This does not prove every possible upstream transport emits timely change notifications."
       }
     ],
     "Cross-platform identity": [
       {
         "claim": "did:key encoding (PR #268, base58btc compliant)",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "New identities use base58btc `did:key` encoding and tests include W3C Ed25519 vectors. Legacy base64url DIDs may still exist in historical state and docs until migration cleanup."
       },
       {
         "claim": "Identity signing authority (PR #270, raw identity_sign Tier 1)",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Raw `identity_sign` is Tier 1 and typed internal signing helpers are not exposed as MCP tools. Guard enforces classification per registered tool name; non-registered helpers and dynamically constructed tool names remain manual-review surface."
       }
     ],
@@ -164,7 +164,7 @@
     "Cross-platform server and CLI; signing custody macOS helper-as-signer": [
       {
         "claim": "Verifiable transparency checkpoint format and offline verifier",
-        "status": "proven",
+        "status": "proven (tests)",
         "bounds": "Tests prove the format and verifier properties: forged signatures rejected, counter rollback/gap/duplicate and replaced-checkpoint linkage detected, tampered counters detected, fail-closed emission (no unsigned or partial checkpoint on any failure). Offline completeness: a clean PASS / exit 0 means \"verified complete from genesis with the authentic genesis sentinel\" and nothing else. A bundle whose earliest checkpoint is counter N>1 FAILS by default (withheld-prefix `counter_prefix_missing`); a counter-1 record whose `previous_checkpoint_hash` is not the genesis sentinel (`\"GENESIS\"`) FAILS as a forged/withheld origin (`genesis_sentinel_mismatch`) and `--allow-partial` cannot launder it; a misplaced genesis sentinel on a non-earliest record FAILS (`genesis_sentinel_misplaced`). A suffix fragment verifies only under explicit `--allow-partial`, which returns the DISTINCT verdict `PARTIAL` and the dedicated exit code `10` (never PASS / exit 0), so no caller gating on verdict or exit code can read incomplete evidence as a complete-from-genesis verification. Host (`--against-log`) detection: tail truncation, content alteration, and non-prefix in-window deletion are detected against the live log; deletion of the LOWEST covered entry (which mimics rotation by raising the live floor) is detected ONLY when the master-key-MAC'd rotation anchor authenticates the cut (requires the fortress passphrase) and otherwise FAILS closed (`rotation_floor_unauthenticated`). A host PASS therefore means \"the live log matches the signed root over the covered window, OR a pruned prefix was proven by an authenticated rotation anchor\"; a host run that emits only a `merkle root not recomputed` note is NOT evidence the live log matches the signed root. What this row does NOT claim: that the wall was enforcing on the wire (enforcement claims trace to the Castle Wall drill rows, not to this format); the emitting binary hash is self-reported; there is no hosted transparency log and no external anchoring; publishing is a manual operator action. No third-party cross-host verification drill has been captured yet. Under the [Proof-of-Control working draft's tier language](https://github.com/LFDT-ProofOfControl/ov-poc-standard) (C7.1.5, LF Decentralized Trust, public comment to 2026-10-30, not a final standard), a system that evidences evaluation without mediating the effect channel may claim Tier 1 to 2 only; this row does not adopt, implement or claim a tier."
       }
     ],
@@ -202,6 +202,13 @@
         "status": "partial",
         "bounds": "The observed claim is exactly: with every packet recorded while Sanctuary 1.8.4 installed, set up, protected a Claude Code configuration and served three agent sessions, three times over on Linux in Docker, no network connection opened and no name was looked up outside the install itself, an update check the user asked for, and npm registry contact made before the server's first answer in sessions started through npx. Basis, per the 2026-11-20 drill record (the Evidence link): three runs of eight steps each (install from the registry, install from a local copy, `sanctuary init --no-pin`, `sanctuary protect --claude-code`, two sessions started through npx with 120 and 300 second idle periods, one session started directly, `sanctuary check-updates`) plus a capture probe, 25 captures in all, every one complete with all planted controls seen; verdict PASS with 0 findings; a second reader from a different model family decoded all 25 raw captures itself and agreed. LIMITS, each part of the claim: (1) ONE PLATFORM: Linux in Docker on one x86-64 host; macOS, Windows and host-level desktop behaviour are not evidenced. (2) ONE VERSION: the 1.8.4 bytes only; a later release is not covered until it has its own run. (3) COOPERATIVE-ONLY SETUP: `init --no-pin` with no Castle Wall root helper; nothing about the Castle Wall install path. (4) REMEMBER AND RECALL REFUSED: on 1.8.4 the default policy refuses `sanctuary_remember` and `sanctuary_recall`, so the drill shows the refusal path opens no connection and does not cover the storage write and read path, which did not run. (5) NPX: in sessions started through npx the registry was contacted before the server's first answer, and the capture cannot tell which process sent it; after that answer there was no new connection and no data byte, while the already-open registry connection sent only empty acknowledgements and a close, so say no new connection and no data after the server started, never no packet at all. (6) DOES NOT, NOT CANNOT: this is observed behaviour, not structural inability to connect; the structural claim is Castle Wall egress enforcement, the separate rows above, and this row never stands in for it. Also not covered: uninstall (no uninstall step ran); anything after the observation windows (minutes, no reboot or days of use); a real Claude Code process or a model in the loop; tools other than those the sessions called; federation or peer configuration; and what travelled inside the encrypted install and update-check connections."
       }
+    ],
+    "Cross-platform CLI; Node.js ^22.22.2, ^24.15.0 or >=26.0.0": [
+      {
+        "claim": "Installed package matches its signed release record (`sanctuary verify-release`)",
+        "status": "partial",
+        "bounds": "Tests only: the real 1.8.4 provenance verifies offline against the committed Sigstore trusted root through the identity and statement checks; the subject, manifest, archive and installed steps are witnessed over a synthetic release; the complete production path is witnessed only by a network-gated test that does not run in CI. Bounds of the claim: run from a copy the user already trusts with `--target`; without `--target` it detects file drift only and is only as trustworthy as the copy running it. It compares the contents and normalized names of regular files and directories, excluding a top-level `node_modules` folder and `.DS_Store` files. It does not detect a malicious change to the release workflow on `main` or misuse of the signing secret by that workflow (both checks share GitHub workflow administration), changes to dependencies under `node_modules`, file modes or the bin launchers npm writes outside the package, or a writer that changes files while the check runs. A trusted root that Sigstore has since rotated past makes newer releases refuse until the committed root is updated."
+      }
     ]
   },
   "bounds": [
@@ -211,14 +218,39 @@
       "bounds": "Tests prove config rewrite and bootstrap behavior for representative harness paths. They do not prove interception for every listed harness version or non-MCP agent surface."
     },
     {
+      "claim": "Approval gating (Tier 1 / Tier 2 / Tier 3 policy)",
+      "status": "proven (tests)",
+      "bounds": "The policy engine and fail-closed channel behavior are covered in unit tests. Operator UX timing and every transport-specific approval channel are not covered by one end-to-end drill here."
+    },
+    {
+      "claim": "Critical audit durability (appendCritical)",
+      "status": "proven (tests)",
+      "bounds": "Critical Cognitive-layer mutations fail closed on audit write failure in the tested storage adapters. PR #276 migrated 43 additional critical call sites across principal-policy, proxy, Castle Wall blocked-egress, sovereignty-profile, bridge/reputation, broker, and token-issuer. Two synchronous API sites remain flagged for later restructure."
+    },
+    {
       "claim": "Tamper-evident audit chain",
       "status": "partial",
       "bounds": "Audit entries carry monotonic sequence, `prev_hash`, `entry_hash`, root-hash recomputation, legacy-anchor migration, and strict-mode verification defaults. The production checkpoint signer and authenticated key resolver are now derived inside the `AuditLog` constructor from its required arguments, so every production call site signs checkpoints when the fortress holds an identity and verifies them through the identity's signed rotation history; a wired-consumer test drives the real `createSanctuaryServer` boot path. Bounds: a fortress with no identity yet, and the root daemon's split audit store, write honestly `unsigned` checkpoints; the standalone verifier reports every unsigned `type: \"checkpoint\"` record as a `checkpoint_unsigned` finding, so an export with unsigned checkpoints does not PASS, and verification against a key reports `checkpoint_coverage_absent` for an export with no checkpoint records; `audit-chain verify --no-strict` reports findings with exit code 10; single-file export is one-chain-only when multiple audit chains exist, and standalone verification checks rotation-anchor shape/linkage but not the custody-key MAC. This slice wires authenticated verification of SIGNED checkpoints and adds code-level silent-downgrade detection (**IC-05-DG**): signature stripping and targeted deletion of committed signed checkpoints (a prefix, an interior run, or a stripped-boundary prefix) surface while either of two authenticated control records survives, and deletion of the committed tail surfaces the same way except when an authentic earlier signing-head record is also replayed. That replay case, along with erasure of both control records or of the complete signing-evidence set, is a bound owned by off-host verification rather than local detection (register id **IC-05-DG**); erasing both control records over surviving signed evidence leaves a permanently latched recovery warning. This is a code-level claim with no drill evidence yet, so it stays partial pending the external-verifier drill: **IC-05**."
     },
     {
+      "claim": "State encryption",
+      "status": "proven (tests)",
+      "bounds": "Tests cover AES-GCM tamper rejection and IV uniqueness. They do not by themselves prove host keychain security or hardware-backed key custody."
+    },
+    {
       "claim": "State envelope integrity / default verify-on-read",
       "status": "partial",
       "bounds": "Schema-2 envelopes bind namespace, key, version, kid, metadata, integrity hash, and payload metadata, and are signed under the `sanctuary.state-envelope.v1` domain prefix. `state_read` verifies by default and rollback anchors are persisted with MAC authentication. The rollback floor still has an anchor-deletion replay residual; closing that requires boot-anchored or externally attested storage. A separate private key-resolution hardening item tracked under register id M-01 is closed. Representative legacy entries auto-migrate on first verified read when the local writer identity is available. Since STATE-READ-REFUSE-01 the enforcing read path returns a value only when verification established the writer: an entry whose writer cannot be established is refused with classification `writer_unverified` rather than returned unverified. COMPATIBILITY BOUND: on a genuinely un-migrated pre-v2 fortress whose writer identity is absent from the local identity store, those entries no longer read through `state_read` until that identity is restored, after which the first read verifies and migrates them. `state_list`, `state_export`, and `state_delete` do not route through that path and still reach the affected entries, so the AGENTS.md MUST-NEVER #2 disjunction is satisfied, but state what the owner loses rather than reading that as no loss: for an affected entry the owner keeps metadata through `state_list`, the stored ciphertext through `state_export` and the Exit V2 bundle, and deletion through `state_delete`, and loses content inspection through every shipped surface until the writer identity is restored. Since STATE-DISCLOSE-UNATTRIB-01 the owner has a route back to that content FOR ORDINARY USER NAMESPACES, and not for the reserved `_`-prefixed set or for opaque memory handles, both of which that route refuses by design so that a Tier-1 approval cannot become a way to read internal state; for those the only remedy remains `identity_import`. `state_disclose_unattributed`, an MCP tool and a CLI verb, is Tier-1 and non-relaxable (force-pinned in both the policy loader and the runtime classifier), audits every invocation that reaches the disclosure operation with the namespace and key (a request refused on its arguments before the fortress is opened is refused before any audit log exists; a declined approval is recorded by the approval gate under its own operation, binding an arguments hash rather than the namespace and key), performs no mutation of the state store, and returns a structurally distinct shape carrying no `value` and no `signature_verified` field. Its durable writes are its own audit records plus, on the CLI transport only, the deliberate operator-visible disclosure file described next; every terminal delivery outcome, including a receipt or JSON payload that could not be delivered and a rollback that could not remove that file, is itself audited, with one named exception: if that delivery record cannot be persisted the command warns on stderr and completes rather than failing, so a storage fault leaves the delivery unrecorded instead of leaving the operator with a false diagnosis. On the CLI transport the disclosed content is written byte-for-byte to a newly created operator-only file under the fortress `disclosures/` directory and the terminal receives a receipt naming that file, with untrusted metadata reduced to bounded printable ASCII; `--json` emits the disclosure verbatim to a redirected or piped stdout and refuses a terminal. Its bounds are part of the claim: it refuses an entry whose writer CAN be established, so it is a route for the owner who has lost that identity and not a verification-optional read, and what it returns is unattributed content, not a verified read, so it restores INSPECTION and never restores attribution. The in-process `readUnverified` escape hatch still has no production call site of its own, and export followed by import still does not close the loop, because import re-verifies and skips an entry whose writer key it cannot resolve. An operator holding a backup of the writer identity recovers fully by importing it, which restores verification and migrates the entry; an operator who has lost that identity recovers the content but never the attribution. Outlier legacy shapes still need soak coverage."
+    },
+    {
+      "claim": "Config/profile fail-closed",
+      "status": "proven (tests)",
+      "bounds": "Config and sovereignty profile corruption are classified, quarantined, and fail closed in tested load paths. This does not prove every future config-like store inherits the same behavior automatically."
+    },
+    {
+      "claim": "Health and attestation evidence-based",
+      "status": "proven (tests)",
+      "bounds": "`exec_attest` and `monitor_health` now use structured local evidence reports instead of unsupported self-claims. This does not prove TEE-backed execution or remote attestation."
     },
     {
       "claim": "Per-agent network stop",
@@ -236,9 +268,49 @@
       "bounds": "CLI export and verifier coverage exist, but the whole exit guarantee is partial: dashboard export is not a complete exit bundle, import does not yet report every entry it skips, and continuity of state across an identity-key rotation is not yet guaranteed. Legacy Operational audit receipts are archive-only in the current verifier and sit outside normal query continuity. Open defect: **IC-07, IC-08, IC-09**."
     },
     {
+      "claim": "Query anonymity (selective disclosure)",
+      "status": "proven (tests)",
+      "bounds": "Coverage is bounded by the magic-string corpus and the shipped adapter list at drill time; novel PII shapes not represented in the corpus and provider adapters added after this drill require corpus and matrix extension."
+    },
+    {
+      "claim": "Context-gate single source of truth",
+      "status": "proven (tests)",
+      "bounds": "The persisted sovereignty profile `features.context_gating` is the source of truth; `ContextGateEnforcer` is initialized from the profile at boot; proxy `contextGateFilter` delegates to the live enforcer instead of returning unchanged args; combined-state status is surfaced through health. This does not prove every future outbound surface automatically registers with the shared enforcer."
+    },
+    {
+      "claim": "Proxy isolation: env (PR #267)",
+      "status": "proven (tests)",
+      "bounds": "Stdio upstreams receive a minimal allowlisted environment with deny filtering. This row does not cover SSE URL SSRF or network isolation."
+    },
+    {
+      "claim": "Proxy SSE SSRF protection",
+      "status": "proven (tests)",
+      "bounds": "`ssrf-validator.ts` blocks loopback, RFC1918, link-local, multicast, IPv6 loopback/local, and cloud metadata addresses; DNS resolution is validated before connection; the operator escape hatch is audited through `appendCritical`. This does not prove kernel-level network isolation for SSE transports."
+    },
+    {
+      "claim": "Dynamic proxy tool discovery",
+      "status": "proven (tests)",
+      "bounds": "Dynamic tool-list strategy handles `tools/list_changed` notifications; `ClientManager` refreshes the proxy catalog on reconnect; Tier 1 approval gating, context-gate filtering, and critical audit emission are preserved. This does not prove every possible upstream transport emits timely change notifications."
+    },
+    {
+      "claim": "did:key encoding (PR #268, base58btc compliant)",
+      "status": "proven (tests)",
+      "bounds": "New identities use base58btc `did:key` encoding and tests include W3C Ed25519 vectors. Legacy base64url DIDs may still exist in historical state and docs until migration cleanup."
+    },
+    {
+      "claim": "Identity signing authority (PR #270, raw identity_sign Tier 1)",
+      "status": "proven (tests)",
+      "bounds": "Raw `identity_sign` is Tier 1 and typed internal signing helpers are not exposed as MCP tools. Guard enforces classification per registered tool name; non-registered helpers and dynamically constructed tool names remain manual-review surface."
+    },
+    {
       "claim": "Composition root review surface",
       "status": "planned",
       "bounds": "Composition features have dedicated tests, but the main server composition root remains large and is explicitly deferred to Wave 4 review in v1.4. Reviewability and trust-boundary mapping are not yet proven."
+    },
+    {
+      "claim": "Verifiable transparency checkpoint format and offline verifier",
+      "status": "proven (tests)",
+      "bounds": "Tests prove the format and verifier properties: forged signatures rejected, counter rollback/gap/duplicate and replaced-checkpoint linkage detected, tampered counters detected, fail-closed emission (no unsigned or partial checkpoint on any failure). Offline completeness: a clean PASS / exit 0 means \"verified complete from genesis with the authentic genesis sentinel\" and nothing else. A bundle whose earliest checkpoint is counter N>1 FAILS by default (withheld-prefix `counter_prefix_missing`); a counter-1 record whose `previous_checkpoint_hash` is not the genesis sentinel (`\"GENESIS\"`) FAILS as a forged/withheld origin (`genesis_sentinel_mismatch`) and `--allow-partial` cannot launder it; a misplaced genesis sentinel on a non-earliest record FAILS (`genesis_sentinel_misplaced`). A suffix fragment verifies only under explicit `--allow-partial`, which returns the DISTINCT verdict `PARTIAL` and the dedicated exit code `10` (never PASS / exit 0), so no caller gating on verdict or exit code can read incomplete evidence as a complete-from-genesis verification. Host (`--against-log`) detection: tail truncation, content alteration, and non-prefix in-window deletion are detected against the live log; deletion of the LOWEST covered entry (which mimics rotation by raising the live floor) is detected ONLY when the master-key-MAC'd rotation anchor authenticates the cut (requires the fortress passphrase) and otherwise FAILS closed (`rotation_floor_unauthenticated`). A host PASS therefore means \"the live log matches the signed root over the covered window, OR a pruned prefix was proven by an authenticated rotation anchor\"; a host run that emits only a `merkle root not recomputed` note is NOT evidence the live log matches the signed root. What this row does NOT claim: that the wall was enforcing on the wire (enforcement claims trace to the Castle Wall drill rows, not to this format); the emitting binary hash is self-reported; there is no hosted transparency log and no external anchoring; publishing is a manual operator action. No third-party cross-host verification drill has been captured yet. Under the [Proof-of-Control working draft's tier language](https://github.com/LFDT-ProofOfControl/ov-poc-standard) (C7.1.5, LF Decentralized Trust, public comment to 2026-10-30, not a final standard), a system that evidences evaluation without mediating the effect channel may claim Tier 1 to 2 only; this row does not adopt, implement or claim a tier."
     },
     {
       "claim": "Sovereign encrypted memory custody (Rung 1, candidate)",
@@ -269,6 +341,11 @@
       "claim": "No unrequested network contact (observed by packet capture)",
       "status": "partial",
       "bounds": "The observed claim is exactly: with every packet recorded while Sanctuary 1.8.4 installed, set up, protected a Claude Code configuration and served three agent sessions, three times over on Linux in Docker, no network connection opened and no name was looked up outside the install itself, an update check the user asked for, and npm registry contact made before the server's first answer in sessions started through npx. Basis, per the 2026-11-20 drill record (the Evidence link): three runs of eight steps each (install from the registry, install from a local copy, `sanctuary init --no-pin`, `sanctuary protect --claude-code`, two sessions started through npx with 120 and 300 second idle periods, one session started directly, `sanctuary check-updates`) plus a capture probe, 25 captures in all, every one complete with all planted controls seen; verdict PASS with 0 findings; a second reader from a different model family decoded all 25 raw captures itself and agreed. LIMITS, each part of the claim: (1) ONE PLATFORM: Linux in Docker on one x86-64 host; macOS, Windows and host-level desktop behaviour are not evidenced. (2) ONE VERSION: the 1.8.4 bytes only; a later release is not covered until it has its own run. (3) COOPERATIVE-ONLY SETUP: `init --no-pin` with no Castle Wall root helper; nothing about the Castle Wall install path. (4) REMEMBER AND RECALL REFUSED: on 1.8.4 the default policy refuses `sanctuary_remember` and `sanctuary_recall`, so the drill shows the refusal path opens no connection and does not cover the storage write and read path, which did not run. (5) NPX: in sessions started through npx the registry was contacted before the server's first answer, and the capture cannot tell which process sent it; after that answer there was no new connection and no data byte, while the already-open registry connection sent only empty acknowledgements and a close, so say no new connection and no data after the server started, never no packet at all. (6) DOES NOT, NOT CANNOT: this is observed behaviour, not structural inability to connect; the structural claim is Castle Wall egress enforcement, the separate rows above, and this row never stands in for it. Also not covered: uninstall (no uninstall step ran); anything after the observation windows (minutes, no reboot or days of use); a real Claude Code process or a model in the loop; tools other than those the sessions called; federation or peer configuration; and what travelled inside the encrypted install and update-check connections."
+    },
+    {
+      "claim": "Installed package matches its signed release record (`sanctuary verify-release`)",
+      "status": "partial",
+      "bounds": "Tests only: the real 1.8.4 provenance verifies offline against the committed Sigstore trusted root through the identity and statement checks; the subject, manifest, archive and installed steps are witnessed over a synthetic release; the complete production path is witnessed only by a network-gated test that does not run in CI. Bounds of the claim: run from a copy the user already trusts with `--target`; without `--target` it detects file drift only and is only as trustworthy as the copy running it. It compares the contents and normalized names of regular files and directories, excluding a top-level `node_modules` folder and `.DS_Store` files. It does not detect a malicious change to the release workflow on `main` or misuse of the signing secret by that workflow (both checks share GitHub workflow administration), changes to dependencies under `node_modules`, file modes or the bin launchers npm writes outside the package, or a writer that changes files while the check runs. A trusted root that Sigstore has since rotated past makes newer releases refuse until the committed root is updated."
     }
   ],
   "evidence_index": {

@@ -11,7 +11,7 @@
 // This guard generalizes it mechanically so a platform-enforcement claim can never
 // reach `proven` on test-only evidence again.
 //
-// It enforces two invariants and fails closed (exit 1) on any violation:
+// It enforces three invariants and fails closed (exit 1) on any violation:
 //   1. LINK RESOLUTION. Every repo-relative markdown link in the Evidence column
 //      resolves to a file that exists. Catches doc drift (a `proven` row pointing
 //      at a moved or deleted test/drill artifact).
@@ -21,6 +21,13 @@
 //      evidence: a link under docs/audit/, OR the word "drill" next to a
 //      YYYY-MM-DD date. A green unit-test suite is not sufficient evidence that a
 //      shipped enforcement path enforces; a captured drill is.
+//
+//   3. BARE PROVEN MEANS A DRILL (2026-11-22). The Status `proven` on its own
+//      tells a reader the shipped product was run on a real machine. A row whose
+//      proof is tests, pull requests or source links only reads `proven (tests)`,
+//      so a bare `proven` row of any kind must cite drill evidence by the same
+//      test as invariant 2, and an enforcement claim may never read
+//      `proven (tests)`, because tests alone cannot prove it.
 //
 // This guard cannot catch a semantic lie inside a drill doc; it makes the cheap,
 // mechanical failure modes (dead links, tests-standing-in-for-a-drill) impossible.
@@ -55,6 +62,15 @@ const ENFORCEMENT_CLAIM_RE =
 // accompanied by an ISO date. Either proves someone ran the real thing on a date.
 const DRILL_DOC_RE = /docs\/audit\//i;
 const DATED_DRILL_RE = /drill[\s\S]{0,80}?\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}[\s\S]{0,80}?drill/i;
+
+// The two spellings of the proven status. `proven (tests)` is the proven status
+// qualified by its evidence kind; it is still a proven claim, so invariant 2
+// applies to it too (a qualifier must never take a row out of the drill rule).
+// Must match the `proven (tests)` value on the "Status enum:" line of
+// ASSURANCE_MATRIX.md and PROVEN_TESTS_STATUS in
+// scripts/synthetic-coverage/assurance-matrix.ts.
+const PROVEN_STATUS = "proven";
+const PROVEN_TESTS_STATUS = "proven (tests)";
 
 // Extract repo-relative targets from markdown links `[text](target)`; skip http(s)
 // and anchor-only links.
@@ -133,18 +149,36 @@ function main() {
     }
 
     // Invariant 2: a proven platform-enforcement claim must cite a drill.
-    if (status.toLowerCase() === "proven") {
-      const isEnforcement = ENFORCEMENT_CLAIM_RE.test(claim);
-      if (isEnforcement) {
-        const hasDrill = DRILL_DOC_RE.test(evidence) || DATED_DRILL_RE.test(evidence);
-        if (!hasDrill) {
-          violations.push(
-            `"${claim}" (${platform}) is marked \`proven\` but cites no drill evidence. ` +
-              `A platform-enforcement claim needs a docs/audit/ drill link or a dated "drill" ` +
-              `citation, not test/PR links alone. Downgrade to \`partial\` or add the drill.`
-          );
-        }
+    const normalizedStatus = status.toLowerCase();
+    const isBareProven = normalizedStatus === PROVEN_STATUS;
+    const isProvenTests = normalizedStatus === PROVEN_TESTS_STATUS;
+    const isEnforcement = ENFORCEMENT_CLAIM_RE.test(claim);
+    const hasDrill = DRILL_DOC_RE.test(evidence) || DATED_DRILL_RE.test(evidence);
+    if ((isBareProven || isProvenTests) && isEnforcement) {
+      if (isProvenTests) {
+        // A label that says the proof is tests alone, on a claim only a drill can
+        // prove, is refused even if a drill link happens to sit in the cell.
+        violations.push(
+          `"${claim}" (${platform}) is marked \`${PROVEN_TESTS_STATUS}\`, but a platform-enforcement ` +
+            `claim cannot be proven by tests. Downgrade to \`partial\`, or cite the drill and mark it \`${PROVEN_STATUS}\`.`
+        );
+      } else if (!hasDrill) {
+        violations.push(
+          `"${claim}" (${platform}) is marked \`proven\` but cites no drill evidence. ` +
+            `A platform-enforcement claim needs a docs/audit/ drill link or a dated "drill" ` +
+            `citation, not test/PR links alone. Downgrade to \`partial\` or add the drill.`
+        );
       }
+    }
+
+    // Invariant 3: a bare `proven` row of any kind must cite a drill, because a
+    // reader takes the bare word to mean the shipped product was run for real.
+    // Enforcement rows are already reported by invariant 2; this covers the rest.
+    if (isBareProven && !isEnforcement && !hasDrill) {
+      violations.push(
+        `"${claim}" (${platform}) is marked \`${PROVEN_STATUS}\` but cites no drill evidence. ` +
+          `A row proven by tests, pull requests or source links alone reads \`${PROVEN_TESTS_STATUS}\`.`
+      );
     }
   }
 
@@ -163,7 +197,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log(`ASSURANCE MATRIX GUARD: OK. ${rowNum} rows; all evidence links resolve; every proven enforcement claim cites a drill.`);
+  console.log(`ASSURANCE MATRIX GUARD: OK. ${rowNum} rows; all evidence links resolve; every proven enforcement claim cites a drill; every bare proven row cites a drill.`);
   process.exit(0);
 }
 

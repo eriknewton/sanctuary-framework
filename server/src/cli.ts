@@ -311,6 +311,13 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "verify-release") {
+    const { runVerifyReleaseCommand } = await import("./cli/verify-release.js");
+    // cli.ts passes its own module URL: self mode checks the package this entry runs from.
+    const code = await runVerifyReleaseCommand({ argv: args.slice(1), entryModuleUrl: import.meta.url });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "completion") {
     const { runCompletionCommand } = await import("./cli/completion.js");
     const code = await runCompletionCommand({ argv: args.slice(1) });
@@ -1064,6 +1071,7 @@ Usage:
   sanctuary doctor [opts]                 # Local environment diagnostic
   sanctuary session-binding <cmd>         # Default binding for the next start
   sanctuary check-updates                 # Explicitly check for updates
+  sanctuary verify-release [opts]         # Check an install against the signed release
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
@@ -1140,6 +1148,13 @@ Subcommands:
                        zero-outbound default. Sanctuary makes no unrequested
                        outbound connection otherwise.
                        Use "sanctuary check-updates --help" for options.
+
+  verify-release       Check an install of this package against the signed
+                       release record (npm provenance and the release
+                       manifest), file by file. Fetches only that version's
+                       records, only when run. Use --target <dir> to check
+                       another install from a copy you already trust.
+                       Use "sanctuary verify-release --help" for options.
 
   completion           Emit shell completion for bash, zsh, or fish.
 
