@@ -35,7 +35,7 @@
  * | `archive-oversize:<cap>` | an archive cap is exceeded |
  * | `installed-object-type:<path>` | a symlink, special file or hardlinked file, an excluded name that is not the excluded type, or a directory that cannot be listed |
  * | `installed-name-invalid:<path>` | an installed name whose bytes are not UTF-8; the path holds the raw bytes, escaped |
- * | `installed-name-collision:<path>` | two installed names with one NFC form |
+ * | `installed-name-collision:<path>` | two installed paths that differ only by case or NFC form |
  * | `installed-tree-oversize` | the target holds more directory entries than the walk's cap |
  * | `installed-file-missing:<path>` | an archive file or directory absent from the target |
  * | `installed-file-extra:<path>` | a file in the target that the archive does not list and that is not an excluded name |

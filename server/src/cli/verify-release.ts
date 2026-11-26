@@ -56,8 +56,9 @@ What it detects:
   - any added, removed or changed file in the checked install. It compares the
     contents and normalized names of regular files and directories, excluding
     exactly a top-level folder named node_modules and files named .DS_Store.
-    Any other spelling of those names, such as Node_Modules or .ds_store, is an
-    extra entry and refuses.
+    Each excluded name must still be a real folder or a plain file, never a
+    link. Any other spelling of those names, such as Node_Modules or
+    .ds_store, is an extra entry and refuses.
 
 What it does not detect:
   - a malicious change to the release workflow on main, or misuse of the

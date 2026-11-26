@@ -180,11 +180,14 @@ export const MAX_ARCHIVE_EXPANDED_BYTES = 4 * 132_452_876;
 /** 16 x 81 = 1,296 entries. */
 export const MAX_ARCHIVE_ENTRIES = 16 * 81;
 /**
- * Installed-walk entries the exclusions may add beyond the archive's own:
- * MAX_ARCHIVE_ENTRIES + 1 = 1,297, that is one top-level `node_modules`, plus
- * one `.DS_Store` in each directory, sized as if every archive entry were a
- * directory. The measured 1.8.4 install has 81 files in 17 directories below
- * its root, so at most 117 entries including every allowed exclusion.
+ * Installed-walk entries allowed beyond the archive's own: MAX_ARCHIVE_ENTRIES
+ * + 1 = 1,297, sized for one top-level `node_modules` plus one `.DS_Store` per
+ * directory. This is a fixed work bound, not an exact budget: parent
+ * directories that archive paths imply are not archive entries, so a release
+ * far more folder-heavy than 1.8.4 could reach it and refuse. Reaching it
+ * always refuses, never passes. The measured 1.8.4 install has 81 files in 17
+ * directories below its root, so at most 117 entries including every allowed
+ * exclusion.
  */
 export const INSTALLED_EXCLUSION_SLACK = MAX_ARCHIVE_ENTRIES + 1;
 /**

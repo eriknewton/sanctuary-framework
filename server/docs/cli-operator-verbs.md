@@ -151,9 +151,11 @@ Refusal reasons for the installed tree that are easy to misread:
   every non-ASCII name, even though the file contents are intact.
 - `installed-tree-oversize`: the install holds more entries than the check reads
   (2,593: twice the archive's 1,296-entry cap, plus one). The check stops reading
-  rather than listing the rest. Failure mode: it looks like a size limit on the
-  package, but the published package is far smaller; something large was added
-  inside the install.
+  rather than listing the rest. Failure mode: it reads like a size limit on the
+  package, and it is a fixed bound on the walk. For a current release, whose
+  install is far below it, the likely cause is many entries added inside the
+  install. A future release with many more folders could also reach it; either
+  way the check refuses and never reports `verified`.
 
 A release signed outside the windows of the committed Sigstore trusted root, for
 example after a Sigstore key rotation that Sanctuary has not yet shipped, refuses

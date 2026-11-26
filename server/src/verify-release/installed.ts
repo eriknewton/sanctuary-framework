@@ -179,7 +179,7 @@ export async function state_INSTALLED(
 
   async function walk(directory: Buffer, prefix: string): Promise<void> {
     for (const { key, path, kind, dirent } of await readDirectory(directory, prefix)) {
-      // Two names with one NFC form would be one path somewhere; the fold is taken over the NFC key.
+      // Two paths that differ only by case or NFC form would be one path on some filesystem; the fold is taken over the NFC key.
       const folded = simpleFold(key);
       if (seenFolds.has(folded)) throw new Refused(withPath("installed-name-collision", key));
       seenFolds.add(folded);
