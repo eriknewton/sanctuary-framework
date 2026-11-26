@@ -1698,13 +1698,23 @@ export class AuditLockHoldDeadlineError extends Error {
   }
 }
 
+/** The largest success-marker failure count a drain reports: the largest count a number holds exactly; the count saturates here, so its state stays bounded. */
+const MARKER_FAILURE_COUNT_MAX = Number.MAX_SAFE_INTEGER;
+
 export class AuditLogPersistenceError extends AuditPersistenceError {
-  constructor(readonly failures: readonly unknown[]) {
+  /**
+   * `failures` holds each failed tracked write and, when markers failed, only the first marker error;
+   * `markerFailureCount` counts every success marker that failed since the last report, up to MARKER_FAILURE_COUNT_MAX.
+   */
+  constructor(readonly failures: readonly unknown[], readonly markerFailureCount = 0) {
+    // The first marker error is in `failures`; each later counted marker adds one more failed write.
+    const failedWrites = failures.length + Math.max(0, markerFailureCount - 1);
     const message =
-      failures.length === 1
+      failedWrites === 1
         ? failureMessage(failures[0])
-        : `${failures.length} audit persistence writes failed`;
-    super(message, failures.length === 1 ? classifyFailure(failures[0]) : "multiple");
+        : `${failedWrites} audit persistence writes failed` +
+          (markerFailureCount > 0 ? `, ${markerFailureCount} of them success markers` : "");
+    super(message, failedWrites === 1 ? classifyFailure(failures[0]) : "multiple");
     this.name = "AuditLogPersistenceError";
   }
 }
@@ -2700,10 +2710,10 @@ export class AuditLog {
   private retentionGeneration = 0;
   private readonly pendingWrites = new Set<Promise<void>>();
   /**
-   * The first success-marker failure no drain has reported yet. A marker has no awaiting caller, so flush() is its
-   * only observer; one kept failure is enough to make the drain reject, so later ones are not kept (bounded state).
+   * The success-marker failures no drain has reported yet: the first error and a count, never a list. A marker has
+   * no awaiting caller, so flush() is its only observer; the count saturates at MARKER_FAILURE_COUNT_MAX (bounded state).
    */
-  private unreportedMarkerFailure: { readonly error: unknown } | undefined;
+  private unreportedMarkerFailures: { readonly first: unknown; count: number } | undefined;
   private pendingVisibleEntries = 0;
   private appendQueue: Promise<void> = Promise.resolve();
   private loaded = false;
@@ -3245,8 +3255,9 @@ export class AuditLog {
   /**
    * Wait for every in-flight `append()` persist (and its rotation pass) to
    * settle. Rejects with `AuditLogPersistenceError` if any tracked persist
-   * failed, or if a call's success marker failed since the last drain that
-   * reported one (the request boundary never awaits a marker). Safe to call
+   * failed, or if any call's success marker failed since the last drain that
+   * reported one (the request boundary never awaits a marker); the error's
+   * `markerFailureCount` counts those markers. Safe to call
    * multiple times — newly-appended entries during a flush are also awaited. Re-entrant only at the granularity of "drain
    * everything queued so far". Short-lived CLIs MUST call this before
    * `process.exit()` to keep audit writes durable.
@@ -3285,13 +3296,12 @@ export class AuditLog {
         if (result.status === "rejected") failures.push(result.reason);
       }
     }
-    // A failed success marker is reported like a failed append, even when it settled before this drain began.
-    if (this.unreportedMarkerFailure !== undefined) {
-      failures.push(this.unreportedMarkerFailure.error);
-      this.unreportedMarkerFailure = undefined;
-    }
+    // Every failed success marker is reported like a failed append, even when it settled before this drain began.
+    const markers = this.unreportedMarkerFailures;
+    this.unreportedMarkerFailures = undefined;
+    if (markers !== undefined) failures.push(markers.first);
     if (failures.length > 0) {
-      throw new AuditLogPersistenceError(failures);
+      throw new AuditLogPersistenceError(failures, markers?.count ?? 0);
     }
     await this.appendQueue;
   }
@@ -3313,7 +3323,9 @@ export class AuditLog {
     // A marker that never lands leaves its call's rows hidden from agent readers; the operator view is unaffected,
     // and the next flush() rejects, so a failed marker is never a silent success.
     this.trackPendingWrite(writePromise.catch((error: unknown) => {
-      this.unreportedMarkerFailure ??= { error };
+      // A failure held unreported must not hide a later one, so each failure counts, saturating at the named maximum.
+      if (this.unreportedMarkerFailures === undefined) this.unreportedMarkerFailures = { first: error, count: 1 };
+      else this.unreportedMarkerFailures.count = Math.min(this.unreportedMarkerFailures.count + 1, MARKER_FAILURE_COUNT_MAX);
       // SAFETY: stderr names only the failed marker operation, without entry content or audit-backed logging.
       console.error(`[audit-log] ${CALL_OUTCOME_SUCCESS_OPERATION} append failed`);
     }));

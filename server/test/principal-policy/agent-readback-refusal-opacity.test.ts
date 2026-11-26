@@ -24,6 +24,8 @@ import { buildAuditDigest } from "../../src/principal-policy/posture.js";
 import { Broker } from "../../src/disclosure/broker/broker.js";
 import { SecretNotFoundError, type Backend } from "../../src/disclosure/broker/backend-interface.js";
 import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
+import { gatherReputationEvidence } from "../../src/shr/tools.js";
+import { ReputationStore } from "../../src/reputation/reputation-store.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 import { expectedRefusal } from "../helpers/expected-refusal.js";
 
@@ -125,25 +127,32 @@ async function succeed(world: World, name: string, args: Record<string, unknown>
 
 /** One observation pass: every agent reader, each at its widest read. Generated identifiers are compared by position only. */
 async function observe(world: World): Promise<unknown> {
-  const opened = body(await succeed(world, "sanctuary_events_open_cursor", {}));
+  // Every reader's whole result, every content block plus isError and the envelope fields, normalized.
+  const whole: string[] = [];
+  const reader = async (name: string, args: Record<string, unknown> = {}): Promise<CallResult> => {
+    const result = await succeed(world, name, args);
+    whole.push(normalizeWhole(world, result));
+    return result;
+  };
+  const opened = body(await reader("sanctuary_events_open_cursor", {}));
   const pages: Array<Array<[unknown, unknown, unknown, unknown]>> = [];
   for (let page = 0; page < EVENT_PAGES_READ; page += 1) {
-    const read = body(await succeed(world, "sanctuary_events_read", { cursor: opened.cursor, opts: { limit: EVENTS_PER_PAGE } }));
-    const events = read.events as Array<Record<string, unknown>>;
+    const pageRead = body(await reader("sanctuary_events_read", { cursor: opened.cursor, opts: { limit: EVENTS_PER_PAGE } }));
+    const events = pageRead.events as Array<Record<string, unknown>>;
     pages.push(events.map((e) => [e.cursor_event_id, e.operation, e.result, e.has_details]));
     if (events.length === 0) break;
   }
-  await succeed(world, "sanctuary_events_close", { cursor: opened.cursor });
-  const searched = body(await succeed(world, "sanctuary_audit_search", { query: MATCH_EVERY_ROW, limit: AUDIT_SEARCH_MAX_LIMIT }));
+  await reader("sanctuary_events_close", { cursor: opened.cursor });
+  const searched = body(await reader("sanctuary_audit_search", { query: MATCH_EVERY_ROW, limit: AUDIT_SEARCH_MAX_LIMIT }));
   const search = (searched.results as Array<Record<string, unknown>>).map((r) => [r.audit_ref, r.operation, r.verification, r.summary]);
-  const monitored = body(await succeed(world, "monitor_audit_log", { limit: 1_000 }));
+  const monitored = body(await reader("monitor_audit_log", { limit: 1_000 }));
   const monitor = {
     count: monitored.count,
     rows: (monitored.entries as Array<Record<string, unknown>>).map((e) => [e.operation, e.result, e.has_details]),
   };
   const siem: Record<string, unknown> = {};
   for (const format of SIEM_EXPORT_FORMATS) {
-    const exported = await succeed(world, "audit_export_siem", { format, limit: 1_000 });
+    const exported = await reader("audit_export_siem", { format, limit: 1_000 });
     const head = body(exported);
     const events = (exported.content as Array<{ text: string }>)[1]!.text;
     siem[format] = {
@@ -154,7 +163,7 @@ async function observe(world: World): Promise<unknown> {
       contents: normalizeTimes(events),
     };
   }
-  return { pages, search, monitor, siem };
+  return { pages, search, monitor, siem, whole };
 }
 
 // Rows written before observation carry each world's own write time; only their order and contents are compared.
@@ -164,6 +173,18 @@ const EPOCH_MILLIS = /\b\d{13}\b/g;
 
 function normalizeTimes(text: string): string {
   return text.replace(ISO_TIMESTAMP, "<timestamp>").replace(EPOCH_MILLIS, "<epoch_ms>");
+}
+
+// Must match the cursor id shape `cursor:<24 hex>` and the audit_ref shape `audit:<operation>:<16 hex>` the cooperative surface returns.
+const CURSOR_ID = /cursor:[0-9a-f]{24}/g;
+const AUDIT_REF = /audit:[a-z_]+:[0-9a-f]{16}/g;
+
+/** A reader's whole result serialized, with times, the world's own identity and per-call random identifiers normalized. */
+function normalizeWhole(world: World, result: CallResult): string {
+  return normalizeTimes(JSON.stringify(result))
+    .split(world.identityId).join("<self>")
+    .replace(CURSOR_ID, "<cursor>")
+    .replace(AUDIT_REF, "<audit_ref>");
 }
 
 /** Both worlds' observation passes under one frozen clock, so no reading depends on when a world was observed. */
@@ -363,6 +384,70 @@ describe("a refused call adds nothing to any agent reader", () => {
     });
     const observed = await observeFrozen(treatment, control);
     expect(observed.treatment).toEqual(observed.control);
+  }, 240_000);
+});
+
+// The publish endpoint path reputation_publish posts to; the mocked transport answers it and nothing else.
+const PUBLISH_PATH = "/api/publish";
+// A status the publish endpoint can answer with that the tool reports as not published.
+const PUBLISH_REFUSED_STATUS = 403;
+const PUBLISH_DATA = { sovereigntyLayers: [], reputationDimensions: [], capabilities: [], overallScore: 0 };
+
+/** The transport, mocked as seam12-shr-publish-evidence mocks it: no call leaves the process, and only the publish path answers. */
+function mockPublishTransport(status: number): void {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (!url.endsWith(PUBLISH_PATH)) throw new Error("unexpected transport call");
+    return { ok: status < 400, status, json: async () => ({ success: status < 400 }) } as unknown as Response;
+  });
+}
+
+/** The SHR reputation evidence the agent-reachable SHR tools gather for this world's identity. */
+async function shrEvidence(world: World): Promise<string> {
+  const identity = world.app.identityManager.get(world.identityId)!;
+  return JSON.stringify(await gatherReputationEvidence(new ReputationStore(world.storage, world.app.masterKey), world.app.auditLog, identity));
+}
+
+describe("reputation_publish through the router adds nothing to any agent reader or the SHR evidence", () => {
+  it("a publish the endpoint refuses leaves every agent reader and the SHR evidence byte-equal to a world without it", async () => {
+    mockPublishTransport(PUBLISH_REFUSED_STATUS);
+    const control = await boot();
+    const treatment = await boot();
+    expect(await call(treatment, "reputation_publish", { type: "shr", data: PUBLISH_DATA })).toEqual(expectedRefusal());
+    // The operator sees the publish row the refused call wrote, so the comparison below is not vacuous.
+    const publishRows = (await operatorRows(treatment)).filter((row) => row.operation === "reputation_publish" && row.identity_id === treatment.identityId);
+    expect(publishRows).toHaveLength(1);
+    expect(await ledgerCause(treatment, "reputation_publish")).toBe("post_allow_refusal");
+    const observed = await observeFrozen(treatment, control);
+    expect(observed.treatment).toEqual(observed.control);
+    expect(await shrEvidence(treatment)).toBe(await shrEvidence(control));
+  }, 240_000);
+
+  it("a publish cancelled after its success row is written leaves every agent reader and the SHR evidence byte-equal to a world without it", async () => {
+    mockPublishTransport(200);
+    const control = await boot();
+    const treatment = await boot();
+    const controller = new AbortController();
+    const appendCritical = treatment.app.auditLog.appendCritical.bind(treatment.app.auditLog);
+    vi.spyOn(treatment.app.auditLog, "appendCritical").mockImplementation(async (entry) => {
+      await appendCritical(entry);
+      // Cancelled once the publish row is durable, before the handler returns its success.
+      if (entry.operation === "reputation_publish") controller.abort();
+    });
+    use(treatment);
+    // The router's own request handler, so the cancel reaches the call's signal at once.
+    const handler = (treatment.app.server as unknown as { _requestHandlers: Map<string, (request: unknown, extra: unknown) => Promise<unknown>> })
+      ._requestHandlers.get("tools/call")!;
+    const result = await handler({ method: "tools/call", params: { name: "reputation_publish", arguments: { type: "shr", data: PUBLISH_DATA } } }, { signal: controller.signal });
+    expect(result).toEqual(expectedRefusal());
+    expect(await ledgerCause(treatment, "reputation_publish")).toBe("call_cancelled");
+    // The operator sees a success publish row for this identity, which the gather would count if it were not filtered.
+    const publishRows = (await operatorRows(treatment)).filter((row) => row.operation === "reputation_publish" && row.identity_id === treatment.identityId);
+    expect(publishRows.map((row) => (row as { result?: string }).result)).toEqual(["success"]);
+    const observed = await observeFrozen(treatment, control);
+    expect(observed.treatment).toEqual(observed.control);
+    expect(await shrEvidence(treatment)).toBe(await shrEvidence(control));
+    expect(JSON.parse(await shrEvidence(treatment)).verascore_linked).toBe(false);
   }, 240_000);
 });
 

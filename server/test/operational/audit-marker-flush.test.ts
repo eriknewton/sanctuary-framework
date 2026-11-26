@@ -93,6 +93,55 @@ describe("flush reports a failed success marker", () => {
     expect(rows.map((row) => row.operation)).toEqual(["own_row", CALL_OUTCOME_SUCCESS_OPERATION]);
   });
 
+  it("two markers that fail before one flush make it reject and report both, and a later flush resolves", async () => {
+    let failNext = false;
+    const r = rig(() => { failNext = true; });
+    const writes = r.auditLog as unknown as PrivateWrites;
+    const original = writes.writeAuditEntryBytes.bind(r.auditLog);
+    vi.spyOn(writes, "writeAuditEntryBytes").mockImplementation(async (key, bytes) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("injected store refusal");
+      }
+      return original(key, bytes);
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await r.call()).toEqual(toolResult(OK_BODY));
+    expect(await r.call()).toEqual(toolResult(OK_BODY));
+    // Both markers settle before flush is called.
+    for (let i = 0; i < 50; i++) await new Promise((resolve) => setImmediate(resolve));
+    const reported = await r.auditLog.flush().then(() => undefined, (error: unknown) => error);
+    expect(reported).toBeInstanceOf(AuditLogPersistenceError);
+    // Every failed marker is counted; none is dropped while an earlier one is held.
+    expect((reported as AuditLogPersistenceError).message).toMatch(/^2 audit persistence writes failed/);
+    expect((reported as AuditLogPersistenceError).markerFailureCount).toBe(2);
+    await expect(r.auditLog.flush()).resolves.toBeUndefined();
+    const rows = (await r.auditLog.query({ limit: 100, include_outcome_markers: true })).entries;
+    expect(rows.map((row) => row.operation)).toEqual(["own_row", "own_row"]);
+  });
+
+  it("a marker that fails after a flush has already reported and cleared makes the next flush reject again", async () => {
+    let failNext = false;
+    const r = rig(() => { failNext = true; });
+    const writes = r.auditLog as unknown as PrivateWrites;
+    const original = writes.writeAuditEntryBytes.bind(r.auditLog);
+    vi.spyOn(writes, "writeAuditEntryBytes").mockImplementation(async (key, bytes) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("injected store refusal");
+      }
+      return original(key, bytes);
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await r.call()).toEqual(toolResult(OK_BODY));
+    await expect(r.auditLog.flush()).rejects.toBeInstanceOf(AuditLogPersistenceError);
+    expect(await r.call()).toEqual(toolResult(OK_BODY));
+    for (let i = 0; i < 50; i++) await new Promise((resolve) => setImmediate(resolve));
+    await expect(r.auditLog.flush()).rejects.toBeInstanceOf(AuditLogPersistenceError);
+    // A third flush with no new failure resolves.
+    await expect(r.auditLog.flush()).resolves.toBeUndefined();
+  });
+
   it("a successful call whose marker lands leaves flush resolving", async () => {
     const r = rig(() => undefined);
     expect(await r.call()).toEqual(toolResult(OK_BODY));

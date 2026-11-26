@@ -29,6 +29,8 @@ const ISO_TIMESTAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
 const AUDIT_REF = /audit:[a-z_]+:[0-9a-f]{16}/g;
 
 type Handler = (req: unknown, extra: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+// The registry row the broker's token rows feed; the operator panel's count of it must include a refused request.
+const SECRET_BROKER_FEATURE = "secret_broker";
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"], now: FROZEN_AT });
@@ -104,11 +106,14 @@ async function world() {
       const result = await brokerHandler({ method: "tools/call", params: { name: "broker/request_token", arguments: { skill: "gmail-triage", secret } } }, { signal: new AbortController().signal });
       expect(result.isError).toBe(true);
     },
-    /** The tool's output text with timestamps and its own audit reference normalized. */
+    /**
+     * The tool's whole result, every content block plus isError and every envelope field, serialized with
+     * timestamps and its own audit reference normalized; a difference in any block is a difference here.
+     */
     read: async () => {
       await auditLog.flush();
-      const text = (await protections.handler({}, "agent:protections", {})).content[0]!.text;
-      return text.replace(ISO_TIMESTAMP, "<timestamp>").replace(AUDIT_REF, "<audit_ref>");
+      const result = await protections.handler({}, "agent:protections", {});
+      return JSON.stringify(result).replace(ISO_TIMESTAMP, "<timestamp>").replace(AUDIT_REF, "<audit_ref>");
     },
   };
 }
@@ -130,14 +135,27 @@ describe("sanctuary_active_protections follows the agent visibility rule", () =>
   });
 
   it("the operator's feature-health panel still counts the refused request", async () => {
+    const control = await world();
     const treatment = await world();
     await treatment.requestToken("never-granted");
+    await control.auditLog.flush();
     await treatment.auditLog.flush();
-    const operator = await buildFeatureHealthPanel({ auditLog: treatment.auditLog, originMachine: "local", registry: SLICE1_FEATURE_REGISTRY, protectionClaimSubject: null });
+    const brokerRow = async (auditLog: AuditLog, agentVisible?: true) =>
+      (await buildFeatureHealthPanel({ auditLog, originMachine: "local", registry: SLICE1_FEATURE_REGISTRY, protectionClaimSubject: null, agentVisible }))
+        .rows.find((row) => row.feature_id === SECRET_BROKER_FEATURE)!;
     const operatorRows = (await treatment.auditLog.query({ limit: 1_000 })).entries.map((e) => e.operation);
     expect(operatorRows).toContain(BROKER_OPS.TOKEN_DENIED);
-    const agent = await buildFeatureHealthPanel({ auditLog: treatment.auditLog, originMachine: "local", registry: SLICE1_FEATURE_REGISTRY, protectionClaimSubject: null, agentVisible: true });
-    expect(JSON.stringify(operator)).not.toBe(JSON.stringify(agent));
+    // Polarity: the operator panel itself shows the refused request, one more than a world without it.
+    const operator = await brokerRow(treatment.auditLog);
+    const operatorControl = await brokerRow(control.auditLog);
+    expect(operatorControl.invocation_count).toBe(0);
+    expect(operator.invocation_count).toBe(1);
+    expect(operator.status).toBe("active");
+    expect(operator.last_evidence_at).not.toBeNull();
+    // The agent panel over the same log leaves it out.
+    const agent = await brokerRow(treatment.auditLog, true);
+    expect(agent.invocation_count).toBe(0);
+    expect(agent).toEqual(operatorControl);
   });
 
   it("the custody panel an agent caller builds leaves out a refused call's custody row, and the operator's keeps it", async () => {
