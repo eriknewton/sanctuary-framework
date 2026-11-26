@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+- Added [COMMITMENTS.md](COMMITMENTS.md), the list of promises Sanctuary makes to the people who run it. Each promise names its evidence, where it is enforced, where it holds, what it does not cover and a check you can run, and ties to its Assurance Matrix row. A change to a promise now needs a labelled pull request, a line under "Commitments changed" below, and a preview release at least seven days before the stable release; see [GOVERNANCE.md](GOVERNANCE.md).
+- The Assurance Matrix now reads `proven (tests)` for the 13 rows whose proof is automated tests, pull requests or source code alone. A bare `proven` now always means the row cites a captured drill, and the matrix guard refuses a bare `proven` row without one. The machine-readable copies follow the matrix: the 13 rows carry `"status": "proven (tests)"` in `docs/assurance-matrix.json`, and they now appear in the `bounds` list of `docs/.well-known/product-facts.json`.
 - Doctor and `sanctuary status` report wall, agent and coverage readings from the same evaluator. Dashboard and posture pages show English badges whose readings expire when evidence stops.
 - The evidence-pack verifier candidate build now checks the packed tarball's exact contents, adds a check-evidence-pack-artifact command; the installed verifier refuses to run from a package marked non-release or whose classification cannot be established.
 
@@ -25,6 +27,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Added an isolated per-role record-signing contract, encrypted key provider and inert native signer service with an attended terminal ceremony, capability-free peers and restart-persistent worker uncertainty, monotonic kill deadlines, fault-latched cleanup settlement and cooperative cleanup that tolerates a concurrent LOCK. Daemon boot, application writers and readers, Mac and pack adapters, and installed acceptance remain pending.
 - Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
 - Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Recipient verification CLI and packaging are not included.
+
+### Commitments changed
+
+- C-01: added. Sanctuary does not update itself.
+- C-02: added. Every 1.8 release carries a signature you can check yourself.
+- C-03: added. In a recorded drill, Sanctuary made no network connection you did not ask for (observed on one Linux host for version 1.8.4 only; the limits are in COMMITMENTS.md).
+- C-04: added. Your keys are created on your machine, and no copy is sent to us.
+- C-05: added. What Sanctuary stores is encrypted, and a tampered entry fails to open.
+- C-06: added. Actions you require approval for wait for you, and are refused if you cannot be reached.
+- C-07: added. Sanctuary keeps a tamper-evident record of what it did, and you can check that record.
+- C-08: added. You can take your data and leave.
+- C-09: added. On Ubuntu 24.04, an agent in its own account reaches only the destinations your signed policy allows.
+- C-10: added. On macOS, an agent in its own account is blocked from destinations your signed policy does not allow, including after restarts you attend.
+- C-11: added. An agent confined by Castle Wall cannot rewrite its own network rules.
+- C-12: added. Sanctuary's tools never return your private keys.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
