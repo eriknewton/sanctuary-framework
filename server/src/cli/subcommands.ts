@@ -67,6 +67,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "transparency",
   "uninstall", // must match EVALUATE_CLI_GUIDANCE.uninstall in server/src/agent-native/capabilities-catalog.ts
   "verify-exit-bundle",
+  "verify-release", // must match the dispatch block in server/src/cli.ts and runVerifyReleaseCommand in cli/verify-release.ts
   "verify-transparency",
   "wrap",
 ] as const;
