@@ -1,3 +1,4 @@
+// fail-before-exempt: the gate this checks lives only under server/test (live.test.ts and live-gate.ts), which the fail-before check keeps at HEAD while it reverts server/src, so no server/src revert can make it fail; its fail-before evidence is the run at ca1ceb9d, where the gate check failed because live.test.ts did not gate on CI.
 /**
  * The networked verify-release live test is skipped in CI whatever its opt-in
  * variable says. This checks the gate predicate over the environment shapes
