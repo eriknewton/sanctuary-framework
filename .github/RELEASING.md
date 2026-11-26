@@ -10,6 +10,10 @@ Publish intent is separate from tag intent. Tag pushes do not publish; manual wo
 4. Type the version string from `server/package.json` into the `version` input (do not prefix with `v`). The workflow always checks out the immutable matching tag (`v<version>`); publishing an arbitrary branch or SHA is intentionally unsupported.
 5. Click "Run workflow". The pipeline verifies the input, runs the release gates, packs one tarball, signs those exact bytes in an isolated job, stages a draft GitHub Release, publishes that tarball through npm Trusted Publishing, and only then makes the GitHub Release visible. Pre-release versions publish under `next`; plain versions publish under `latest`.
 
+### Commitment changes before a stable release
+
+Before dispatching a stable (non-pre-release) version, read every `### Commitments changed` line released since the previous stable version. Each line not marked `(correction)` must already have shipped, with identical text in `COMMITMENTS.md` and its backing matrix row, in a pre-release published to npm's `next` channel at least 7 days earlier (`npm view @sanctuary-framework/mcp-server time --json` lists publish times). If one has not, ship a pre-release first and wait. This check is manual today; no workflow enforces it yet. Failure mode: a promise change reaches `latest` users the same day it is written, and nothing on the release page shows the wait was skipped.
+
 ## Required repo secrets
 
 - `RELEASE_SIGNING_KEY` (canonical unpadded base64url of the 32-byte Ed25519 release-signing seed; activated 2026-07-01). Only the isolated `sign-release` job receives it. The signer derives its public key and requires an exact match with the public key pinned by shipped clients before signing. The seed also has an off-host operator escrow; restore from escrow if lost. A newly minted seed is not a substitute because shipped clients would not trust it.

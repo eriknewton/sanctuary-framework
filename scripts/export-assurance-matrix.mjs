@@ -333,6 +333,11 @@ function build(stamp) {
   for (const row of rows) {
     (platforms[row.platform] ??= []).push({ claim: row.claim, status: row.status, bounds: row.bounds });
   }
+  // Only a bare `proven` row (proof includes a captured drill) stays out of the
+  // bounds list. A `proven (tests)` row is listed here on purpose: its proof is
+  // tests alone, and an agent reading only this list must still see its gap.
+  // Must match PROVEN_STATUS in scripts/check-assurance-matrix.mjs, whose
+  // invariant 3 is what guarantees every bare `proven` row cites a drill.
   const bounds = rows
     .filter((row) => row.status !== "proven")
     .map((row) => ({ claim: row.claim, status: row.status, bounds: row.bounds }));
