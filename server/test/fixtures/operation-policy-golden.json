@@ -120,6 +120,7 @@
     "sanctuary_events_read",
     "sanctuary_help",
     "sanctuary_hide",
+    "sanctuary_local_task",
     "sanctuary_recall",
     "sanctuary_remember",
     "sanctuary_who_am_i",

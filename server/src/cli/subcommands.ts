@@ -38,6 +38,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "intelligence",
   "license",
   "liveness-probe",
+  "local", // must match the dispatch block in server/src/cli.ts and runLocalCommand in cli/local-results.ts
   "memory_archive_export",
   "memory_archive_import",
   "memory_provenance_mark_bad_signer",
@@ -53,6 +54,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "protect",
   "reset-passphrase",
   "restore-attest",
+  "results", // must match the dispatch block in server/src/cli.ts and runResultsCommand in cli/local-results.ts
   "rotate-master",
   "sdw-owner",
   "secrets",

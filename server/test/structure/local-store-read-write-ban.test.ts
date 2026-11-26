@@ -18,7 +18,9 @@ import { createTempFortress, TEST_PASSPHRASE } from "../helpers/temp-fortress.js
 
 type Args = Record<string, unknown>;
 type Driver = { class: "no_namespace_input"; reason: string } |
-  { class: "addresses_namespace" | "skips_reserved_namespace"; reason: string; args: (name: string) => Promise<Args | Args[]> | Args | Args[] };
+  { class: "addresses_namespace" | "skips_reserved_namespace" | "fixed_response_refusal"; reason: string; args: (name: string) => Promise<Args | Args[]> | Args | Args[] };
+// Must match INVALID_INPUT_TEXT in src/local-recompile/responses.ts: the local task tool never returns an error result.
+const LOCAL_TASK_INVALID_INPUT = '{"status":"invalid_input"}';
 const namespaceArgs = (namespace: string) => ({ namespace, key: "one" });
 const facadeArgs = (namespace: string) => ({ key: "one", opts: { namespace } });
 const importBundles = new Map<string, string>();
@@ -132,6 +134,8 @@ const drivers: Record<string, Driver> = {
   "sanctuary_audit_search": { class: "no_namespace_input", reason: "takes query, scope, limit; none selects a storage namespace" },
   "sanctuary_compound_execute": { class: "addresses_namespace", reason: "accepts a namespace in its direct fields or structured payload", args: (namespace) => ["sanctuary_remember", "sanctuary_recall", "sanctuary_hide", "sanctuary_forget"].map((tool) => ({ steps: [{ tool, args: { ...facadeArgs(namespace), value: "fixture", mode: "secure", approval_ref: "fixture" } }] })) },
   "sanctuary_distress": { class: "no_namespace_input", reason: "takes reason, severity, detail; none selects a storage namespace" },
+  "sanctuary_local_task": { class: "fixed_response_refusal", reason: "accepts namespaces in its source refs and answers a reserved one with its fixed invalid-input response",
+    args: (namespace) => ({ kind: "summarize", sources: { refs: [{ namespace, key: "one" }] }, instruction: "fixture" }) },
   "manifest": { class: "no_namespace_input", reason: "takes no input fields" },
   "governor_status": { class: "no_namespace_input", reason: "takes no input fields" },
   "governor_reset": { class: "no_namespace_input", reason: "takes confirm; none selects a storage namespace" },
@@ -237,6 +241,9 @@ it.each(Object.entries(drivers).filter(([, driver]) => driver.class !== "no_name
           calls.length = 0;
           const reference = await client!.callTool({ name: tool, arguments: await driver.args("_identities") as Args });
           expect(actual).toEqual(importResponse(reference));
+        } else if (driver.class === "fixed_response_refusal") {
+          expect(response.isError, `${tool}: ${namespace}`).not.toBe(true);
+          expect((response.content as Array<{ text: string }>)[0]!.text, `${tool}: ${namespace}`).toBe(LOCAL_TASK_INVALID_INPUT);
         } else {
           expect(response.isError, `${tool}: ${namespace}`).toBe(true);
         }

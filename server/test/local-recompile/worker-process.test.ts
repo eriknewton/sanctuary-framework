@@ -20,10 +20,13 @@ import {
   assertSendable,
   WorkerProtocolError,
 } from "../../src/local-recompile/worker-protocol.js";
+import { resolveCustodyLockRoot } from "../../src/storage/cross-process-lock.js";
 import { SHORT_SOCKET_TMP_PARENT } from "../helpers/short-socket-tmp-parent.js";
 import { FIXTURE_SEAT, fixtureRequestId } from "./__fixtures__/strict-memory-storage.js";
 
 const MASTER_KEY_BYTES = 32; // AES-256 master key
+// The lock root this test process resolves, which the worker is handed in init.
+const TEST_LOCK_ROOT = resolveCustodyLockRoot(process.getuid!(), { env: process.env, platform: process.platform });
 const STORE_KEY_BYTES = 32;
 // Bounded graceful wait before SIGKILL when reaping a fixture child.
 const REAP_GRACE_MS = 2_000;
@@ -112,6 +115,7 @@ function startClient(storageRoot: string, keys: { oplogKey: Uint8Array; resultsK
   const events = new EventEmitter();
   const client = new LocalWorkerClient({
     storageRoot,
+    custodyLockRoot: TEST_LOCK_ROOT,
     oplogKey: keys.oplogKey,
     resultsKey: keys.resultsKey,
     spawn: recordingSpawn(extra.sent ?? [], extra.spawnOptions),
@@ -210,7 +214,7 @@ describe("local job worker process", () => {
     const { keys } = await fortress();
     const fake = new FakeChild();
     const clock = manualTimers();
-    const client = new LocalWorkerClient({ storageRoot: "/fixture", ...keys, spawn: () => fake as unknown as ChildProcess, timers: clock.timers });
+    const client = new LocalWorkerClient({ custodyLockRoot: TEST_LOCK_ROOT, storageRoot: "/fixture", ...keys, spawn: () => fake as unknown as ChildProcess, timers: clock.timers });
     client.start();
     fake.emit("message", { type: "ready", extra: true });
     fake.emit("message", "not an object");
@@ -231,9 +235,9 @@ describe("local job worker process", () => {
     const child = fork(modulePath, [], { execArgv, stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
     children.add(child);
     const ready = once(child, "message");
-    child.send({ type: "init", storage_root: "relative/path", oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    child.send({ type: "init", storage_root: "relative/path", custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     child.send({ type: "nonsense" });
-    child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    child.send({ type: "init", storage_root: storageRoot, custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     expect((await ready)[0]).toEqual({ type: "ready" });
   }, 60_000);
 
@@ -244,6 +248,7 @@ describe("local job worker process", () => {
     const delays: number[] = [];
     const client = new LocalWorkerClient({
       storageRoot: "/fixture",
+      custodyLockRoot: TEST_LOCK_ROOT,
       ...keys,
       timers: clock.timers,
       spawn: () => { const child = new FakeChild(); fakes.push(child); return child as unknown as ChildProcess; },
@@ -300,7 +305,7 @@ describe("local job worker process", () => {
     const child = fork(modulePath, [], { execArgv, stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
     children.add(child);
     const ready = once(child, "message");
-    child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    child.send({ type: "init", storage_root: storageRoot, custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     await ready;
     const exited = once(child, "exit");
     child.disconnect();
@@ -342,7 +347,7 @@ describe("local job worker process", () => {
     // The worker exits right after its fault, so the exit wait is attached before anything is sent.
     const exited = once(child, "exit");
     const reply = once(child, "message");
-    child.send({ type: "init", storage_root: join(notADirectory, "state"), oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    child.send({ type: "init", storage_root: join(notADirectory, "state"), custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     const [message] = await reply;
     expect(message).toEqual({ type: "fault", kind: "store_open" });
     expect(keyBuffers(message)).toEqual([]);
@@ -357,10 +362,10 @@ describe("local job worker process", () => {
     const exited = once(child, "exit");
     // The second init is sent only after the first has finished, so this is the running-worker case.
     const ready = once(child, "message");
-    child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    child.send({ type: "init", storage_root: storageRoot, custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     expect((await ready)[0]).toEqual({ type: "ready" });
     const reply = nextMessage(child, (message) => message.type === "fault");
-    child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+    child.send({ type: "init", storage_root: storageRoot, custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     expect(await reply).toEqual({ type: "fault", kind: "init_invalid" });
     await exited;
   }, 60_000);
@@ -399,11 +404,11 @@ async function gatedWorker(mode: string) {
       await store.ensure();
       return (await log.verifyChain()).ok;
     },
-    init: () => child.send({ type: "init", storage_root: storageRoot, oplog_key: keys.oplogKey, results_key: keys.resultsKey }),
+    init: () => child.send({ type: "init", storage_root: storageRoot, custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey }),
     /** An init whose stores cannot open, so the worker faults with store_open. */
     failingInit: async () => {
       await writeFile(notADirectory, "not a fortress");
-      child.send({ type: "init", storage_root: join(notADirectory, "state"), oplog_key: keys.oplogKey, results_key: keys.resultsKey });
+      child.send({ type: "init", storage_root: join(notADirectory, "state"), custody_lock_root: TEST_LOCK_ROOT, oplog_key: keys.oplogKey, results_key: keys.resultsKey });
     },
     /** The fixture's record and the exit code, once the child has exited. */
     record: async (): Promise<GatedRecord & { exitCode: number | null }> => {
@@ -511,6 +516,7 @@ describe("local job worker client protocol states", () => {
     const events: WorkerClientEvent[] = [];
     const client = new LocalWorkerClient({
       storageRoot: options.storageRoot ?? "/fixture",
+      custodyLockRoot: TEST_LOCK_ROOT,
       ...keys,
       timers: clock.timers,
       spawn: () => { const child = options.child?.() ?? new FakeChild(); fakes.push(child); return child as unknown as ChildProcess; },
@@ -583,7 +589,7 @@ describe("local job worker client protocol states", () => {
 
   it("a storage root the worker would refuse is refused at construction", async () => {
     const { keys } = await fortress();
-    expect(() => new LocalWorkerClient({ storageRoot: "relative/state", ...keys, spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow(WorkerProtocolError);
+    expect(() => new LocalWorkerClient({ custodyLockRoot: TEST_LOCK_ROOT, storageRoot: "relative/state", ...keys, spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow(WorkerProtocolError);
   });
 
   it("a backlogged channel refuses sends until that write is delivered, and an error never clears it", async () => {
@@ -733,7 +739,7 @@ describe("local job worker client protocol states", () => {
     const { keys } = await fortress();
     const fill = vi.spyOn(Uint8Array.prototype, "fill");
     try {
-      expect(() => new LocalWorkerClient({ storageRoot: "relative/state", ...keys, spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow(WorkerProtocolError);
+      expect(() => new LocalWorkerClient({ custodyLockRoot: TEST_LOCK_ROOT, storageRoot: "relative/state", ...keys, spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow(WorkerProtocolError);
       const zeroed = fill.mock.contexts.filter((target, index) => (target as Uint8Array).length === STORE_KEY_BYTES && fill.mock.calls[index]![0] === 0);
       expect(zeroed).toHaveLength(2);
       expect((zeroed as Uint8Array[]).every((key) => key.every((byte) => byte === 0))).toBe(true);
@@ -749,7 +755,7 @@ describe("local job worker client protocol states", () => {
     const SHORT_KEY_BYTES = 16; // half an AES-256 key, refused by the key copy
     const fill = vi.spyOn(Uint8Array.prototype, "fill");
     try {
-      expect(() => new LocalWorkerClient({ storageRoot: "/fixture", oplogKey: keys.oplogKey, resultsKey: new Uint8Array(SHORT_KEY_BYTES), spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow();
+      expect(() => new LocalWorkerClient({ custodyLockRoot: TEST_LOCK_ROOT, storageRoot: "/fixture", oplogKey: keys.oplogKey, resultsKey: new Uint8Array(SHORT_KEY_BYTES), spawn: () => new FakeChild() as unknown as ChildProcess })).toThrow();
       const zeroed = fill.mock.contexts.filter((target, index) => (target as Uint8Array).length === STORE_KEY_BYTES && fill.mock.calls[index]![0] === 0);
       expect(zeroed).toHaveLength(1);
       expect(zeroed[0] as Uint8Array).not.toBe(keys.oplogKey);

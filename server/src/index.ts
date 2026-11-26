@@ -78,6 +78,7 @@ import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
+import { composeLocalTask, type ComposedLocalTask, type LocalTaskStatus, type LocalTaskTestSeams } from "./local-recompile/compose.js";
 import { assertToolOutcomesRegistered } from "./tool-outcome.js";
 import { DenialLedger } from "./agent-native/denial-ledger.js";
 import { toolResult } from "./router.js";
@@ -220,6 +221,8 @@ export interface SanctuaryServer {
   masterKey: Uint8Array;
   auditLog: AuditLog;
   policy: PrincipalPolicy;
+  /** The local task tool's arming state and worker liveness, for operator surfaces only. */
+  localTask: LocalTaskStatus;
   /**
    * Idempotent async cleanup: stop MCP admission, sentinel/anomaly/inbox
    * ticks, the selected approval channel (dashboard or webhook), and proxy
@@ -371,6 +374,15 @@ export async function createSanctuaryServer(options?: {
   __testReadStoredPassphrase?: typeof readStoredPassphrase;
   /** TEST ONLY: fake the machine-local custody-key read used by hands-free boot. */
   __testReadKeychainCustody?: typeof readKeychainCustodyKeyStatus;
+  /**
+   * TEST ONLY, honoured only when process.env.VITEST is set: the local task
+   * tool's composition seams. `spawnWorker` opts in to starting the worker;
+   * `auditLogConfig` passes retention caps to the shared audit log. No other
+   * src/ file names this option (test/structure/local-task-test-seams.test.ts).
+   */
+  __testLocalTask?: LocalTaskTestSeams & {
+    auditLogConfig?: { maxEntries?: number; maxTotalSizeBytes?: number };
+  };
   // MUST MATCH the same pair of seams on the standalone dashboard boot:
   // `__testReadStoredPassphrase` / `__testReadKeychainCustody` on
   // `StandaloneDashboardOptions` in `src/dashboard-standalone.ts`. Both boots
@@ -521,6 +533,9 @@ export async function createSanctuaryServer(options?: {
   }
   const constructionWork = new ConstructionWork();
   let startupScreen: ResponseScreen | undefined;
+  let startupLocalTask: ComposedLocalTask | undefined;
+  // The local task seams exist only for the test suite; a production boot ignores them.
+  const testLocalTask = process.env.VITEST ? options?.__testLocalTask : undefined;
   try {
   const responseScreen = new ResponseScreen(); // Host lifetime begins tainted, independent of proxy configuration.
   startupScreen = responseScreen;
@@ -530,7 +545,7 @@ export async function createSanctuaryServer(options?: {
   const recoveryKey = custody.mintedRecoveryKey;
 
   // 5. Initialize audit log
-  const auditLog = new AuditLog(storage, masterKey);
+  const auditLog = new AuditLog(storage, masterKey, testLocalTask?.auditLogConfig);
 
   // 5b. G-2 (coordinator gate, 2026-08-22): roll back any interrupted
   // exit-import BEFORE any other subsystem below reads or writes storage,
@@ -2311,6 +2326,28 @@ export async function createSanctuaryServer(options?: {
       : {}),
   });
 
+  // 16z. Arm the local task tool: the worker starts only over boot-owned
+  // filesystem storage, and the tool is listed either way, disarmed with its
+  // cause on any failure. Must match the arming rules in local-recompile/compose.ts.
+  const localTask = await composeLocalTask({
+    bootOwnsStorage,
+    storage: storage as FilesystemStorage,
+    storageRoot: resolvePath(`${config.storage_path}/${FORTRESS_STATE_DIRECTORY}`),
+    masterKey,
+    auditLog,
+    binding: intelligenceSelector,
+    policy,
+    identities: () => identityManager.list().flatMap((identity) => {
+      const stored = identityManager.get(identity.identity_id);
+      return stored ? [stored] : [];
+    }),
+    underVitest: process.env.VITEST !== undefined,
+    ...(testLocalTask ? { test: testLocalTask } : {}),
+  });
+  startupLocalTask = localTask;
+  // The operator-only local task routes; the dashboard authenticates them before they run.
+  dashboard?.setLocalSurface(localTask.operator);
+
   // 17. Assemble all tools
   let allTools: ToolDefinition[] = [
     ...l1Tools,
@@ -2342,6 +2379,7 @@ export async function createSanctuaryServer(options?: {
     ...cooperativeTools,
     ...distressTools,
     manifestTool,
+    localTask.tool,
   ];
 
   // 17a. Initialize proxy layer for upstream MCP servers (if configured)
@@ -2508,6 +2546,8 @@ export async function createSanctuaryServer(options?: {
         // server.close() is async (SDK Protocol.close); awaiting it ensures the
         // transport is fully torn down before we flush persistence below.
         try { await server.close(); } catch (e) { errors.push(e); }
+        // The local worker stops after admission closes and before the final audit flush.
+        try { await localTask.close(); } catch (e) { errors.push(e); }
         // Stop future ticks independently so a failure in one does not block others.
         try { unifiedInboxScheduler.stop(); } catch (e) { errors.push(e); }
         // Stop future calibration audit production before the final flush.
@@ -2590,6 +2630,7 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     auditLog,
     policy,
+    localTask: localTask.status,
     cleanup,
   };
   } catch (error) {
@@ -2597,6 +2638,8 @@ export async function createSanctuaryServer(options?: {
     await constructionWork.drain();
     // Scanner cleanup cannot skip the custody scrub if cleanup itself fails.
     try { await startupScreen?.close(); } catch { /* Preserve the startup failure below. */ }
+    // A worker started before the failure is stopped, so a failed start leaves no process behind.
+    try { await startupLocalTask?.close(); } catch { /* Preserve the startup failure below. */ }
     // Startup never transferred the master session to a live server. Release
     // its shared rotation barrier only after every attempted startup write has
     // settled, then scrub the unowned master before surfacing the root cause.
