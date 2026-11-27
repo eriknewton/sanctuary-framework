@@ -30,9 +30,11 @@ class HeldAuditWriteStorage extends MemoryStorage {
   }
 }
 
-// A response that waits on a held write fails this bound by assertion, well inside the test's own timeout.
+// A response that waits on a held write fails this bound by assertion, well inside the test's own timeout:
+// 2_000 = one fifteenth of the suite's 30_000 ms testTimeout (server/vitest.config.ts), and far above an unheld call.
 const RESPONSE_BOUND_MS = 2_000;
-// How long the held cleanup is watched for an early resolve before its writes are released.
+// How long the held cleanup is watched for an early resolve before its writes are released. 50 ms spans many
+// event-loop turns; a cleanup that does not wait on its held writes resolves within a few microtasks.
 const HELD_CLEANUP_OBSERVE_MS = 50;
 const RESPONSE_PENDING = Symbol("response_PENDING");
 
@@ -49,9 +51,15 @@ async function withinBound<T>(promise: Promise<T>, boundMs: number): Promise<T |
 
 const teardown: Array<() => Promise<void>> = [];
 afterEach(async () => {
-  for (const step of teardown.splice(0).reverse()) await step();
+  // Every step runs even when an earlier one rejects, so a failed cleanup still removes the temporary fortress and
+  // restores the mocks and environment; the collected failures are reported after all of it has run.
+  const failures: unknown[] = [];
+  for (const step of teardown.splice(0).reverse()) {
+    try { await step(); } catch (error) { failures.push(error); }
+  }
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  if (failures.length > 0) throw new AggregateError(failures, `cleanup-order teardown: ${failures.length} step(s) failed`);
 });
 
 async function boot(storage = new MemoryStorage()) {
@@ -73,7 +81,9 @@ async function boot(storage = new MemoryStorage()) {
     await client.close();
     await app.cleanup();
   })());
-  teardown.push(async () => { await cleanup(); await app.server.close(); });
+  // Two steps, run in reverse: cleanup, then the server close, then the fortress; a rejected cleanup does not skip the close.
+  teardown.push(() => app.server.close());
+  teardown.push(() => cleanup());
   return { app, client, cleanup };
 }
 
