@@ -13,7 +13,9 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { AuditLog, readCallScopeNote, runInCallScope } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { toolResult, type ToolDefinition } from "../../src/router.js";
+import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
+import type { DenialCause, DenialRecorder } from "../../src/agent-native/denial-ledger.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
 import { ApprovalProofStore, fingerprintIdentityId, fixedDenial, type SessionBinding } from "../../src/agent-native/safety-base.js";
 
@@ -309,7 +311,36 @@ describe("eviction, close and the stored filter", () => {
     const cursor = (await r.open())!;
     const foreign = await r.call("sanctuary_events_read", { cursor }, undefined, other.tools);
     expect(foreign.result).toEqual(REFUSAL);
+    expect(foreign.cause).toBe("cursor_unknown");
     expect(r.eventCursorTable.size).toBe(1);
     expect(other.eventCursorTable.size).toBe(0);
+  });
+});
+
+describe("a cancelled open through the router", () => {
+  it("an open cancelled before promotion is the one refusal with one ledger row from the router, and its slot and listener are released", async () => {
+    const r = await setup();
+    const causes: DenialCause[] = [];
+    const denialLedger: DenialRecorder = { record: (cause) => { causes.push(cause); } };
+    const server = createServer(r.tools, { auditLog: r.auditLog, denialLedger });
+    type CallHandler = (request: unknown, extra: { signal: AbortSignal }) => Promise<unknown>;
+    const handler = (server as unknown as { _requestHandlers: Map<string, CallHandler> })._requestHandlers.get("tools/call")!;
+    try {
+      const hold = holdOpenAudits(r.auditLog);
+      const controller = new AbortController();
+      const pending = handler({ method: "tools/call", params: { name: OPEN, arguments: {} } }, { signal: controller.signal });
+      await until(() => hold.held() === 1);
+      controller.abort();
+      expect(r.eventCursorTable.size).toBe(0);
+      hold.releaseAll();
+      expect(await pending).toEqual(expectedRefusal());
+      // The router settled the call refused at the abort, so the cause is its own.
+      expect(causes).toEqual(["post_allow_refusal"]);
+      expect(abortListeners(controller.signal)).toBe(0);
+      expect(r.eventCursorTable.size).toBe(0);
+      expect(r.eventCursorTable.opensInFlight).toBe(0);
+    } finally {
+      await server.close();
+    }
   });
 });
