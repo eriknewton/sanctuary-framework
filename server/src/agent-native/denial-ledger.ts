@@ -48,6 +48,21 @@ export const DENIAL_CAUSES = [
   "origin_unresolved",
   // Must match the late-success refusal in runBoundedCall in router.ts.
   "call_cancelled",
+  // Must match the deny( and readPrimitiveResult call sites in agent-native/cooperative-surface.ts.
+  "primitive_refused",
+  "hidden_key",
+  "cooperative_filter_refused",
+  "audit_scope_refused",
+  "audit_integrity_findings",
+  "compound_step_refused",
+  "compound_approval_missing",
+  "compound_fault",
+  "cooperative_fault",
+  // Must match the events cursor deny( call sites in agent-native/cooperative-surface.ts.
+  "cursor_unknown",
+  "cursor_spent",
+  "cursor_table_full",
+  "cursor_open_failed",
   "other",
 ] as const;
 

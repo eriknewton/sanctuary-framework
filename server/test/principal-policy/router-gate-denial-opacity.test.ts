@@ -364,7 +364,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "recall of an absent key",
-    cause: "post_allow_refusal",
+    cause: "primitive_refused",
     gateRow: false,
     run: async (b) => {
       // A first save settles the session's memory namespace, so the recall below reaches its handler.
@@ -374,7 +374,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "recall of a hidden key",
-    cause: "post_allow_refusal",
+    cause: "hidden_key",
     gateRow: false,
     run: async (b) => {
       expect((await call(b, "sanctuary_remember", { key: "hidden-key", value: "v" })).isError).not.toBe(true);
@@ -401,7 +401,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "compound step denial",
-    cause: "post_allow_refusal",
+    cause: "compound_step_refused",
     gateRow: false,
     run: (b) => call(b, "sanctuary_compound_execute", {
       steps: [{ tool: "sanctuary_recall", args: { key: "never-written-compound" } }],
@@ -409,7 +409,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "compound missing approval",
-    cause: "post_allow_refusal",
+    cause: "compound_approval_missing",
     gateRow: false,
     run: (b) => call(b, "sanctuary_compound_execute", {
       steps: [{ tool: "sanctuary_forget", args: { key: "k", mode: "secure" } }],
@@ -417,7 +417,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "spent cursor",
-    cause: "post_allow_refusal",
+    cause: "cursor_unknown",
     gateRow: false,
     run: async (b) => {
       const opened = body(await call(b, "sanctuary_events_open_cursor", {}));
@@ -427,7 +427,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "unknown cursor",
-    cause: "post_allow_refusal",
+    cause: "cursor_unknown",
     gateRow: false,
     run: (b) => call(b, "sanctuary_events_read", { cursor: "cursor-that-was-never-opened" }),
   },
@@ -630,7 +630,7 @@ describe("one refusal through the production composition root", () => {
       const drew = (tool: string, cause: DenialCause) =>
         served.some((record) => record.cause === cause && (record.input as DenialRecordInput).tool === tool);
       expect(drew("state_delete", "gate_denied")).toBe(true);
-      expect(drew("sanctuary_recall", "post_allow_refusal")).toBe(true);
+      expect(drew("sanctuary_recall", "hidden_key")).toBe(true);
       expect(drew("state_write", "post_allow_refusal")).toBe(true);
       expect(drew(`proxy/${FIXTURE_UPSTREAM}/read`, "post_allow_refusal")).toBe(true);
       // The one ledger wrote each tool's window row to the served process's audit log.

@@ -452,6 +452,42 @@ describe("denial ledger call sites", () => {
     }
   });
 
+  it("every cooperative deny( and every noteRefusalCause( site passes a literal from the closed cause list, except the one typed forwarding site inside deny", () => {
+    const causes = new Set<string>(DENIAL_CAUSES);
+    // The enclosing function of a call site, exported or nested, by the nearest preceding function declaration.
+    const enclosingFunction = (text: string, index: number): string =>
+      [...text.slice(0, index).matchAll(/\bfunction\s+(\w+)\s*\(/g)].at(-1)?.[1] ?? "";
+    // A mention inside a comment line is prose, not a call site.
+    const inComment = (text: string, index: number): boolean =>
+      /^\s*(\*|\/\/)/.test(text.slice(text.lastIndexOf("\n", index) + 1, index));
+    const cooperative = readFileSync(join(SRC_DIR, "agent-native", "cooperative-surface.ts"), "utf8");
+    const denySites = [...cooperative.matchAll(/(?<!function )\bdeny\(\s*([^,)]*)/g)]
+      .filter((match) => !inComment(cooperative, match.index!))
+      .map((match) => match[1]!.trim());
+    expect(denySites.length).toBeGreaterThan(0);
+    for (const first of denySites) {
+      expect(first).toMatch(/^"[a-z_]+"$/);
+      expect(causes.has(first.slice(1, -1)), first).toBe(true);
+    }
+    const forwarding: string[] = [];
+    let literalSites = 0;
+    for (const file of sourceFiles(SRC_DIR)) {
+      const text = readFileSync(file, "utf8");
+      for (const match of text.matchAll(/(?<!function )\bnoteRefusalCause\(\s*([^,)]*)/g)) {
+        if (inComment(text, match.index!)) continue;
+        const first = match[1]!.trim();
+        if (/^"[a-z_]+"$/.test(first)) {
+          expect(causes.has(first.slice(1, -1)), `${file}: ${first}`).toBe(true);
+          literalSites += 1;
+          continue;
+        }
+        forwarding.push(`${file.slice(SRC_DIR.length)}: ${enclosingFunction(text, match.index!)}(${first})`);
+      }
+    }
+    expect(literalSites).toBeGreaterThan(0);
+    expect(forwarding).toEqual(["agent-native/cooperative-surface.ts: deny(cause)"]);
+  });
+
   it("the handler stage records an unresolved origin as its own cause and every other handler error as handler_error", () => {
     expect(handlerStageCause(new OriginUnresolvedError())).toBe("origin_unresolved");
     expect(handlerStageCause(new Error("write origin could not be determined"))).toBe("handler_error");

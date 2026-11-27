@@ -414,6 +414,9 @@ const AUDIT_LOG_READ_ONLY: ReadonlySet<string> = new Set([
   // this justification became true when the resolver started resolving
   // function-valued arguments, and was an assumption before that.
   "runAllowingIntegrityFindings",
+  // Stores the open call's first refusal cause in memory on its call scope, for
+  // the router to record once; it writes no durable state and no record.
+  "noteCallScopeCause",
 ]);
 
 /**

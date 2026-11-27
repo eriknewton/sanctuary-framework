@@ -16,7 +16,11 @@ import { AGENT_AUDIT_VIEW_FIELDS } from "../../src/operational/agent-audit-redac
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
-import { toolResult, type ToolDefinition } from "../../src/router.js";
+import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { readCallScopeNote, runInCallScope } from "../../src/operational/audit-log.js";
+import type { DenialCause, DenialRecorder, DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
 import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import {
   ApprovalProofStore,
@@ -31,7 +35,7 @@ import {
   sha256,
   type SessionBinding,
 } from "../../src/agent-native/safety-base.js";
-import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
+import { createAgentNativeCooperativeTools, readPrimitiveResult } from "../../src/agent-native/cooperative-surface.js";
 import { attributeFlows } from "../../src/castle-wall/audit/per-rule-report.js";
 import { CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY } from "../../src/castle-wall/constants.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
@@ -43,7 +47,7 @@ import {
 } from "../../src/principal-policy/loader.js";
 import type { ApprovalResponse } from "../../src/principal-policy/types.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
-import { expectedRefusalBody } from "../helpers/expected-refusal.js";
+import { expectedRefusal, expectedRefusalBody } from "../helpers/expected-refusal.js";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 
@@ -175,6 +179,15 @@ function compoundPlanHash(
     normalized_args_hash: normalizedArgsHash(step.primitive),
     risk_tier: step.risk_tier,
   }))));
+}
+
+/** The details of the newest compound failure row, read raw from the operator audit log. */
+async function lastCompoundFailure(env: { auditLog: AuditLog }): Promise<Record<string, unknown>> {
+  const rows = (await env.auditLog.query({ operation_type: "sanctuary_compound_execute", limit: 50 })).entries
+    .filter((entry) => entry.result === "failure");
+  const last = rows.at(-1);
+  if (!last) throw new Error("no compound failure row");
+  return last.details ?? {};
 }
 
 const EVENT_ALLOWED_KEYS = [
@@ -1227,10 +1240,12 @@ describe("agent-native Phase 2 cooperative surface", () => {
       ],
       approvals: { "step-1": proof.approval_ref },
     });
-    expect(result.status).toBe("partial_failed");
+    // The agent sees the one refusal; the step detail is in the operator failure row.
+    expect(result).toEqual(expectedRefusalBody());
+    const resultRow = await lastCompoundFailure(env);
     expect(result.status).not.toBe("completed");
-    expect(result.completed_steps).toEqual([]);
-    expect(result.failed_step).toBe("step-1");
+    expect(resultRow.completed_steps ?? []).toEqual([]);
+    expect(resultRow.failed_step).toBe("step-1");
 
     const afterMarkers = await env.storage.list("_facade/hidden");
     expect(afterMarkers.map((entry) => entry.key)).toEqual(beforeMarkers.map((entry) => entry.key));
@@ -1481,9 +1496,11 @@ describe("agent-native Phase 2 cooperative surface", () => {
       ],
       approvals: {},
     });
-    expect(result.status).toBe("partial_failed");
-    expect(result.completed_steps).toEqual([]);
-    expect(result.failed_step).toBe("step-2");
+    // The agent sees the one refusal; the step detail is in the operator failure row.
+    expect(result).toEqual(expectedRefusalBody());
+    const resultRow = await lastCompoundFailure(env);
+    expect(resultRow.completed_steps ?? []).toEqual([]);
+    expect(resultRow.failed_step).toBe("step-2");
 
     const stillThere = await callTool(env.facadeTools, "sanctuary_recall", {
       key: "compound_key",
@@ -1510,8 +1527,10 @@ describe("agent-native Phase 2 cooperative surface", () => {
       ],
       approvals: { "step-2": "approval:anything" },
     });
-    expect(invalidLaterProof.status).toBe("partial_failed");
-    expect(invalidLaterProof.completed_steps).toEqual([]);
+    // The agent sees the one refusal; the step detail is in the operator failure row.
+    expect(invalidLaterProof).toEqual(expectedRefusalBody());
+    const invalidLaterProofRow = await lastCompoundFailure(env);
+    expect(invalidLaterProofRow.completed_steps ?? []).toEqual([]);
     const didNotRun = await callTool(env.facadeTools, "sanctuary_recall", {
       key: "must_not_run",
     });
@@ -1550,8 +1569,10 @@ describe("agent-native Phase 2 cooperative surface", () => {
       ],
       approvals: { "step-2": futureProof.approval_ref },
     });
-    expect(earlierFailure.status).toBe("partial_failed");
-    expect(earlierFailure.completed_steps).toEqual([]);
+    // The agent sees the one refusal; the step detail is in the operator failure row.
+    expect(earlierFailure).toEqual(expectedRefusalBody());
+    const earlierFailureRow = await lastCompoundFailure(env);
+    expect(earlierFailureRow.completed_steps ?? []).toEqual([]);
 
     const releasedProof = await callTool(env.facadeTools, "sanctuary_compound_execute", {
       steps: [
@@ -1560,8 +1581,10 @@ describe("agent-native Phase 2 cooperative surface", () => {
       ],
       approvals: { "step-2": futureProof.approval_ref },
     });
-    expect(releasedProof.status).toBe("partial_failed");
-    expect(releasedProof.completed_steps).toEqual([]);
+    // The agent sees the one refusal; the step detail is in the operator failure row.
+    expect(releasedProof).toEqual(expectedRefusalBody());
+    const releasedProofRow = await lastCompoundFailure(env);
+    expect(releasedProofRow.completed_steps ?? []).toEqual([]);
 
     const directUseDenied = await env.approvalGate.evaluate("state_delete", futureDeleteArgs, {
       approval_ref: futureProof.approval_ref,
@@ -1635,8 +1658,10 @@ describe("agent-native Phase 2 cooperative surface", () => {
       ],
       approvals: { "step-2": crossPlanProof.approval_ref },
     });
-    expect(crossPlanReplay.status).toBe("partial_failed");
-    expect(crossPlanReplay.completed_steps).toEqual([]);
+    // The agent sees the one refusal; the step detail is in the operator failure row.
+    expect(crossPlanReplay).toEqual(expectedRefusalBody());
+    const crossPlanReplayRow = await lastCompoundFailure(env);
+    expect(crossPlanReplayRow.completed_steps ?? []).toEqual([]);
 
     const otherDeleteArgs = {
       namespace,
@@ -1664,7 +1689,259 @@ describe("agent-native Phase 2 cooperative surface", () => {
       ],
       approvals: { "step-1": wrongStepProof.approval_ref },
     });
-    expect(crossStepReplay.status).toBe("partial_failed");
-    expect(crossStepReplay.completed_steps).toEqual([]);
+    // The agent sees the one refusal; the step detail is in the operator failure row.
+    expect(crossStepReplay).toEqual(expectedRefusalBody());
+    const crossStepReplayRow = await lastCompoundFailure(env);
+    expect(crossStepReplayRow.completed_steps ?? []).toEqual([]);
+  });
+});
+
+// ── Operator causes through the router ────────────────────────────────────
+
+interface RecordedDenial { cause: DenialCause; input: DenialRecordInput }
+
+/** The cooperative surface behind the real router, with a ledger that records each refusal's cause. */
+async function routerRig(overrides: Record<string, ToolDefinition["handler"]> = {}) {
+  const env = await setup();
+  let primitives = env.l1Tools;
+  for (const [name, handler] of Object.entries(overrides)) primitives = toolsWithOverride(primitives, name, handler);
+  const tools = facadeWithPrimitives(env, primitives);
+  const recorded: RecordedDenial[] = [];
+  const denialLedger: DenialRecorder = { record: (cause, input) => { recorded.push({ cause, input }); } };
+  const server = createServer(tools, { auditLog: env.auditLog, denialLedger, currentSessionBinding: () => env.active });
+  const client = new Client({ name: "cooperative-causes", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  cleanup.push(() => server.close());
+  cleanup.push(() => client.close());
+  const call = (name: string, args: Record<string, unknown> = {}) => client.callTool({ name, arguments: args });
+  const body = (result: Awaited<ReturnType<typeof call>>) =>
+    JSON.parse((result.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>;
+  return { env, tools, recorded, call, body };
+}
+
+type RouterRig = Awaited<ReturnType<typeof routerRig>>;
+
+const refusingRead: ToolDefinition["handler"] = async () => toolResult({ error: "fixture refusal" });
+const throwingRead: ToolDefinition["handler"] = async () => { throw new Error("fixture primitive fault"); };
+
+const COOPERATIVE_CAUSE_CASES: Array<{
+  cause: DenialCause;
+  overrides?: Record<string, ToolDefinition["handler"]>;
+  prepare?: (r: RouterRig) => Promise<void>;
+  act: (r: RouterRig) => ReturnType<RouterRig["call"]>;
+}> = [
+  {
+    cause: "primitive_refused",
+    overrides: { state_read: refusingRead },
+    act: (r) => r.call("sanctuary_recall", { key: "k" }),
+  },
+  {
+    cause: "hidden_key",
+    prepare: async (r) => {
+      await r.call("sanctuary_remember", { key: "k", value: "v" });
+      await r.call("sanctuary_hide", { key: "k" });
+    },
+    act: (r) => r.call("sanctuary_recall", { key: "k" }),
+  },
+  {
+    cause: "cooperative_filter_refused",
+    act: (r) => r.call("sanctuary_events_open_cursor", { filter: { url: "https://example.invalid" } }),
+  },
+  {
+    cause: "audit_integrity_findings",
+    prepare: async (r) => {
+      vi.spyOn(r.env.auditLog, "getAuditChainVerdict").mockResolvedValue({ status: "findings" } as never);
+    },
+    act: (r) => r.call("sanctuary_audit_search", { query: "x" }),
+  },
+  {
+    cause: "compound_step_refused",
+    overrides: { state_read: refusingRead },
+    act: (r) => r.call("sanctuary_compound_execute", { steps: [{ tool: "sanctuary_recall", args: { key: "k" } }] }),
+  },
+  {
+    cause: "compound_approval_missing",
+    act: (r) => r.call("sanctuary_compound_execute", { steps: [{ tool: "sanctuary_forget", args: { key: "k", mode: "secure" } }] }),
+  },
+  {
+    cause: "compound_fault",
+    act: (r) => r.call("sanctuary_compound_execute", { steps: [{ tool: "not_a_cooperative_tool", args: {} }] }),
+  },
+  {
+    cause: "cooperative_fault",
+    overrides: { state_read: throwingRead },
+    act: (r) => r.call("sanctuary_recall", { key: "k" }),
+  },
+  {
+    cause: "cursor_unknown",
+    act: (r) => r.call("sanctuary_events_read", { cursor: "cursor:never-opened" }),
+  },
+  {
+    cause: "cursor_spent",
+    prepare: async (r) => {
+      const opened = r.body(await r.call("sanctuary_events_open_cursor", {}));
+      (r as RouterRig & { cursor?: string }).cursor = opened.cursor as string;
+      for (let i = 0; i < 10; i++) await r.call("sanctuary_events_read", { cursor: opened.cursor });
+    },
+    act: (r) => r.call("sanctuary_events_read", { cursor: (r as RouterRig & { cursor?: string }).cursor }),
+  },
+  {
+    cause: "cursor_table_full",
+    prepare: async (r) => {
+      for (let i = 0; i < 64; i++) await r.call("sanctuary_events_open_cursor", {});
+    },
+    act: (r) => r.call("sanctuary_events_open_cursor", {}),
+  },
+  {
+    cause: "cursor_open_failed",
+    prepare: async (r) => {
+      vi.spyOn(r.env.auditLog, "query").mockRejectedValue(new Error("fixture query fault"));
+    },
+    act: (r) => r.call("sanctuary_events_open_cursor", {}),
+  },
+];
+
+describe("every cooperative refusal names its operator cause", () => {
+  it.each(COOPERATIVE_CAUSE_CASES.map((c) => [c.cause, c] as const))("%s: the agent gets the one refusal and the ledger records that cause", async (_cause, c) => {
+    const r = await routerRig(c.overrides);
+    await c.prepare?.(r);
+    r.recorded.length = 0;
+    expect(await c.act(r)).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause)).toEqual([c.cause]);
+  });
+
+  it("a widened audit-search scope and a non-secure forget mode, which schema validation stops before the router's boundary, note their causes at the handler", async () => {
+    const env = await setup();
+    const tool = (name: string) => env.facadeTools.find((candidate) => candidate.name === name)!;
+    const noted = async (name: string, args: Record<string, unknown>) =>
+      runInCallScope(async (scope) => {
+        expect(await tool(name).handler(args)).toEqual(toolResult(fixedDenial()));
+        return readCallScopeNote(scope)?.cause;
+      });
+    expect(await noted("sanctuary_audit_search", { query: "x", scope: "everyone" })).toBe("audit_scope_refused");
+    expect(await noted("sanctuary_forget", { key: "k", mode: "fast", approval_ref: "a" })).toBe("cooperative_filter_refused");
+  });
+
+  it("a refused remember's ledger record links its intent row", async () => {
+    const r = await routerRig();
+    const appendCritical = r.env.auditLog.appendCritical.bind(r.env.auditLog);
+    vi.spyOn(r.env.auditLog, "appendCritical").mockImplementation(async (entry) => {
+      if (entry.operation === "sanctuary_remember") throw new Error("fixture completion audit failure");
+      return appendCritical(entry);
+    });
+    expect(await r.call("sanctuary_remember", { key: "k", value: "v" })).toEqual(expectedRefusal());
+    expect(r.recorded).toHaveLength(1);
+    expect(r.recorded[0]!.cause).toBe("cooperative_fault");
+    const intents = (await r.env.auditLog.query({ operation_type: "sanctuary_remember_intent", limit: 10 })).entries;
+    expect(intents).toHaveLength(1);
+    expect(r.recorded[0]!.input.linked_ref).toBe(intents[0]!.details?.audit_ref);
+  });
+
+  it("a compound failure returns the one refusal and its step detail is in the operator failure row", async () => {
+    const r = await routerRig({ state_read: refusingRead });
+    expect(await r.call("sanctuary_compound_execute", {
+      steps: [{ tool: "sanctuary_recall", args: { key: "a" } }, { tool: "sanctuary_recall", args: { key: "b" } }],
+    })).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause)).toEqual(["compound_step_refused"]);
+    const rows = (await r.env.auditLog.query({ operation_type: "sanctuary_compound_execute", limit: 10 })).entries;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.result).toBe("failure");
+    expect(rows[0]!.details).toMatchObject({ failed_step: "step-1", completed_steps: [], release_not_consume: true });
+  });
+
+  it("a classified success whose text does not parse is a cooperative fault (defensive, not a shipped path)", async () => {
+    // A two-item success shape whose first item is plain text: the classifier accepts it, the body read does not.
+    const raw = { content: [{ type: "text", text: "plain report" }, { type: "text", text: "{}" }] };
+    const read = await runInCallScope(async (scope) => ({
+      result: readPrimitiveResult("sovereignty_audit", raw),
+      cause: readCallScopeNote(scope)?.cause,
+    }));
+    expect(read).toEqual({ result: { outcome: "refused" }, cause: "cooperative_fault" });
+  });
+});
+
+describe("a primitive's result is classified before it is read", () => {
+  it("a non-JSON refusal is recorded primitive_refused", async () => {
+    const r = await routerRig({ state_read: async () => ({ content: [{ type: "text", text: "not json" }] }) });
+    expect(await r.call("sanctuary_recall", { key: "k" })).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause)).toEqual(["primitive_refused"]);
+  });
+
+  it("a two-item refusal is recorded primitive_refused", async () => {
+    const verified = JSON.stringify({ value: "v", version: 1, integrity_verified: true, signature_verified: true });
+    const r = await routerRig({
+      state_read: async () => ({ content: [{ type: "text", text: verified }, { type: "text", text: "trailing" }] }),
+    });
+    expect(await r.call("sanctuary_recall", { key: "k" })).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause)).toEqual(["primitive_refused"]);
+  });
+
+  it("an ordinary success is parsed and succeeds", async () => {
+    const r = await routerRig();
+    expect(r.body(await r.call("sanctuary_remember", { key: "k", value: "stored" }))).toMatchObject({ key: "k" });
+    expect(r.body(await r.call("sanctuary_recall", { key: "k" }))).toMatchObject({ value: "stored", verified: true });
+    expect(r.recorded).toEqual([]);
+  });
+});
+
+describe("each primitive's success inside the cooperative layer stays a success and writes no ledger row", () => {
+  it("a state_write success stays a success and writes no ledger row", async () => {
+    const r = await routerRig();
+    expect((await r.call("sanctuary_remember", { key: "k", value: "v" })).isError).not.toBe(true);
+    expect(r.recorded).toEqual([]);
+  });
+
+  it("a state_read success, through recall and through hide, stays a success and writes no ledger row", async () => {
+    const r = await routerRig();
+    await r.call("sanctuary_remember", { key: "k", value: "v" });
+    await r.call("sanctuary_remember", { key: "h", value: "w" });
+    expect(r.body(await r.call("sanctuary_recall", { key: "k" }))).toMatchObject({ value: "v", verified: true });
+    expect(r.body(await r.call("sanctuary_hide", { key: "h" }))).toMatchObject({ hidden: true });
+    expect(r.recorded).toEqual([]);
+  });
+
+  it("a state_read success whose body carries a nested error key stays a success and writes no ledger row", async () => {
+    // The classifier reads only top-level verdict keys, so a nested `error` is data; a top-level `error: null` is a refusal.
+    const body = { value: "v", version: 1, integrity_verified: true, signature_verified: true, metadata: { error: "nested" } };
+    const r = await routerRig({ state_read: async () => toolResult(body) });
+    expect(r.body(await r.call("sanctuary_recall", { key: "k" }))).toMatchObject({ value: "v", verified: true });
+    expect(r.recorded).toEqual([]);
+  });
+
+  it("a state_delete success stays a success and writes no ledger row", async () => {
+    const r = await routerRig();
+    await r.call("sanctuary_remember", { key: "k", value: "v" });
+    expect(r.body(await r.call("sanctuary_forget", { key: "k", mode: "secure", approval_ref: "approval:fixture" })))
+      .toMatchObject({ mode: "secure" });
+    expect(r.recorded).toEqual([]);
+  });
+
+  it("compound remember, recall and hide step successes stay a success and write no ledger row", async () => {
+    const r = await routerRig();
+    expect(r.body(await r.call("sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_remember", args: { key: "c", value: "v" } },
+        { tool: "sanctuary_recall", args: { key: "c" } },
+        { tool: "sanctuary_hide", args: { key: "c" } },
+      ],
+    }))).toMatchObject({ status: "completed", completed_steps: ["step-1", "step-2", "step-3"] });
+    expect(r.recorded).toEqual([]);
+  });
+});
+
+describe("who-am-I and capabilities read the session once", () => {
+  it("who-am-I and capabilities read the identity manager once per call, and the row's identity is that one read's value", async () => {
+    const r = await routerRig();
+    const identityId = r.env.identity.identity_id as string;
+    const get = vi.spyOn(r.env.identityManager, "get");
+    for (const name of ["sanctuary_who_am_i", "sanctuary_capabilities"]) {
+      get.mockClear();
+      expect((await r.call(name)).isError).not.toBe(true);
+      expect(get, name).toHaveBeenCalledTimes(1);
+      const rows = (await r.env.auditLog.query({ operation_type: name, limit: 10 })).entries;
+      expect(rows.at(-1)?.identity_id, name).toBe(identityId);
+    }
   });
 });

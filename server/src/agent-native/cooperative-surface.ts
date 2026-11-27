@@ -9,6 +9,8 @@ import {
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { toolResult, type ToolDefinition } from "../router.js";
+import { classifyToolOutcome } from "../tool-outcome.js";
+import { noteRefusalCause, type DenialCause } from "./denial-ledger.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { StateStore } from "../cognitive/state-store.js";
 import type { ResponseScreen } from "../proxy/response-screen.js";
@@ -69,10 +71,37 @@ function operatorActionFor(view: Exclude<SessionView, { state: "session_BOUND" }
   return view.state === "session_NOT_BOUND" ? UNBOUND_OPERATOR_ACTION : UNCONFIRMED_OPERATOR_ACTION;
 }
 
+/** A primitive's result as the cooperative layer reads it: a classified success with its body, or a refusal. */
+export type PrimitiveResult =
+  | { outcome: "success"; body: Record<string, unknown> }
+  | { outcome: "refused" };
+
 type PrimitiveCaller = (
   name: string,
   args: Record<string, unknown>
-) => Promise<Record<string, unknown>>;
+) => Promise<PrimitiveResult>;
+
+/**
+ * Read a primitive's raw MCP result. A primitive's result is classified before it is read, so a refusal is never
+ * parsed as data; the classification must match classifyToolOutcome in tool-outcome.ts, which the router applies to
+ * the same tool.
+ */
+export function readPrimitiveResult(name: string, raw: unknown, tool?: object): PrimitiveResult {
+  if (classifyToolOutcome(name, raw, tool) !== "success") return { outcome: "refused" };
+  try {
+    const body: unknown = JSON.parse((raw as { content: Array<{ text: string }> }).content[0]!.text);
+    if (typeof body === "object" && body !== null && !Array.isArray(body)) {
+      return { outcome: "success", body: body as Record<string, unknown> };
+    }
+  } catch {
+    // Handled below with the same fault.
+  }
+  // A classified success whose first text is not a JSON object is a fault, never data. The standard rule in
+  // tool-outcome.ts already requires one text item that parses as a JSON object, so for the wired primitives this
+  // branch is unreachable; it stays so a wider success shape can never be read as a body.
+  noteRefusalCause("cooperative_fault");
+  return { outcome: "refused" };
+}
 
 interface HiddenMarker {
   namespace: string;
@@ -169,8 +198,7 @@ export function createAgentNativeCooperativeTools(
   const callPrimitive: PrimitiveCaller = async (name, args) => {
     const tool = options.primitiveTools.find((candidate) => candidate.name === name);
     if (!tool) throw new Error(`missing primitive tool: ${name}`);
-    const result = await tool.handler(args);
-    return JSON.parse(result.content[0]?.text ?? "{}") as Record<string, unknown>;
+    return readPrimitiveResult(name, await tool.handler(args), tool);
   };
 
   function sessionView(): SessionView {
@@ -391,12 +419,14 @@ export function createAgentNativeCooperativeTools(
     return auditRef;
   }
 
-  function deny(
-    auditRef: string,
-    remediation: "request_review" | "try_lower_scope" | "wait" = "request_review",
-    retryAfter: null | "later" | "minutes" | "hours" = null
-  ) {
-    return toolResult(fixedDenial(auditRef, remediation, retryAfter));
+  /**
+   * Every cooperative refusal names its operator-side cause; the agent sees the one refusal. This is the one
+   * forwarding site whose noteRefusalCause( argument is not a literal; every deny( call passes a literal from
+   * DENIAL_CAUSES in denial-ledger.ts, which must match the structural check in test/agent-native/denial-ledger.test.ts.
+   */
+  function deny(cause: DenialCause, linkedRef?: string) {
+    noteRefusalCause(cause, linkedRef);
+    return toolResult(fixedDenial());
   }
 
   function requireBoundSessionArgs(args: Record<string, unknown>): Record<string, unknown> {
@@ -514,7 +544,7 @@ export function createAgentNativeCooperativeTools(
   async function callCompoundStepPrimitive(step: {
     tool: CompoundExecutableToolName;
     primitive: Record<string, unknown>;
-  }): Promise<Record<string, unknown>> {
+  }): Promise<PrimitiveResult> {
     switch (step.tool) {
       case COOPERATIVE_TOOL_NAMES.remember:
         // DEBT(AGENT-SEAT-COMPOUND-NAMESPACE-INSERT): A namespace first saved by a compound remember step is not kept
@@ -682,12 +712,15 @@ export function createAgentNativeCooperativeTools(
           });
           // Attribution must be durable before state_write can commit; intent success proves only that the attempt was recorded.
           primitiveRunning = true;
-          const result = await callPrimitive("state_write", primitiveArgs);
+          const written = await callPrimitive("state_write", primitiveArgs);
           primitiveRunning = false;
-          if (result.denied || result.error) {
+          if (written.outcome !== "success") {
             await audit("sanctuary_remember", { agent_id: callerIdentity, intent_audit_ref: intentRef }, "failure");
-            return deny(intentRef, "try_lower_scope");
+            // The intent row is this refusal's linked reference; a cause the primitive noted first wins, and the intent
+            // row still shares the call's call_ref.
+            return deny("primitive_refused", intentRef);
           }
+          const result = written.body;
           // intent_audit_ref must match sdw/memory-tools.ts and the intent correlation in dashboard/v1_1/client.ts and principal-policy/posture-evidence-html.ts.
           const auditRef = await audit("sanctuary_remember", { agent_id: callerIdentity, intent_audit_ref: intentRef });
           // A namespace insert never changes the save's response; its failure is a system row, then stderr.
@@ -702,7 +735,7 @@ export function createAgentNativeCooperativeTools(
           // A primitive throw cannot establish non-commit: the value may precede a failed anchor write.
           if (primitiveRunning) throw error;
           // Intent or outcome append failure leaves no invented outcome; an acknowledged intent still names the attempt.
-          return deny(intentRef ?? "audit:sanctuary_remember", "try_lower_scope");
+          return deny("cooperative_fault", intentRef);
         }
       },
     },
@@ -733,17 +766,13 @@ export function createAgentNativeCooperativeTools(
             primitiveArgs.namespace as string,
             primitiveArgs.key as string
           );
-          const read = await callPrimitive("state_read", primitiveArgs);
-          if (read.denied) return toolResult(read);
-          if (!isVerifiedRead(read)) return deny("audit:sanctuary_recall");
+          const primitive = await callPrimitive("state_read", primitiveArgs);
+          if (primitive.outcome !== "success") return deny("primitive_refused");
+          const read = primitive.body;
+          if (!isVerifiedRead(read)) return deny("primitive_refused");
           if (marker) {
-            if (marker === "invalid") return deny("audit:sanctuary_recall", "request_review");
-            const markerMatches =
-              marker.version === read.version &&
-              marker.content_hash === stateContentHash(read);
-            return markerMatches
-              ? deny("audit:sanctuary_recall", "try_lower_scope")
-              : deny("audit:sanctuary_recall", "request_review");
+            // A hidden key and an unreadable marker refuse alike: either way the value stays hidden.
+            return deny("hidden_key");
           }
           const auditRef = await audit("sanctuary_recall", {
             primitive_tool: "state_read",
@@ -755,7 +784,7 @@ export function createAgentNativeCooperativeTools(
           }
           return toolResult({ value: read.value, verified: true, audit_ref: auditRef });
         } catch {
-          return deny("audit:sanctuary_recall", "try_lower_scope");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -783,11 +812,11 @@ export function createAgentNativeCooperativeTools(
         try {
           const primitiveArgs = await recallPrimitiveArgs(args);
           const read = await callPrimitive("state_read", primitiveArgs);
-          if (read.denied) {
-            return deny("audit:sanctuary_hide");
+          if (read.outcome !== "success") {
+            return deny("primitive_refused");
           }
-          const hiddenResult = await applyHideSideEffects(args, primitiveArgs, read);
-          if (!hiddenResult) return deny("audit:sanctuary_hide");
+          const hiddenResult = await applyHideSideEffects(args, primitiveArgs, read.body);
+          if (!hiddenResult) return deny("primitive_refused");
           const { marker, auditRef } = hiddenResult;
           return toolResult({
             hidden: true,
@@ -797,7 +826,7 @@ export function createAgentNativeCooperativeTools(
             audit_ref: auditRef,
           });
         } catch {
-          return deny("audit:sanctuary_hide", "try_lower_scope");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -822,15 +851,15 @@ export function createAgentNativeCooperativeTools(
         required: ["key", "mode", "approval_ref"],
       },
       handler: async (args) => {
-        if (!forgetModeIsSecure(args)) return deny("audit:sanctuary_forget");
+        if (!forgetModeIsSecure(args)) return deny("cooperative_filter_refused");
         try {
           const primitiveArgs = await deletePrimitiveArgs(args);
           const result = await callPrimitive("state_delete", primitiveArgs);
-          if (result.denied || result.error) return deny("audit:sanctuary_forget");
+          if (result.outcome !== "success") return deny("primitive_refused");
           const auditRef = await applyForgetSideEffects(args, primitiveArgs);
-          return toolResult({ ...result, mode: "secure", audit_ref: auditRef });
+          return toolResult({ ...result.body, mode: "secure", audit_ref: auditRef });
         } catch {
-          return deny("audit:sanctuary_forget");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -870,7 +899,7 @@ export function createAgentNativeCooperativeTools(
           });
           return toolResult({ ...classified, probe_key: undefined, session_bound: sessionBound, audit_ref: auditRef });
         } catch {
-          return deny("audit:sanctuary_help", "wait");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -883,9 +912,10 @@ export function createAgentNativeCooperativeTools(
         try {
           const view = sessionView();
           const bound = view.state === "session_BOUND";
+          // The audit row names the identity from the same session read, so the manager is consulted once per call.
           const auditRef = await audit("sanctuary_capabilities", {
             tool_count: COOPERATIVE_CAPABILITIES.length,
-          });
+          }, "success", view.state === "session_BOUND" ? view.identity.identity_id : "system");
           return toolResult({
             session: view.state === "session_BOUND"
               ? { bound: true, binding_source: view.binding_source }
@@ -900,7 +930,7 @@ export function createAgentNativeCooperativeTools(
             audit_ref: auditRef,
           });
         } catch {
-          return deny("audit:sanctuary_capabilities", "wait");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -914,13 +944,15 @@ export function createAgentNativeCooperativeTools(
           const view = sessionView();
           if (view.state !== "session_BOUND") {
             // arm_UNBOUND: an unbound answer carries no identity fact and no refusal marker, so the router passes it as a success.
-            const auditRef = await audit("sanctuary_who_am_i");
+            // The audit row names the identity from the same session read, so the manager is consulted once per call.
+            const auditRef = await audit("sanctuary_who_am_i", {}, "success", "system");
             return toolResult({ bound: false, operator_action: operatorActionFor(view), audit_ref: auditRef });
           }
           // arm_BOUND: every fact comes from the one session read above, including its manager record.
           const activeIdentity = view.identity;
           const identity = view.record;
-          const auditRef = await audit("sanctuary_who_am_i");
+          // The audit row names the identity from the same session read, so the manager is consulted once per call.
+          const auditRef = await audit("sanctuary_who_am_i", {}, "success", activeIdentity.identity_id);
           return toolResult({
             bound: true,
             binding_source: view.binding_source,
@@ -933,7 +965,7 @@ export function createAgentNativeCooperativeTools(
           });
         } catch {
           // arm_FAULT: a session read that fails for a reason other than identity gives the fixed denial.
-          return deny("audit:sanctuary_who_am_i");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -1005,7 +1037,7 @@ export function createAgentNativeCooperativeTools(
             audit_ref: auditRef,
           });
         } catch {
-          return deny("audit:sanctuary_active_protections");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -1027,7 +1059,7 @@ export function createAgentNativeCooperativeTools(
       handler: async (args, _caller, context) => {
         try {
           const filter = (args.filter as Record<string, unknown> | undefined) ?? {};
-          if (filter.callback || filter.url || filter.other_agent) return deny("audit:sanctuary_events_open_cursor");
+          if (filter.callback || filter.url || filter.other_agent) return deny("cooperative_filter_refused");
           const activeIdentity = active();
           // Capacity is checked and the pending entry inserted with no await between, so concurrent opens never hold
           // more than MAX_OPEN_CURSORS entries; spent cursors make room first, oldest first.
@@ -1037,7 +1069,7 @@ export function createAgentNativeCooperativeTools(
               if (held.reads >= EVENTS_CURSOR_MAX_READS) cursors.delete(id);
             }
           }
-          if (cursors.size >= MAX_OPEN_CURSORS) return deny("audit:sanctuary_events_open_cursor", "wait");
+          if (cursors.size >= MAX_OPEN_CURSORS) return deny("cursor_table_full");
           const cursor: EventCursor = {
             cursor_id: `cursor:${randomBytes(12).toString("hex")}`,
             owner_fingerprint: activeIdentity.requester_identity_fingerprint,
@@ -1081,7 +1113,7 @@ export function createAgentNativeCooperativeTools(
             throw error;
           }
         } catch {
-          return deny("audit:sanctuary_events_open_cursor", "wait");
+          return deny("cursor_open_failed");
         }
       },
     },
@@ -1103,11 +1135,11 @@ export function createAgentNativeCooperativeTools(
           const cursor = cursors.get(args.cursor as string);
           const activeIdentity = active();
           if (!cursor || cursor.owner_fingerprint !== activeIdentity.requester_identity_fingerprint) {
-            return deny("audit:sanctuary_events_read");
+            return deny("cursor_unknown");
           }
-          if (cursor.pending) return deny("audit:sanctuary_events_read", "wait");
+          if (cursor.pending) return deny("cursor_unknown");
           cursor.reads += 1;
-          if (cursor.reads > EVENTS_CURSOR_MAX_READS) return deny("audit:sanctuary_events_read", "wait", "minutes");
+          if (cursor.reads > EVENTS_CURSOR_MAX_READS) return deny("cursor_spent");
           const limit = Math.min(EVENTS_READ_MAX_LIMIT, Math.max(1, Number((args.opts as Record<string, unknown> | undefined)?.limit ?? 10)));
           // The read keeps the whole retained window (do not slice; the retained window is the bound), scoped to the
           // caller's identity and to rows still agent-visible, and returns the snapshot's next keys found in it.
@@ -1125,7 +1157,7 @@ export function createAgentNativeCooperativeTools(
           // not a clean-CLAIM. `sanctuary_events_read` returns redacted events; a
           // finding makes it refuse, it never stamps a verified-clean label, so it
           // does not derive an audit-chain cleanliness verdict (F2 round-4 HIGH-2).
-          if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_events_read");
+          if (queried.integrity_findings.length > 0) return deny("audit_integrity_findings");
           const byKey = new Map<string, AuditEntry>();
           const keys = queried.sequences ?? [];
           queried.entries.forEach((entry, index) => { byKey.set(cursorKeyId(keys[index]!), entry); });
@@ -1145,7 +1177,7 @@ export function createAgentNativeCooperativeTools(
             audit_ref: auditRef,
           });
         } catch {
-          return deny("audit:sanctuary_events_read", "wait");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -1159,13 +1191,13 @@ export function createAgentNativeCooperativeTools(
         try {
           const cursor = cursors.get(args.cursor as string);
           if (!cursor || cursor.owner_fingerprint !== active().requester_identity_fingerprint) {
-            return deny("audit:sanctuary_events_close");
+            return deny("cursor_unknown");
           }
           cursors.delete(cursor.cursor_id);
           const auditRef = await audit("sanctuary_events_close");
           return toolResult({ closed: true, audit_ref: auditRef });
         } catch {
-          return deny("audit:sanctuary_events_close");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -1185,7 +1217,7 @@ export function createAgentNativeCooperativeTools(
       },
       handler: async (args) => {
         try {
-          if (args.scope && args.scope !== "own_signed") return deny("audit:sanctuary_audit_search");
+          if (args.scope && args.scope !== "own_signed") return deny("audit_scope_refused");
           const activeIdentity = active();
           // Scope to the caller's identity BEFORE the limit (AuditLog.query
           // filters identity_id before its slice) so the 500-entry search window
@@ -1210,7 +1242,7 @@ export function createAgentNativeCooperativeTools(
           // case) the agent verified only the post-split chain, so it claims the
           // honest weaker label rather than full-chain verification.
           const chainVerdict = await options.auditLog.getAuditChainVerdict();
-          if (chainVerdict.status === "findings") return deny("audit:sanctuary_audit_search");
+          if (chainVerdict.status === "findings") return deny("audit_integrity_findings");
           const verificationLabel =
             chainVerdict.status === "verified"
               ? "verified_against_audit_chain"
@@ -1253,7 +1285,7 @@ export function createAgentNativeCooperativeTools(
           });
           return toolResult({ scope: "own_signed", results: matches, audit_ref: auditRef });
         } catch {
-          return deny("audit:sanctuary_audit_search");
+          return deny("cooperative_fault");
         }
       },
     },
@@ -1327,19 +1359,14 @@ export function createAgentNativeCooperativeTools(
                 continue;
               }
               releaseReservedApprovals(reservedApprovals);
-              const auditRef = await audit("sanctuary_compound_execute", {
+              await audit("sanctuary_compound_execute", {
                 plan_hash: planHash,
                 failed_step: step.step_id,
                 skipped_steps: planSteps.filter((candidate) => candidate.step_id !== step.step_id).map((candidate) => candidate.step_id),
                 release_not_consume: true,
               }, "failure");
-              return toolResult({
-                status: "partial_failed",
-                completed_steps: [],
-                failed_step: step.step_id,
-                skipped_steps: planSteps.filter((candidate) => candidate.step_id !== step.step_id).map((candidate) => candidate.step_id),
-                audit_ref: auditRef,
-              });
+              // The step detail stays in the operator failure row above; the agent sees the one refusal.
+              return deny("compound_approval_missing");
             }
           }
           const completed: string[] = [];
@@ -1347,47 +1374,47 @@ export function createAgentNativeCooperativeTools(
             const reserved = reservedApprovals.find((approval) => approval.step_id === step.step_id);
             if (reserved && !approvalProofStore.consumeReserved(reserved.approval_ref, reserved.reservation_id)) {
               releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
-              const auditRef = await audit("sanctuary_compound_execute", {
+              await audit("sanctuary_compound_execute", {
                 plan_hash: planHash,
                 completed_steps: completed,
                 failed_step: step.step_id,
                 release_not_consume: true,
               }, "failure");
-              return toolResult({ status: "partial_failed", completed_steps: completed, failed_step: step.step_id, audit_ref: auditRef });
+              return deny("compound_approval_missing");
             }
             const result = await callCompoundStepPrimitive(step);
-            if (result.denied || result.error) {
+            if (result.outcome !== "success") {
               releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
-              const auditRef = await audit("sanctuary_compound_execute", {
+              await audit("sanctuary_compound_execute", {
                 plan_hash: planHash,
                 completed_steps: completed,
                 failed_step: step.step_id,
                 release_not_consume: true,
               }, "failure");
-              return toolResult({ status: "partial_failed", completed_steps: completed, failed_step: step.step_id, audit_ref: auditRef });
+              return deny("compound_step_refused");
             }
             let sideEffectsApplied = true;
             try {
-              sideEffectsApplied = await applyCompoundStepSideEffects(step, result);
+              sideEffectsApplied = await applyCompoundStepSideEffects(step, result.body);
             } catch {
               sideEffectsApplied = false;
             }
             if (!sideEffectsApplied) {
               releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
-              const auditRef = await audit("sanctuary_compound_execute", {
+              await audit("sanctuary_compound_execute", {
                 plan_hash: planHash,
                 completed_steps: completed,
                 failed_step: step.step_id,
                 release_not_consume: true,
               }, "failure");
-              return toolResult({ status: "partial_failed", completed_steps: completed, failed_step: step.step_id, audit_ref: auditRef });
+              return deny("compound_step_refused");
             }
             completed.push(step.step_id);
           }
           const auditRef = await audit("sanctuary_compound_execute", { plan_hash: planHash, completed_steps: completed });
           return toolResult({ status: "completed", plan_hash: planHash, completed_steps: completed, audit_ref: auditRef });
         } catch {
-          return deny("audit:sanctuary_compound_execute");
+          return deny("compound_fault");
         }
       },
     },
