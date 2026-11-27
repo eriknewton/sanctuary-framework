@@ -432,6 +432,21 @@ const REFUSAL_CASES: RefusalCase[] = [
     run: (b) => call(b, "sanctuary_events_read", { cursor: "cursor-that-was-never-opened" }),
   },
   {
+    label: "full cursor table",
+    cause: "cursor_table_full",
+    gateRow: false,
+    run: async (b) => {
+      // Must match MAX_OPEN_CURSORS in agent-native/cooperative-surface.ts; the opened cursors are closed again after.
+      const opened: string[] = [];
+      try {
+        for (let i = 0; i < 64; i++) opened.push(body(await call(b, "sanctuary_events_open_cursor", {})).cursor as string);
+        return await call(b, "sanctuary_events_open_cursor", {});
+      } finally {
+        for (const cursor of opened) await call(b, "sanctuary_events_close", { cursor });
+      }
+    },
+  },
+  {
     label: "write under integrity findings",
     cause: "write_integrity_stop",
     gateRow: false,

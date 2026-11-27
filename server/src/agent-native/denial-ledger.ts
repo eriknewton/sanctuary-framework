@@ -63,6 +63,8 @@ export const DENIAL_CAUSES = [
   "cursor_spent",
   "cursor_table_full",
   "cursor_open_failed",
+  "cursor_filter_too_long",
+  "cursor_open_evicted",
   "other",
 ] as const;
 

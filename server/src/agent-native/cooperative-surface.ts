@@ -10,7 +10,7 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import { classifyToolOutcome } from "../tool-outcome.js";
-import { noteRefusalCause, type DenialCause } from "./denial-ledger.js";
+import { DENIAL_ROW_IDENTIFIER_MAX_BYTES, noteRefusalCause, type DenialCause } from "./denial-ledger.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { StateStore } from "../cognitive/state-store.js";
 import type { ResponseScreen } from "../proxy/response-screen.js";
@@ -120,10 +120,14 @@ interface EventCursor {
   keys: CursorKey[];
   /** The next snapshot position a read returns. */
   position: number;
-  /** Set until the open's snapshot is taken; a pending cursor refuses reads. */
+  /** Set until the open's snapshot and audit have both settled and it is promoted; a pending cursor refuses reads and closes. */
   pending: boolean;
   opened_at: string;
+  /** The cursor clock's reading at reservation, for TTL eviction and the promotion check. */
+  reserved_at: number;
   reads: number;
+  /** Removes this reservation's abort listener; set only while a listener is registered. */
+  detach_abort?: () => void;
 }
 
 /** The read window the events cursor already used. */
@@ -134,8 +138,19 @@ const EVENTS_CURSOR_MAX_READS = 10;
 const EVENTS_READ_MAX_LIMIT = 25;
 /** The most positions a cursor can ever read, so the snapshot keeps no more. */
 const EVENTS_CURSOR_SNAPSHOT_ROWS = EVENTS_CURSOR_MAX_READS * EVENTS_READ_MAX_LIMIT;
-/** The most cursors one server keeps open; each holds at most EVENTS_CURSOR_SNAPSHOT_ROWS keys. */
+/**
+ * The most cursors one server keeps open; each holds at most EVENTS_CURSOR_SNAPSHOT_ROWS keys. One process is one
+ * origin; ten times the paging a single agent turn uses, and the table stays under 64 small records. The same figure
+ * bounds opens still in flight.
+ */
 const MAX_OPEN_CURSORS = 64;
+/** 15 minutes (15 * 60 * 1000 ms), longer than any paging loop in one turn. */
+const CURSOR_TTL_MS = 900_000;
+/**
+ * The MCP tool-name length limit, the same figure as DENIAL_ROW_IDENTIFIER_MAX_BYTES in denial-ledger.ts, above every
+ * registered operation name.
+ */
+const CURSOR_FILTER_OPERATION_MAX_CHARS = DENIAL_ROW_IDENTIFIER_MAX_BYTES;
 
 function cursorKeyId(key: CursorKey): string {
   return "sequence" in key ? `s:${key.sequence}` : `l:${key.legacy_key}`;
@@ -179,7 +194,10 @@ export interface CooperativeSurfaceOptions {
 /** A read-only view of one server's open-cursor table, for tests that sample it while an open is in flight. */
 export interface EventCursorTableView {
   readonly size: number;
+  /** Opens whose snapshot query or audit has not settled, including evicted ones. */
+  readonly opensInFlight: number;
   ids(): string[];
+  openedAt(id: string): string | undefined;
 }
 
 export function createAgentNativeCooperativeTools(
@@ -187,6 +205,10 @@ export function createAgentNativeCooperativeTools(
 ): { tools: ToolDefinition[]; eventCursorTable: EventCursorTableView } {
   const hidden = new Map<string, HiddenMarker>();
   const cursors = new Map<string, EventCursor>();
+  // Opens whose work has not settled; must match the admission check in the events open handler below.
+  let opensInFlight = 0;
+  // The cursor clock; the real clock keeps TTL eviction live when the caller supplies none.
+  const cursorNow = options.now ?? Date.now;
   const helpProbeSummaries = new Map<string, HelpProbeSummary>();
   let helpProbeOverflow = 0;
   let helpProbeOverflowUnconfirmed = 0;
@@ -662,6 +684,31 @@ export function createAgentNativeCooperativeTools(
     }
   }
 
+  /** A cursor slot is released only if the map still holds this same entry; its abort listener goes with it. */
+  function releaseCursor(cursor: EventCursor): void {
+    if (cursors.get(cursor.cursor_id) === cursor) cursors.delete(cursor.cursor_id);
+    cursor.detach_abort?.();
+    cursor.detach_abort = undefined;
+  }
+
+  /**
+   * Make room in a full table: spent cursors first, oldest first, until one slot is free; then, if still full, every
+   * entry past CURSOR_TTL_MS, open or pending. An evicted reservation releases its slot and its listener, so eviction
+   * bounds table size and listeners; `opensInFlight` bounds opens whose work has not settled, and is released only when
+   * that work settles.
+   */
+  function evictCursors(now: number): void {
+    const oldestFirst = [...cursors.values()].sort((a, b) => a.reserved_at - b.reserved_at);
+    for (const cursor of oldestFirst) {
+      if (cursors.size < MAX_OPEN_CURSORS) return;
+      if (!cursor.pending && cursor.reads >= EVENTS_CURSOR_MAX_READS) releaseCursor(cursor);
+    }
+    if (cursors.size < MAX_OPEN_CURSORS) return;
+    for (const cursor of oldestFirst) {
+      if (now - cursor.reserved_at >= CURSOR_TTL_MS) releaseCursor(cursor);
+    }
+  }
+
   function redactEvent(entry: AuditEntry, index: number): Record<string, unknown> {
     return {
       cursor_event_id: index,
@@ -1060,16 +1107,16 @@ export function createAgentNativeCooperativeTools(
         try {
           const filter = (args.filter as Record<string, unknown> | undefined) ?? {};
           if (filter.callback || filter.url || filter.other_agent) return deny("cooperative_filter_refused");
-          const activeIdentity = active();
-          // Capacity is checked and the pending entry inserted with no await between, so concurrent opens never hold
-          // more than MAX_OPEN_CURSORS entries; spent cursors make room first, oldest first.
-          if (cursors.size >= MAX_OPEN_CURSORS) {
-            for (const [id, held] of cursors) {
-              if (cursors.size < MAX_OPEN_CURSORS) break;
-              if (held.reads >= EVENTS_CURSOR_MAX_READS) cursors.delete(id);
-            }
+          // The stored filter is bounded, so a cursor record stays small whatever the caller sends.
+          if (typeof filter.operation === "string" && filter.operation.length > CURSOR_FILTER_OPERATION_MAX_CHARS) {
+            return deny("cursor_filter_too_long");
           }
-          if (cursors.size >= MAX_OPEN_CURSORS) return deny("cursor_table_full");
+          const activeIdentity = active();
+          const reservedAt = cursorNow();
+          // Eviction, the size check and the insert run with no await between them, so concurrent opens cannot exceed
+          // the cap; opens still in flight after eviction are bounded by the same figure.
+          if (cursors.size >= MAX_OPEN_CURSORS) evictCursors(reservedAt);
+          if (opensInFlight >= MAX_OPEN_CURSORS || cursors.size >= MAX_OPEN_CURSORS) return deny("cursor_table_full");
           const cursor: EventCursor = {
             cursor_id: `cursor:${randomBytes(12).toString("hex")}`,
             owner_fingerprint: activeIdentity.requester_identity_fingerprint,
@@ -1077,17 +1124,22 @@ export function createAgentNativeCooperativeTools(
             keys: [],
             position: 0,
             pending: true,
-            opened_at: new Date().toISOString(),
+            opened_at: new Date(reservedAt).toISOString(),
+            reserved_at: reservedAt,
             reads: 0,
           };
           cursors.set(cursor.cursor_id, cursor);
+          opensInFlight += 1;
+          const signal = context?.signal;
           // Read at each check, since cancellation can land during any await of the open.
-          const cancelled = (): boolean => context?.signal?.aborted === true;
-          // An open that does not return its cursor frees the entry it inserted, so a failed open never holds a slot.
-          const discard = (): void => {
-            // Only this open's own entry is removed; a later entry under the same id is never touched.
-            if (cursors.get(cursor.cursor_id) === cursor) cursors.delete(cursor.cursor_id);
-          };
+          const cancelled = (): boolean => signal?.aborted === true;
+          if (signal !== undefined) {
+            // A cancelled open releases its slot at once; the work it started still counts in flight until it settles.
+            const onAbort = (): void => releaseCursor(cursor);
+            signal.addEventListener("abort", onAbort, { once: true });
+            cursor.detach_abort = () => signal.removeEventListener("abort", onAbort);
+            if (signal.aborted) releaseCursor(cursor);
+          }
           try {
             // A cursor pages through the rows visible when it was opened, so a row that becomes visible later is never
             // inserted ahead of the read position.
@@ -1101,16 +1153,34 @@ export function createAgentNativeCooperativeTools(
                 limit: EVENTS_CURSOR_WINDOW_ROWS,
               })
             );
-            if (cancelled()) throw new Error("cursor open cancelled");
+            // A cancelled call is already refused at the router boundary, which records its cause; this open only
+            // releases what it reserved.
+            if (cancelled()) {
+              releaseCursor(cursor);
+              return toolResult(fixedDenial());
+            }
+            const auditRef = await audit("sanctuary_events_open_cursor", { operation: cursor.operation });
+            if (cancelled()) {
+              releaseCursor(cursor);
+              return toolResult(fixedDenial());
+            }
+            // A reservation is promoted only if the table still holds this same entry, the call is live and the entry
+            // has not expired.
+            if (cursors.get(cursor.cursor_id) !== cursor || cursorNow() - cursor.reserved_at >= CURSOR_TTL_MS) {
+              releaseCursor(cursor);
+              return deny("cursor_open_evicted");
+            }
             cursor.keys = (snapshot.sequences ?? []).slice(0, EVENTS_CURSOR_SNAPSHOT_ROWS);
             cursor.pending = false;
-            const auditRef = await audit("sanctuary_events_open_cursor", { operation: cursor.operation });
-            // A cancelled call is refused at the boundary, so its cursor would never reach the caller.
-            if (cancelled()) throw new Error("cursor open cancelled");
             return toolResult({ cursor: cursor.cursor_id, audit_ref: auditRef });
-          } catch (error) {
-            discard();
-            throw error;
+          } catch {
+            releaseCursor(cursor);
+            return deny("cursor_open_failed");
+          } finally {
+            // The listener goes on every exit; the in-flight count is released only here, once this open's work settled.
+            cursor.detach_abort?.();
+            cursor.detach_abort = undefined;
+            opensInFlight -= 1;
           }
         } catch {
           return deny("cursor_open_failed");
@@ -1119,6 +1189,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.eventsRead,
+      // "10 reads per cursor" must match EVENTS_CURSOR_MAX_READS above and the description pin in test/agent-native/events-cursor-snapshot.test.ts.
       description: "Read the next page of redacted events from a cursor opened with sanctuary_events_open_cursor (default 10, max 25 per call). Returns { events, next_cursor, audit_ref }. Only your own identity's events are visible; capped at 10 reads per cursor, then rate-limited.",
       tool_class: "read",
       approvalTargetArgs: requireBoundSessionArgs,
@@ -1190,10 +1261,11 @@ export function createAgentNativeCooperativeTools(
       handler: async (args) => {
         try {
           const cursor = cursors.get(args.cursor as string);
-          if (!cursor || cursor.owner_fingerprint !== active().requester_identity_fingerprint) {
+          // A held cursor closes, spent or not; a pending, evicted, unknown or foreign one refuses alike.
+          if (!cursor || cursor.pending || cursor.owner_fingerprint !== active().requester_identity_fingerprint) {
             return deny("cursor_unknown");
           }
-          cursors.delete(cursor.cursor_id);
+          releaseCursor(cursor);
           const auditRef = await audit("sanctuary_events_close");
           return toolResult({ closed: true, audit_ref: auditRef });
         } catch {
@@ -1422,7 +1494,9 @@ export function createAgentNativeCooperativeTools(
 
   const eventCursorTable: EventCursorTableView = {
     get size() { return cursors.size; },
+    get opensInFlight() { return opensInFlight; },
     ids: () => [...cursors.keys()],
+    openedAt: (id) => cursors.get(id)?.opened_at,
   };
   return { tools, eventCursorTable };
 }
