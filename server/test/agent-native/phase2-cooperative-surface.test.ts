@@ -20,7 +20,11 @@ import { createServer, toolResult, type ToolDefinition } from "../../src/router.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { readCallScopeNote, runInCallScope } from "../../src/operational/audit-log.js";
-import type { DenialCause, DenialRecorder, DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
+import { noteRefusalCause, type DenialCause, type DenialRecorder, type DenialRecordInput } from "../../src/agent-native/denial-ledger.js";
+import { createReputationTools } from "../../src/reputation/tools.js";
+import { StateVerificationError } from "../../src/cognitive/state-entry-open.js";
+import { INTERNAL_SIGNING_DOMAIN_PREFIXES } from "../../src/core/signing-domains.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import {
   ApprovalProofStore,
@@ -1700,12 +1704,22 @@ describe("agent-native Phase 2 cooperative surface", () => {
 
 interface RecordedDenial { cause: DenialCause; input: DenialRecordInput }
 
-/** The cooperative surface behind the real router, with a ledger that records each refusal's cause. */
-async function routerRig(overrides: Record<string, ToolDefinition["handler"]> = {}) {
+/**
+ * The cooperative surface behind the real router, with a ledger that records each refusal's cause. With `primitives`
+ * set, the primitive and reputation tools are served beside it.
+ */
+async function routerRig(overrides: Record<string, ToolDefinition["handler"]> = {}, primitivesServed = false) {
   const env = await setup();
   let primitives = env.l1Tools;
   for (const [name, handler] of Object.entries(overrides)) primitives = toolsWithOverride(primitives, name, handler);
-  const tools = facadeWithPrimitives(env, primitives);
+  const tools = [
+    ...facadeWithPrimitives(env, primitives),
+    // The composition root assigns primitives their class; with no integrity findings here, the class changes nothing.
+    ...(primitivesServed
+      ? [...env.l1Tools, ...createReputationTools(env.storage, env.masterKey, env.identityManager, env.auditLog).tools]
+        .map((tool): ToolDefinition => ({ ...tool, tool_class: tool.tool_class ?? "write" }))
+      : []),
+  ];
   const recorded: RecordedDenial[] = [];
   const denialLedger: DenialRecorder = { record: (cause, input) => { recorded.push({ cause, input }); } };
   const server = createServer(tools, { auditLog: env.auditLog, denialLedger, currentSessionBinding: () => env.active });
@@ -1943,5 +1957,108 @@ describe("who-am-I and capabilities read the session once", () => {
       const rows = (await r.env.auditLog.query({ operation_type: name, limit: 10 })).entries;
       expect(rows.at(-1)?.identity_id, name).toBe(identityId);
     }
+  });
+});
+
+// ── Primitive and reputation causes through the router ────────────────────
+
+const PRIMITIVE_CAUSE_CASES: Array<{
+  cause: DenialCause;
+  act: (r: RouterRig) => Promise<Awaited<ReturnType<RouterRig["call"]>>>;
+}> = [
+  { cause: "namespace_refused", act: (r) => r.call("state_write", { namespace: "_reputation", key: "k", value: "v" }) },
+  { cause: "storage_name_unusable", act: (r) => r.call("state_write", { namespace: "plain", key: "key-\u4E2D", value: "v" }) },
+  { cause: "target_absent", act: (r) => r.call("state_read", { namespace: "plain", key: "never-written" }) },
+  {
+    cause: "sign_identity_mismatch",
+    act: async (r) => {
+      const other = await callTool(r.env.l1Tools, "identity_create", { label: "agent-b" });
+      return r.call("identity_sign", { identity_id: other.identity_id, payload: toBase64url(stringToBytes("hello")) });
+    },
+  },
+  {
+    cause: "sign_reserved_domain",
+    act: (r) => r.call("identity_sign", {
+      identity_id: r.env.identity.identity_id,
+      payload: toBase64url(stringToBytes(`${INTERNAL_SIGNING_DOMAIN_PREFIXES[0]}forged`)),
+    }),
+  },
+  {
+    cause: "import_unverified",
+    act: async (r) => {
+      expect((await r.call("state_write", { namespace: "plain", key: "k", value: "v" })).isError).not.toBe(true);
+      const exported = await callTool(r.env.l1Tools, "state_export", { namespace: "plain" });
+      expect(typeof exported.bundle).toBe("string");
+      vi.spyOn(StateStore.prototype, "assertImportVersionFloors")
+        .mockRejectedValue(new StateVerificationError("signature_mismatch", "fixture verification failure"));
+      return r.call("state_import", { bundle: exported.bundle });
+    },
+  },
+  {
+    cause: "reputation_import_unverified",
+    act: (r) => r.call("reputation_import", { bundle: toBase64url(stringToBytes("{}")) }),
+  },
+];
+
+describe("every primitive and reputation refusal names its operator cause", () => {
+  it.each(PRIMITIVE_CAUSE_CASES.map((c) => [c.cause, c] as const))("%s: the agent gets the one refusal and the ledger records that cause", async (_cause, c) => {
+    const r = await routerRig({}, true);
+    const result = await c.act(r);
+    expect(result).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause).at(-1)).toBe(c.cause);
+  });
+
+  it("an unusable stored name and an absent key give the same envelope and different ledger causes", async () => {
+    const r = await routerRig();
+    const unusable = await r.call("sanctuary_remember", { key: "key-\u4E2D", value: "v" });
+    const absent = await r.call("sanctuary_recall", { key: "never-written" });
+    expect(unusable).toEqual(expectedRefusal());
+    expect(absent).toEqual(unusable);
+    expect(r.recorded.map((entry) => entry.cause)).toEqual(["storage_name_unusable", "target_absent"]);
+  });
+
+  it("a cause noted by a primitive inside a cooperative call reaches the ledger as that cause", async () => {
+    const r = await routerRig();
+    expect(await r.call("sanctuary_recall", { key: "never-written" })).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause)).toEqual(["target_absent"]);
+  });
+
+  it("a primitive's note inside remember wins, and the intent row shares the call's call_ref", async () => {
+    const r = await routerRig();
+    expect(await r.call("sanctuary_remember", { key: "key-\u4E2D", value: "v" })).toEqual(expectedRefusal());
+    expect(r.recorded).toHaveLength(1);
+    expect(r.recorded[0]!.cause).toBe("storage_name_unusable");
+    // The first note carries no intent link; the call's rows share one call_ref instead.
+    expect(r.recorded[0]!.input.linked_ref).toBeUndefined();
+    const rows = async (operation: string) => (await r.env.auditLog.query({ operation_type: operation, limit: 10 })).entries;
+    const [intent] = await rows("sanctuary_remember_intent");
+    const [outcome] = await rows("sanctuary_remember");
+    const [primitive] = await rows("state_write");
+    expect(intent?.call_ref).toMatch(/^[0-9a-f]{16}$/);
+    expect(outcome?.result).toBe("failure");
+    expect(outcome?.call_ref).toBe(intent?.call_ref);
+    expect(primitive?.call_ref).toBe(intent?.call_ref);
+  });
+
+  it("a stage fault after a primitive noted a cause keeps the stage's cause", async () => {
+    // An invalid namespace is noted as refused at the source, then thrown out of the handler.
+    const r = await routerRig({}, true);
+    expect(await r.call("state_write", { namespace: "..", key: "k", value: "v" })).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause)).toEqual(["handler_error"]);
+    // The source's own refusal row shows it noted before the throw.
+    const sourceRows = (await r.env.auditLog.query({ operation_type: "state_write", limit: 10 })).entries;
+    expect(sourceRows.map((row) => row.details?.denial_class)).toEqual(["namespace_unavailable"]);
+  });
+
+  it("a cause a primitive notes on a call that then succeeds is discarded", async () => {
+    const verified = { value: "v", version: 1, integrity_verified: true, signature_verified: true };
+    const r = await routerRig({
+      state_read: async () => {
+        noteRefusalCause("target_absent");
+        return toolResult(verified);
+      },
+    });
+    expect(r.body(await r.call("sanctuary_recall", { key: "k" }))).toMatchObject({ value: "v", verified: true });
+    expect(r.recorded).toEqual([]);
   });
 });

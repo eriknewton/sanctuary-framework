@@ -22,6 +22,7 @@ import { validateResponse, normalizeScreenedResponse, rehydrationBudget, Request
 import type { ToolDefinition, ToolHandler } from "../router.js";
 import { toolResult } from "../router.js";
 import { markProxiedTool, recordProxiedOutcome } from "../tool-outcome.js";
+import { noteRefusalCause } from "../agent-native/denial-ledger.js";
 import type { ClientManager } from "./client-manager.js";
 import { UpstreamUnavailableError } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
@@ -217,6 +218,8 @@ export class ProxyRouter {
             },
           });
 
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("proxy_injection");
           this.notifyProxyCall(proxyName, serverName, "blocked", "injection_detected", tier);
           return proxyRefusal({
             error: "Operation not permitted",
@@ -295,6 +298,8 @@ export class ProxyRouter {
               },
             });
 
+            // This refusal's cause is noted by type at its source; the router records it once.
+            noteRefusalCause("proxy_context_gate");
             this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
             return proxyRefusal({
               error: "Operation not permitted",
@@ -358,6 +363,8 @@ export class ProxyRouter {
                 latency_ms: Date.now() - start,
               },
             });
+            // This refusal's cause is noted by type at its source; the router records it once.
+            noteRefusalCause("proxy_privacy");
             this.notifyProxyCall(
               proxyName,
               serverName,
@@ -397,6 +404,8 @@ export class ProxyRouter {
                 latency_ms: Date.now() - start,
               },
             });
+            // This refusal's cause is noted by type at its source; the router records it once.
+            noteRefusalCause("proxy_privacy");
             this.notifyProxyCall(
               proxyName,
               serverName,
@@ -486,6 +495,8 @@ export class ProxyRouter {
               },
             });
 
+            // This refusal's cause is noted by type at its source; the router records it once.
+            noteRefusalCause("proxy_governor");
             this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
             return proxyRefusal({
               error: "Operation not permitted",
@@ -548,6 +559,8 @@ export class ProxyRouter {
           if (lease) await lease.wait(audit);
           else await audit; // Admission refusals still leave the existing operator audit row.
         } catch { /* Audit failure cannot release upstream content. */ }
+        // This refusal's cause is noted by type at its source; the router records it once.
+        noteRefusalCause("proxy_admission");
         this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
         return proxyRefusal({ error: "Operation not permitted", proxy: true });
       } finally {

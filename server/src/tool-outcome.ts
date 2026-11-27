@@ -319,7 +319,6 @@ export function classifyToolOutcome(toolName: string, result: unknown, tool?: ob
  * Must match the argument-stage cause entries of DENIAL_CAUSES in
  * agent-native/denial-ledger.ts; narrowing a cause here needs no router edit.
  */
-// DEBT(AGENT-SEAT-CI-DEFERRED-CAUSES): causes for call-scoped cursor and audit refusals await their producers in a later slice.
 // A session with no bound identity is recorded as session_not_bound; a handle the session does not own stays pre_gate_argument_refused.
 export function argumentStageCause(error: unknown): Extract<DenialCause, "export_capacity" | "pre_gate_argument_refused" | "session_not_bound"> {
   return isSessionNotBoundError(error) ? "session_not_bound"

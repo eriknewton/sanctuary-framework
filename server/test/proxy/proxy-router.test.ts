@@ -12,6 +12,11 @@ import { unitResponseScreen } from "../helpers/response-screen.js";
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ProxyRouter } from "../../src/proxy/proxy-router.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createServer } from "../../src/router.js";
+import type { DenialCause, DenialRecorder } from "../../src/agent-native/denial-ledger.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 
 // ── Mocks ────────────────────────────────────────────────────────────
 
@@ -536,5 +541,75 @@ describe("ProxyRouter", () => {
       expect(tools[0]!.name).toBe("proxy/server-a/tool1");
       expect(tools[1]!.name).toBe("proxy/server-b/tool2");
     });
+  });
+});
+
+// ── Through the router ───────────────────────────────────────────────
+
+describe("each proxy refusal is the one refusal, with its own operator cause", () => {
+  const closers: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const close of closers.splice(0).reverse()) await close();
+  });
+
+  async function proxied(build: (clientManager: ReturnType<typeof createMockClientManager>) => ProxyRouter) {
+    const clientManager = createMockClientManager();
+    const causes: DenialCause[] = [];
+    const denialLedger: DenialRecorder = { record: (cause) => { causes.push(cause); } };
+    const server = createServer(build(clientManager).getProxiedTools(), { denialLedger });
+    const client = new Client({ name: "proxy-causes", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closers.push(() => server.close());
+    closers.push(() => client.close());
+    return { causes, clientManager, call: () => client.callTool({ name: "proxy/test-server/list_files", arguments: {} }) };
+  }
+
+  const CASES: Array<{ cause: DenialCause; build: (clientManager: ReturnType<typeof createMockClientManager>) => ProxyRouter }> = [
+    {
+      cause: "proxy_injection",
+      build: (cm) => new ProxyRouter(cm as any, createMockInjectionDetector({ flagged: true, recommendation: "block" as any }) as any,
+        createMockAuditLog() as any, unitResponseScreen()),
+    },
+    {
+      cause: "proxy_context_gate",
+      build: (cm) => new ProxyRouter(cm as any, createMockInjectionDetector() as any, createMockAuditLog() as any, unitResponseScreen(),
+        { contextGateFilter: async () => { throw new Error("fixture context gate fault"); } }),
+    },
+    {
+      cause: "proxy_privacy",
+      build: (cm) => new ProxyRouter(cm as any, createMockInjectionDetector() as any, createMockAuditLog() as any, unitResponseScreen(),
+        { privacyEnforcement: { engine: {} as any, policyResolver: async () => { throw new Error("fixture vault outage"); } } as any }),
+    },
+    {
+      cause: "proxy_governor",
+      build: (cm) => {
+        const governor = createMockGovernor({ checkResult: { allowed: false, reason: "rate_exceeded" } });
+        return new ProxyRouter(cm as any, createMockInjectionDetector() as any, createMockAuditLog() as any, unitResponseScreen(),
+          { governor: governor as any });
+      },
+    },
+    {
+      cause: "proxy_admission",
+      build: (cm) => {
+        const screen = unitResponseScreen();
+        screen.screen = async () => { throw new Error("fixture screen fault"); };
+        return new ProxyRouter(cm as any, createMockInjectionDetector() as any, createMockAuditLog() as any, screen);
+      },
+    },
+    {
+      cause: "proxy_upstream_error",
+      build: (cm) => {
+        cm.callTool.mockRejectedValue(new Error("fixture upstream failure"));
+        return new ProxyRouter(cm as any, createMockInjectionDetector() as any, createMockAuditLog() as any, unitResponseScreen());
+      },
+    },
+  ];
+
+  it.each(CASES.map((c) => [c.cause, c] as const))("%s: the agent gets the one refusal and the ledger records that cause", async (_cause, c) => {
+    const r = await proxied(c.build);
+    expect(await r.call()).toEqual(expectedRefusal());
+    expect(r.causes).toEqual([c.cause]);
   });
 });
