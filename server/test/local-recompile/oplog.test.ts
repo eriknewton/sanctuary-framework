@@ -1,4 +1,4 @@
-// fail-before-exempt: new operator-log module, no base behaviour.
+// fail-before-exempt: FL-1 gives both real writers a bounded load budget and observes child failures; append and chain assertions are unchanged.
 import { afterEach, describe, expect, it } from "vitest";
 import { fork, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
@@ -369,6 +369,10 @@ describe("operator log capability refusals", () => {
 describe("operator log across processes", () => {
   const CHILD_APPENDS = 50;
   const PARENT_APPENDS = 50;
+  // Preserve the two-minute case deadline for setup, both writers, verification and cleanup.
+  const TWO_WRITER_TEST_TIMEOUT_MS = 2 * 60 * 1_000;
+  // Each writer may wait a quarter of the case budget, leaving half for the remaining work.
+  const WRITER_ACQUIRE_TIMEOUT_MS = TWO_WRITER_TEST_TIMEOUT_MS / 4;
 
   it("two processes append to one log without a gap or a fork", async () => {
     const base = await realpath(await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "lro-")));
@@ -377,25 +381,31 @@ describe("operator log across processes", () => {
     const runtimeRoot = await realpath(await mkdtemp(join(base, "r")));
     const storage = new FilesystemStorage(root);
     const keys = fixtureStoreKeys();
-    const log = new LocalOplog(storage, keys.oplogKey, { runtimeRoot });
+    const log = new LocalOplog(storage, keys.oplogKey, { runtimeRoot, timeoutMs: WRITER_ACQUIRE_TIMEOUT_MS });
     cleanups.push(() => log.close());
     await log.ensure();
     const childPath = fileURLToPath(new URL("./__fixtures__/oplog-append-child.ts", import.meta.url));
-    const child: ChildProcess = fork(childPath, [root, runtimeRoot, String(CHILD_APPENDS)], {
+    const child: ChildProcess = fork(childPath, [root, runtimeRoot, String(CHILD_APPENDS), String(WRITER_ACQUIRE_TIMEOUT_MS)], {
       execArgv: ["--import", import.meta.resolve("tsx")],
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
     cleanups.push(() => reap(child));
     const reply = replyOrExit(child);
-    child.send({ key: Buffer.from(keys.oplogKey).toString("base64") });
-    for (let index = 0; index < PARENT_APPENDS; index += 1) await log.append("worker_spawned", { pid: process.pid });
-    const [message] = (await reply) as [{ done: boolean }];
-    expect(message).toEqual({ done: true });
+    const parent = (async () => {
+      child.send({ key: Buffer.from(keys.oplogKey).toString("base64") });
+      for (let index = 0; index < PARENT_APPENDS; index += 1) await log.append("worker_spawned", { pid: process.pid });
+    })();
+    // Observe both immediately and settle both before teardown, even if either writer fails first.
+    const [parentResult, childResult] = await Promise.allSettled([parent, reply]);
+    if (parentResult.status === "rejected") throw parentResult.reason;
+    if (childResult.status === "rejected") throw childResult.reason;
+    const [message] = childResult.value as [{ done: boolean; error?: string }];
+    expect(message, message.error).toEqual({ done: true });
     expect(await log.verifyChain()).toEqual({ ok: true, base_seq: 0, head_seq: CHILD_APPENDS + PARENT_APPENDS });
     const rows = await log.readRows(0, CHILD_APPENDS + PARENT_APPENDS + 1);
     expect(rows.map((row) => row.seq)).toEqual(Array.from({ length: CHILD_APPENDS + PARENT_APPENDS + 1 }, (_, seq) => seq));
     expect(rows.filter((row) => row.kind === "worker_spawned" && row.body.pid === child.pid)).toHaveLength(CHILD_APPENDS);
-  }, 120_000);
+  }, TWO_WRITER_TEST_TIMEOUT_MS);
 });
 
 // Bounded graceful wait before SIGKILL when reaping a fixture child.
