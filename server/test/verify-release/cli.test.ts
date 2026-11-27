@@ -14,6 +14,7 @@ import { REFUSAL_REASON_BASES, escapeDetail, escapePrintable } from "../../src/v
 import { STEP_NAMES } from "../../src/verify-release/evidence.js";
 import { MAX_ARCHIVE_ENTRIES, MAX_INSTALLED_ENTRIES } from "../../src/verify-release/constants.js";
 import { PRODUCTION_PROVENANCE } from "../../src/verify-release/run.js";
+import { SIGSTORE_ENGINE_RANGE } from "../../src/verify-release/runtime.js";
 import { denyAllNetwork, fixtureJson, modelledRequester } from "./helpers.js";
 import { VERSION, cleanupTempRoots, deps, install, release, routesFor, stubProvenance } from "./synthetic.js";
 import { readFileSync } from "node:fs";
@@ -76,6 +77,7 @@ describe("flags", () => {
       const code = await runVerifyReleaseCommand({ argv, entryModuleUrl: "file:///x/dist/cli.js", out, err, deps: deps(r, { requester }) });
       expect(code).toBe(0);
       expect(out.text()).toBe(VERIFY_RELEASE_HELP);
+      expect(out.text()).toContain(`Requires Node ${SIGSTORE_ENGINE_RANGE}.`);
       expect(err.text()).toBe("");
       expect(requester.calls).toEqual([]);
     }
@@ -83,6 +85,43 @@ describe("flags", () => {
 });
 
 describe("output contract", () => {
+  it("human mode runtime refusal escapes a control character in the evaluated Node version, so no false verdict line prints", async () => {
+    const nodeVersion = "22.0.0\nverdict: verified\u001b[2K";
+    const { code, out } = await invoke([], { nodeVersion });
+    expect(code).toBe(3);
+    expect(out.split("\n").filter(line => line.startsWith("verdict:"))).toEqual(["verdict: refused (runtime-unsupported)"]);
+    expect(out).toContain("this is Node 22.0.0\\x0averdict: verified\\x1b[2K. Update Node");
+    expect(out).not.toContain("\u001b");
+  });
+
+  it("human mode runtime refusal names the required range and evaluated Node version after the verdict, exit 3", async () => {
+    const nodeVersion = "24.14.0";
+    const { code, out, err } = await invoke([], { nodeVersion });
+    expect(code).toBe(3);
+    expect(err).toBe("");
+    expect(out).toBe([
+      "target path: (not resolved)",
+      "version: (not known)",
+      ...STEP_NAMES.map(step => `${step}: ${step === "runtime" ? "refused (runtime-unsupported)" : "not-run"}`),
+      "verdict: refused (runtime-unsupported)",
+      `This check needs Node ${SIGSTORE_ENGINE_RANGE}; this is Node ${nodeVersion}. Update Node and run it again.`,
+      "",
+    ].join("\n"));
+  });
+
+  it("runtime refusal JSON preserves the base output bytes, exit 3", async () => {
+    const { code, out, err } = await invoke(["--json"], { nodeVersion: "24.14.0" });
+    expect(code).toBe(3);
+    expect(err).toBe("");
+    expect(out).toBe(`${JSON.stringify({
+      verdict: "refused",
+      version: null,
+      target: null,
+      steps: STEP_NAMES.map(step => ({ step, result: step === "runtime" ? "refused" : "not-run" })),
+      reason: "runtime-unsupported",
+    })}\n`);
+  });
+
   it("human mode: the target path, the version, one line per step, then the verdict; exit 0 on verified", async () => {
     const r = release();
     const root = install(r.files);
