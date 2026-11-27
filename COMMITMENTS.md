@@ -36,7 +36,7 @@ To compare the promises in two versions, run `git diff v<older> v<newer> -- COMM
 - Enforced: release process
 - Holds on: the npm package `@sanctuary-framework/mcp-server`, releases 1.8.0 and later
 - Limit: One signing key, held by the project, signs every release. A valid signature shows the file is the one that key signed. It does not show independent review.
-- Check it yourself: follow "Verify Before You Trust" in `SECURITY.md`; its npm package check ends with `node scripts/verify-release-artifact.mjs --tarball <file> --manifest release-manifest.json --version <version> --expected-public-key <key>`.
+- Check it yourself: follow "Verify Before You Trust" in `SECURITY.md`; its npm package check ends with `node scripts/verify-release-artifact.mjs --tarball <file> --manifest release-manifest.json --version <version> --expected-public-key <key>`. From the first release that includes it, `sanctuary verify-release --target <dir>` runs the same check, plus npm provenance, against an install.
 
 ## C-03. In a recorded drill, Sanctuary made no network connection you did not ask for.
 
