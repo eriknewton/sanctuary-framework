@@ -806,8 +806,8 @@ export function createReputationTools(
             },
           });
 
-          // A bundle that fails verification is its own cause, chosen by error type; a quota refusal keeps the router's.
-          if (!(err instanceof ReputationStoreQuotaError)) {
+          // Only the verification step's own error type means "unverified"; any other failure (quota, storage, custody, deadline) keeps the router's cause.
+          if (err instanceof ReputationBundleVerificationError) {
             // This refusal's cause is noted by type at its source; the router records it once.
             noteRefusalCause("reputation_import_unverified");
           }

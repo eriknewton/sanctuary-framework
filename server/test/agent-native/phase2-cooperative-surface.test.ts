@@ -2050,6 +2050,24 @@ describe("every primitive and reputation refusal names its operator cause", () =
     expect(sourceRows.map((row) => row.details?.denial_class)).toEqual(["namespace_unavailable"]);
   });
 
+  it("a reputation bundle that verifies and then fails to store keeps the router's cause", async () => {
+    const r = await routerRig({}, true);
+    expect((await r.call("reputation_record", {
+      interaction_id: "stored-after-verify",
+      counterparty_did: "did:key:counterparty",
+      outcome: { type: "transaction", result: "completed" },
+    })).isError).not.toBe(true);
+    const exported = r.body(await r.call("reputation_export", {}));
+    expect(typeof exported.bundle).toBe("string");
+    const write = r.env.storage.write.bind(r.env.storage);
+    vi.spyOn(r.env.storage, "write").mockImplementation(async (namespace, key, data) => {
+      if (namespace === "_reputation") throw new Error("fixture storage fault");
+      return write(namespace, key, data);
+    });
+    expect(await r.call("reputation_import", { bundle: exported.bundle })).toEqual(expectedRefusal());
+    expect(r.recorded.map((entry) => entry.cause)).toEqual(["post_allow_refusal"]);
+  });
+
   it("a cause a primitive notes on a call that then succeeds is discarded", async () => {
     const verified = { value: "v", version: 1, integrity_verified: true, signature_verified: true };
     const r = await routerRig({

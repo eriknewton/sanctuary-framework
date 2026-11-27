@@ -30,6 +30,23 @@ class HeldAuditWriteStorage extends MemoryStorage {
   }
 }
 
+// A response that waits on a held write fails this bound by assertion, well inside the test's own timeout.
+const RESPONSE_BOUND_MS = 2_000;
+// How long the held cleanup is watched for an early resolve before its writes are released.
+const HELD_CLEANUP_OBSERVE_MS = 50;
+const RESPONSE_PENDING = Symbol("response_PENDING");
+
+/** The promise's value, or RESPONSE_PENDING once the bound passes. */
+async function withinBound<T>(promise: Promise<T>, boundMs: number): Promise<T | typeof RESPONSE_PENDING> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<typeof RESPONSE_PENDING>((resolve) => { timer = setTimeout(() => resolve(RESPONSE_PENDING), boundMs); });
+  try {
+    return await Promise.race([promise, bound]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const teardown: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const step of teardown.splice(0).reverse()) await step();
@@ -50,13 +67,12 @@ async function boot(storage = new MemoryStorage()) {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await app.server.connect(serverTransport);
   await client.connect(clientTransport);
-  let cleaned = false;
-  const cleanup = async () => {
-    if (cleaned) return;
-    cleaned = true;
+  // Every caller, teardown included, awaits the one real cleanup until it settles.
+  let cleaning: Promise<void> | undefined;
+  const cleanup = (): Promise<void> => (cleaning ??= (async () => {
     await client.close();
     await app.cleanup();
-  };
+  })());
   teardown.push(async () => { await cleanup(); await app.server.close(); });
   return { app, client, cleanup };
 }
@@ -136,19 +152,25 @@ describe("cleanup order", () => {
       await appendCritical(entry);
       if (entry.operation === "sanctuary_who_am_i") storage.holding = true;
     });
-    const response = await b.client.callTool({ name: "sanctuary_who_am_i", arguments: {} });
-    expect(response.isError).not.toBe(true);
-    // The response arrived; the marker's write is still held.
-    await vi.waitFor(() => expect(storage.held.length).toBeGreaterThan(0));
-    let cleanupDone = false;
-    steps.state.recording = true;
-    const cleanup = b.cleanup().then(() => { cleanupDone = true; });
-    await vi.waitFor(() => expect(steps.order).toContain("auditLog.flush"));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(cleanupDone).toBe(false);
-    storage.release();
-    await cleanup;
-    expect(cleanupDone).toBe(true);
-    expect(storage.held).toEqual([]);
+    try {
+      const response = await withinBound(b.client.callTool({ name: "sanctuary_who_am_i", arguments: {} }), RESPONSE_BOUND_MS);
+      expect(response).not.toBe(RESPONSE_PENDING);
+      expect((response as Exclude<typeof response, typeof RESPONSE_PENDING>).isError).not.toBe(true);
+      // The response arrived; the marker's write is still held.
+      await vi.waitFor(() => expect(storage.held.length).toBeGreaterThan(0));
+      let cleanupDone = false;
+      steps.state.recording = true;
+      const cleanup = b.cleanup().then(() => { cleanupDone = true; });
+      await vi.waitFor(() => expect(steps.order).toContain("auditLog.flush"));
+      await new Promise((resolve) => setTimeout(resolve, HELD_CLEANUP_OBSERVE_MS));
+      expect(cleanupDone).toBe(false);
+      storage.release();
+      await cleanup;
+      expect(cleanupDone).toBe(true);
+      expect(storage.held).toEqual([]);
+    } finally {
+      // Held writes are released on every path, so a failed assertion still leaves teardown able to drain the queue.
+      storage.release();
+    }
   });
 });

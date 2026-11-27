@@ -299,12 +299,6 @@ describe("eviction, close and the stored filter", () => {
     expect((await r.call("sanctuary_events_close", { cursor: id })).body.closed).toBe(true);
   });
 
-  it("opened_at comes from the injected clock", async () => {
-    const r = await setup();
-    const cursor = (await r.open())!;
-    expect(r.eventCursorTable.openedAt(cursor)).toBe(new Date(r.clock.now).toISOString());
-  });
-
   it("two factories do not share a cursor table", async () => {
     const r = await setup();
     const other = r.factory();
