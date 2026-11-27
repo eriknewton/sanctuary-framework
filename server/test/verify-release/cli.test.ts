@@ -85,6 +85,15 @@ describe("flags", () => {
 });
 
 describe("output contract", () => {
+  it("human mode runtime refusal escapes a control character in the evaluated Node version, so no false verdict line prints", async () => {
+    const nodeVersion = "22.0.0\nverdict: verified\u001b[2K";
+    const { code, out } = await invoke([], { nodeVersion });
+    expect(code).toBe(3);
+    expect(out.split("\n").filter(line => line.startsWith("verdict:"))).toEqual(["verdict: refused (runtime-unsupported)"]);
+    expect(out).toContain("this is Node 22.0.0\\x0averdict: verified\\x1b[2K. Update Node");
+    expect(out).not.toContain("\u001b");
+  });
+
   it("human mode runtime refusal names the required range and evaluated Node version after the verdict, exit 3", async () => {
     const nodeVersion = "24.14.0";
     const { code, out, err } = await invoke([], { nodeVersion });

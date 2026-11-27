@@ -133,7 +133,9 @@ function humanReport(report: RunReport, nodeVersion: string): string {
     report.verdict === "verified" ? "verdict: verified" : `verdict: refused (${report.reason})`,
   ];
   if (report.reason === "runtime-unsupported") {
-    lines.push(`This check needs Node ${SIGSTORE_ENGINE_RANGE}; this is Node ${nodeVersion}. Update Node and run it again.`);
+    // The version comes from the running binary, but this line prints exactly when its strict parse failed, so it is
+    // escaped like the target path: a newline or control sequence in it must never print a second, false verdict line.
+    lines.push(`This check needs Node ${SIGSTORE_ENGINE_RANGE}; this is Node ${escapePrintable(nodeVersion)}. Update Node and run it again.`);
   }
   return `${lines.join("\n")}\n`;
 }
