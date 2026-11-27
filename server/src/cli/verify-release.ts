@@ -16,6 +16,7 @@ import { getSanctuaryVersion } from "../version.js";
 import { SYSTEM_CLOCK } from "../verify-release/deadline.js";
 import { escapePrintable } from "../verify-release/reasons.js";
 import { PRODUCTION_PROVENANCE, runVerifyRelease, type RunReport, type VerifyReleaseDeps } from "../verify-release/run.js";
+import { SIGSTORE_ENGINE_RANGE } from "../verify-release/runtime.js";
 import { httpsRequester } from "../verify-release/transport.js";
 
 export const VERIFY_RELEASE_VERIFIED_EXIT_CODE = 0;
@@ -28,6 +29,7 @@ export const VERIFY_RELEASE_REFUSED_EXIT_CODE = 3;
 export const VERIFY_RELEASE_HELP = `sanctuary verify-release. Check an install against Sanctuary's signed release record.
 
 Usage: sanctuary verify-release [--target <dir>] [--version <v>] [--json]
+Requires Node ${SIGSTORE_ENGINE_RANGE}.
 
   --target <dir>   The install to check: a folder holding
                    @sanctuary-framework/mcp-server (for example
@@ -122,7 +124,7 @@ export function parseVerifyReleaseArgs(argv: string[]): ParsedArgs {
   };
 }
 
-function humanReport(report: RunReport): string {
+function humanReport(report: RunReport, nodeVersion: string): string {
   const lines = [
     `target path: ${report.target === null ? "(not resolved)" : escapePrintable(report.target)}`,
     `version: ${report.version ?? "(not known)"}`,
@@ -130,6 +132,9 @@ function humanReport(report: RunReport): string {
       `${step}: ${result === "refused" ? `refused (${report.reason})` : result}`),
     report.verdict === "verified" ? "verdict: verified" : `verdict: refused (${report.reason})`,
   ];
+  if (report.reason === "runtime-unsupported") {
+    lines.push(`This check needs Node ${SIGSTORE_ENGINE_RANGE}; this is Node ${nodeVersion}. Update Node and run it again.`);
+  }
   return `${lines.join("\n")}\n`;
 }
 
@@ -171,7 +176,7 @@ export async function runVerifyReleaseCommand(args: VerifyReleaseCommandArgs): P
       { ...(parsed.target === undefined ? {} : { target: parsed.target }), ...(parsed.version === undefined ? {} : { version: parsed.version }) },
       deps,
     );
-    out.write(parsed.json ? jsonReport(report) : humanReport(report));
+    out.write(parsed.json ? jsonReport(report) : humanReport(report, deps.nodeVersion));
     return report.verdict === "verified" ? VERIFY_RELEASE_VERIFIED_EXIT_CODE : VERIFY_RELEASE_REFUSED_EXIT_CODE;
   } catch {
     // A fixed line: no stack, no message from the caught value, no bundle or certificate bytes.
