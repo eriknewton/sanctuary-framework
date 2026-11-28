@@ -31,11 +31,37 @@ import {
 } from "./erc8004-identity-signer.js";
 import {
   confirmErc8004RegistryOwner,
+  ERC8004_AGENT_REASONS,
   type Erc8004RegistryConfirmation,
   type Erc8004RegistryConfirmationConfig,
   type Erc8004RegistryEgressGate,
   type Erc8004RegistryFetch,
 } from "./erc8004-registry-confirm.js";
+
+// ── Agent projection ─────────────────────────────────────────────────
+
+const AGENT_REASON_SET: ReadonlySet<string> = new Set(ERC8004_AGENT_REASONS);
+
+/** A fixed message with no reason code in it; the raw code is already in the operator row. */
+export const ERC8004_REASON_OUTSIDE_SET_ERROR = "registry confirmation reason outside the agent set";
+
+/**
+ * The operator row keeps the gate's own code; the agent result is an allowlisted projection of status, chain_id,
+ * registry, reason and owner_address, so no other field can reach the agent. A reason outside ERC8004_AGENT_REASONS
+ * (erc8004-registry-confirm.ts) throws a fixed error rather than reach the agent.
+ */
+function agentRegistryConfirmation(confirmation: Erc8004RegistryConfirmation): Erc8004RegistryConfirmation {
+  if (confirmation.reason !== undefined && !AGENT_REASON_SET.has(confirmation.reason)) {
+    throw new Error(ERC8004_REASON_OUTSIDE_SET_ERROR);
+  }
+  return {
+    status: confirmation.status,
+    ...(confirmation.chain_id !== undefined ? { chain_id: confirmation.chain_id } : {}),
+    ...(confirmation.registry !== undefined ? { registry: confirmation.registry } : {}),
+    ...(confirmation.reason !== undefined ? { reason: confirmation.reason } : {}),
+    ...(confirmation.owner_address !== undefined ? { owner_address: confirmation.owner_address } : {}),
+  };
+}
 
 // ── Audit ops ────────────────────────────────────────────────────────
 
@@ -269,11 +295,14 @@ export async function resolveErc8004Identity(
         request_id: requestId,
         registry: signed.registry,
         chain_id: signed.chain_id,
-        reason: registryConfirmation.reason,
+        // The operator row keeps the gate's own code when egress refused the read.
+        reason: registryConfirmation.operator_reason ?? registryConfirmation.reason,
         fortress_id: deps.fortressId,
       },
     );
   }
+  // Projected after the unconfirmed row is written, so an out-of-set reason is on the operator row before the throw.
+  const agentConfirmation = agentRegistryConfirmation(registryConfirmation);
 
   await deps.auditLog.append(
     "l2",
@@ -295,7 +324,7 @@ export async function resolveErc8004Identity(
         ? "registry_confirmed"
         : "offline_verified",
     signer_address: signed.signer_address,
-    registry_confirmation: registryConfirmation,
+    registry_confirmation: agentConfirmation,
     fields,
   };
 }

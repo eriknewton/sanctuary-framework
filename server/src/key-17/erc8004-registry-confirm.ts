@@ -44,12 +44,35 @@ export type Erc8004RegistryConfirmationStatus =
   | "confirmed"
   | "unconfirmed";
 
+/**
+ * The reasons an agent may see on an unconfirmed registry read. The agent-facing reason is one of a closed set that
+ * never carries the egress gate's own code: every egress refusal reads `egress_unavailable`. Must match the projection
+ * in agentRegistryConfirmation (erc8004-resolve.ts) and the closed-set test in test/key-17/erc8004-resolve.test.ts.
+ */
+export const ERC8004_AGENT_REASONS = [
+  "rpc_not_configured",
+  "invalid_rpc_url",
+  "chain_mismatch",
+  "invalid_registry_address",
+  "invalid_signer_address",
+  "identity_not_numeric",
+  "identity_not_registered",
+  "owner_mismatch",
+  "rpc_error",
+  "egress_unavailable",
+] as const;
+
+export type Erc8004AgentReason = (typeof ERC8004_AGENT_REASONS)[number];
+
 export interface Erc8004RegistryConfirmation {
   status: Erc8004RegistryConfirmationStatus;
   chain_id?: number;
   registry?: string;
+  /** The agent-facing reason, one of ERC8004_AGENT_REASONS. */
   reason?: string;
   owner_address?: string;
+  /** Operator-only: the egress gate's own code when egress refused the read. Never part of an agent result. */
+  operator_reason?: string;
 }
 
 export interface Erc8004RegistryEgressRequest {
@@ -211,6 +234,16 @@ function unconfirmed(
   };
 }
 
+/** An egress refusal reads `egress_unavailable` for the agent; the gate's own code stays operator-only. */
+function egressUnconfirmed(
+  input: Erc8004RegistryConfirmationInput,
+  code: string,
+): Erc8004RegistryConfirmation {
+  // A malformed RPC URL found at fetch time is the same configuration fault the config check names, not a gate code.
+  if (code === "invalid_rpc_url") return unconfirmed(input, "invalid_rpc_url");
+  return { ...unconfirmed(input, "egress_unavailable"), operator_reason: code };
+}
+
 function isMissingRecordError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const msg = error.message.toLowerCase();
@@ -326,7 +359,7 @@ export async function confirmErc8004RegistryOwner(
     };
   } catch (error) {
     const egressDeniedReason = extractEgressDeniedReason(error);
-    if (egressDeniedReason) return unconfirmed(input, egressDeniedReason);
+    if (egressDeniedReason) return egressUnconfirmed(input, egressDeniedReason);
     if (isMissingRecordError(error)) {
       return unconfirmed(input, "identity_not_registered");
     }

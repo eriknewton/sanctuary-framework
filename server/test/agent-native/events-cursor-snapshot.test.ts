@@ -1,3 +1,4 @@
+// fail-before-exempt: pins only; the 64-concurrent-opens test now also reads every returned id, and the reservation it pins already holds at base.
 /**
  * An events cursor pages through the rows that were visible when it was
  * opened, in order, and skips a row that has since left the retained window.
@@ -261,6 +262,8 @@ describe("the open-cursor cap", () => {
     const held = opened.filter((o) => typeof o.cursor === "string");
     expect(held).toHaveLength(MAX_OPEN_CURSORS);
     expect(opened.filter((o) => o.cursor === undefined)).toHaveLength(1);
+    // Every returned id reads once every open has settled.
+    for (const o of held) expect((await r.run("sanctuary_events_read", { cursor: o.cursor })).next_cursor).toBe(o.cursor);
   });
 
   it("three waves of blocked snapshot queries never hold more than 64 cursors", async () => {

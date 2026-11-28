@@ -70,6 +70,7 @@ import { assertAdmissibleIdentityLabel } from "../signing/reserved-label.js";
 import type { SessionBindingBootState, SessionBindingState } from "../agent-native/session-binding-state.js";
 import { isSessionNotBoundError } from "../agent-native/session-not-bound.js";
 import { OriginUnresolvedError } from "./origin-unresolved.js";
+import { noteRefusalCause } from "../agent-native/denial-ledger.js";
 
 // Must match AUDIT_EVENT_SIGNING_DOMAIN_PREFIX / INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX
 // in core/signing-domains.ts (the identity_sign refusal list).
@@ -1314,6 +1315,8 @@ export function createCognitiveTools(
   }
 
   async function denyNamespaceAccess(operation: string, namespace: string) {
+    // This refusal's cause is noted by type at its source; the router records it once.
+    noteRefusalCause("namespace_refused");
     await recordCriticalAudit(auditLog, "l1", operation, "system", {
       namespace,
       denial_class: "namespace_unavailable",
@@ -1336,6 +1339,8 @@ export function createCognitiveTools(
             : {}),
         }
       : {};
+    // This refusal's cause is noted by type at its source; the router records it once.
+    noteRefusalCause("storage_name_unusable");
     await recordCriticalAudit(auditLog, "l1", operation, "system", {
       namespace,
       denial_class: "namespace_unavailable",
@@ -1349,6 +1354,8 @@ export function createCognitiveTools(
     error: StateVerificationError,
     namespaces: string[]
   ) {
+    // This refusal's cause is noted by type at its source; the router records it once.
+    noteRefusalCause("import_unverified");
     const partialDetails = getStateImportPartialApplyDetails(error);
     const partial = stateImportPartialAuditDetails(partialDetails);
     await recordCriticalAudit(
@@ -1615,6 +1622,8 @@ export function createCognitiveTools(
         try {
           assertIdentityMatchesSession(args.identity_id as string | undefined, "identity_sign");
         } catch {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("sign_identity_mismatch");
           return toolResult(fixedDenial("audit:identity_sign"));
         }
         const identity = resolveIdentity(args.identity_id as string | undefined);
@@ -1635,6 +1644,8 @@ export function createCognitiveTools(
         // accepts. Refused before the key is touched, with the fixed denial.
         if (startsWithInternalSigningDomain(payload)) {
           await recordCriticalAudit(auditLog, "l1", "identity_sign_denied", identity.identity_id);
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("sign_reserved_domain");
           return toolResult(fixedDenial("audit:identity_sign"));
         }
 
@@ -1844,6 +1855,8 @@ export function createCognitiveTools(
         // Namespace firewall: reject writes to reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("namespace_refused");
           return toolResult({
             error: "namespace_reserved",
             message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Choose a different namespace.`,
@@ -1956,6 +1969,8 @@ export function createCognitiveTools(
         // Namespace firewall: reject reads from reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("namespace_refused");
           return toolResult({
             error: "namespace_reserved",
             message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot read from reserved namespaces.`,
@@ -2005,6 +2020,8 @@ export function createCognitiveTools(
         }
 
         if (!result) {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("target_absent");
           return toolResult(fixedDenial("audit:state_read"));
         }
 
@@ -2128,6 +2145,8 @@ export function createCognitiveTools(
         }
 
         if (outcome.status === "refused_namespace_reserved") {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("namespace_refused");
           return toolResult({
             error: "namespace_reserved",
             message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${outcome.reservedPrefix}). Cannot disclose from reserved namespaces.`,
@@ -2136,9 +2155,13 @@ export function createCognitiveTools(
         if (outcome.status === "refused_namespace_unavailable") {
           // The denial audit record is written by the shared function; this is
           // the same generic denial `denyNamespaceAccess` renders.
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("namespace_refused");
           return toolResult(fixedDenial(`audit:${UNATTRIBUTED_DISCLOSURE_OPERATION}`));
         }
         if (outcome.status === "not_found") {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("target_absent");
           return toolResult(fixedDenial(`audit:${UNATTRIBUTED_DISCLOSURE_OPERATION}`));
         }
         if (outcome.status === "refused_writer_is_establishable") {
@@ -2194,6 +2217,8 @@ export function createCognitiveTools(
         // Namespace firewall: reject listing of reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("namespace_refused");
           return toolResult({
             error: "namespace_reserved",
             message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot list reserved namespaces.`,
@@ -2252,6 +2277,8 @@ export function createCognitiveTools(
         // Namespace firewall: reject deletes from reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
+          // This refusal's cause is noted by type at its source; the router records it once.
+          noteRefusalCause("namespace_refused");
           return toolResult({
             error: "namespace_reserved",
             message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot delete from reserved namespaces.`,
@@ -2594,6 +2621,8 @@ export function createCognitiveTools(
               },
               "failure"
             );
+            // This refusal's cause is noted by type at its source; the router records it once.
+            noteRefusalCause("import_unverified");
             return toolResult(fixedDenial("audit:state_import"));
           }
           throw err;

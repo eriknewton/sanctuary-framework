@@ -9,12 +9,26 @@
  * optional RPC read is default-off and is mocked in-process.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   resolveErc8004Identity,
   createErc8004ResolveTools,
+  ERC8004_REASON_OUTSIDE_SET_ERROR,
   ERC8004_RESOLVE_AUDIT_OPS,
 } from "../../src/key-17/erc8004-resolve.js";
+import {
+  confirmErc8004RegistryOwner,
+  ERC8004_AGENT_REASONS,
+  type Erc8004RegistryConfirmation,
+} from "../../src/key-17/erc8004-registry-confirm.js";
+import { createServer } from "../../src/router.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import type { DenialCause, DenialRecorder } from "../../src/agent-native/denial-ledger.js";
+import { expectedRefusal } from "../helpers/expected-refusal.js";
 import {
   signErc8004Registration,
   type Erc8004Registration,
@@ -27,6 +41,19 @@ import type {
   Erc8004RegistryEgressGate,
   Erc8004RegistryFetch,
 } from "../../src/key-17/erc8004-registry-confirm.js";
+
+// A test can make the registry confirmer return a fixed confirmation; otherwise the real one runs.
+const forcedConfirmation = vi.hoisted(() => ({ value: undefined as Erc8004RegistryConfirmation | undefined }));
+vi.mock("../../src/key-17/erc8004-registry-confirm.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/key-17/erc8004-registry-confirm.js")>();
+  return {
+    ...actual,
+    confirmErc8004RegistryOwner: (...args: Parameters<typeof actual.confirmErc8004RegistryOwner>) =>
+      forcedConfirmation.value !== undefined
+        ? Promise.resolve(forcedConfirmation.value)
+        : actual.confirmErc8004RegistryOwner(...args),
+  };
+});
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -339,10 +366,146 @@ describe("resolveErc8004Identity: optional registry confirmation", () => {
     expect(result.assurance).toBe("offline_verified");
     expect(result.registry_confirmation).toMatchObject({
       status: "unconfirmed",
-      reason: "egress_destination_denied",
+      reason: "egress_unavailable",
     });
     expect(egress.calls).toHaveLength(1);
     expect(fetchCalls).toHaveLength(0);
+  });
+});
+
+// ── Agent-facing registry reasons ────────────────────────────────────
+
+function denyingGate(reasonCode: string): Erc8004RegistryEgressGate {
+  return () => ({ decision: "deny", reason_code: reasonCode });
+}
+
+function unconfirmedRows(audit: ReturnType<typeof createMockAuditLog>) {
+  return audit.entries.filter((entry) => entry.op === ERC8004_RESOLVE_AUDIT_OPS.REGISTRY_UNCONFIRMED);
+}
+
+const ALLOWED_CONFIRMATION_KEYS = ["status", "chain_id", "registry", "reason", "owner_address"];
+
+describe("the registry reason an agent sees is one closed set", () => {
+  it("two different egress-gate denials give the same agent-facing reason and different operator rows", async () => {
+    const signed = makeSignedRecord({ identity: "12345", chain_id: 1 });
+    const policyAudit = createMockAuditLog();
+    const policyDenied = await resolveErc8004Identity(
+      baseDeps(policyAudit, {
+        registryConfirmation: CONFIRMATION_CONFIG,
+        egressGate: egressGateFromPolicy("different-rpc.example").gate,
+        fetchFn: fetchOwner(signed.signer_address),
+      }),
+      signed,
+    );
+    const customAudit = createMockAuditLog();
+    const customDenied = await resolveErc8004Identity(
+      baseDeps(customAudit, {
+        registryConfirmation: CONFIRMATION_CONFIG,
+        egressGate: denyingGate("egress_fixture_quota"),
+        fetchFn: fetchOwner(signed.signer_address),
+      }),
+      signed,
+    );
+    expect(policyDenied.registry_confirmation).toEqual(customDenied.registry_confirmation);
+    expect(policyDenied.registry_confirmation?.reason).toBe("egress_unavailable");
+    expect(JSON.stringify(policyDenied)).not.toContain("egress_destination_denied");
+    expect(JSON.stringify(customDenied)).not.toContain("egress_fixture_quota");
+    expect(unconfirmedRows(policyAudit).map((row) => row.data.reason)).toEqual(["egress_destination_denied"]);
+    expect(unconfirmedRows(customAudit).map((row) => row.data.reason)).toEqual(["egress_fixture_quota"]);
+  });
+
+  const SIGNER = "0x1111111111111111111111111111111111111111";
+  const REGISTRY = "0x1234567890abcdef1234567890abcdef12345678";
+  const allowAll: Erc8004RegistryEgressGate = () => ({ decision: "allow" });
+  const missingRecordRpc: Erc8004RegistryFetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    return new Response(JSON.stringify({
+      jsonrpc: "2.0",
+      id: body.id ?? 1,
+      error: { code: 3, message: "execution reverted: ERC721: owner query for nonexistent token" },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const ARMS: Array<{ label: string; config?: Partial<Erc8004RegistryConfirmationConfig>; input?: Record<string, unknown>; gate?: Erc8004RegistryEgressGate | null; fetchFn?: Erc8004RegistryFetch }> = [
+    { label: "no RPC configured", config: { rpc_url: "" } },
+    { label: "an unusable RPC URL", config: { rpc_url: "ftp://rpc.example" } },
+    { label: "a chain mismatch", input: { chain_id: 5 } },
+    { label: "an invalid registry address", input: { registry: "not-an-address" } },
+    { label: "an invalid signer address", input: { signer_address: "not-an-address" } },
+    { label: "a non-numeric identity", input: { identity: "did:agent:alice" } },
+    { label: "an unregistered identity", gate: allowAll, fetchFn: missingRecordRpc },
+    { label: "an owner mismatch", gate: allowAll, fetchFn: fetchOwner("0x2222222222222222222222222222222222222222") },
+    { label: "an RPC failure", gate: allowAll, fetchFn: unreachableRpc() },
+    { label: "a denied egress read", gate: denyingGate("egress_fixture_denied") },
+    { label: "a denied egress read with no code", gate: () => ({ decision: "deny" }) },
+    { label: "no egress gate", gate: null },
+  ];
+
+  it.each(ARMS)("every agent-facing reason is in the closed set: $label", async (arm) => {
+    const result = await confirmErc8004RegistryOwner(
+      {
+        config: { ...CONFIRMATION_CONFIG, ...arm.config },
+        ...(arm.gate === null ? {} : { egressGate: arm.gate ?? allowAll }),
+        fetchFn: arm.fetchFn ?? fetchOwner(SIGNER),
+      },
+      { identity: "12345", registry: REGISTRY, chain_id: 1, signer_address: SIGNER, ...arm.input } as Parameters<typeof confirmErc8004RegistryOwner>[1],
+    );
+    expect(result.status).toBe("unconfirmed");
+    expect(ERC8004_AGENT_REASONS as readonly string[]).toContain(result.reason);
+  });
+
+  it("registry_confirmation carries only the allowlisted fields", async () => {
+    const signed = makeSignedRecord({ identity: "12345", chain_id: 1 });
+    const result = await resolveErc8004Identity(
+      baseDeps(createMockAuditLog(), {
+        registryConfirmation: CONFIRMATION_CONFIG,
+        egressGate: denyingGate("egress_fixture_denied"),
+        fetchFn: fetchOwner(signed.signer_address),
+      }),
+      signed,
+    );
+    const keys = Object.keys(result.registry_confirmation ?? {});
+    expect(keys.length).toBeGreaterThan(0);
+    for (const key of keys) expect(ALLOWED_CONFIRMATION_KEYS).toContain(key);
+  });
+
+  it("a reason outside the set refuses with a message that contains no reason code", async () => {
+    const forced = "egress_fixture_outside_the_set";
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const { tools } = createErc8004ResolveTools({
+      auditLog,
+      identityId: OPERATOR_ID,
+      fortressId: "fortress-test",
+      registryConfirmation: CONFIRMATION_CONFIG,
+    });
+    const causes: DenialCause[] = [];
+    const denialLedger: DenialRecorder = { record: (cause) => { causes.push(cause); } };
+    const server = createServer(tools, { auditLog, denialLedger });
+    const client = new Client({ name: "erc8004-outside-set", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      const signed = makeSignedRecord({ identity: "12345", chain_id: 1 });
+      forcedConfirmation.value = { status: "unconfirmed", chain_id: 1, registry: signed.registry, reason: forced };
+      const result = await client.callTool({
+        name: "sanctuary/resolve_erc8004_identity",
+        arguments: { record: signed as unknown as Record<string, unknown> },
+      });
+      expect(result).toEqual(expectedRefusal());
+      for (const item of result.content as Array<{ text: string }>) expect(item.text).not.toContain(forced);
+      expect(causes).toEqual(["handler_error"]);
+      await auditLog.flush();
+      const toolErrors = (await auditLog.query({ operation_type: "tool_error:sanctuary/resolve_erc8004_identity", limit: 10 })).entries;
+      expect(toolErrors).toHaveLength(1);
+      expect(toolErrors[0]!.details?.error).toBe(ERC8004_REASON_OUTSIDE_SET_ERROR);
+      expect(ERC8004_REASON_OUTSIDE_SET_ERROR).not.toContain(forced);
+      const rows = (await auditLog.query({ operation_type: ERC8004_RESOLVE_AUDIT_OPS.REGISTRY_UNCONFIRMED, limit: 10 })).entries;
+      expect(rows.map((row) => row.details?.reason)).toEqual([forced]);
+    } finally {
+      forcedConfirmation.value = undefined;
+      await client.close();
+      await server.close();
+    }
   });
 });
 
