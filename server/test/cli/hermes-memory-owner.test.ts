@@ -1,9 +1,11 @@
+// fail-before-exempt: FL-3 scopes report fault fixtures by file identity; production behavior is unchanged.
 /**
  * The Hermes owner verbs (memory-report, memory-show, memory-delete) run
  * in-process against temporary fortresses: refusals, the report's derived
  * fields and window integrity, the no-write reader, show's ordering and
  * escaping, and every arm of the delete continuing-path table.
  */
+import type { FileHandle } from "node:fs/promises";
 import { Server } from "node:net";
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
@@ -39,6 +41,30 @@ import {
   FIXTURE_AGENT_ID, FIXTURE_PACKAGE_VERSION, FIXTURE_PASSPHRASE, TerminalInput, TerminalSink, admittedRow, auditEntries, ownerFortress,
   fixturePackage, runCleanups, runVerb, seedBridgeRows, seedPassage, treeHashes, withSeedSession, type Cleanup, type OwnerFortress,
 } from "../helpers/hermes-owner-fortress.js";
+
+/** Report faults must not change audit or lock durability in the same process. */
+async function spyOnReportSync(root: string, target: string, fixture: (handle: FileHandle) => Promise<void>) {
+  const probe = await open(join(root, "probe"), "w");
+  const prototype = Object.getPrototypeOf(probe) as FileHandle;
+  const realSync = prototype.sync;
+  await probe.close();
+  let reportIdentity: Awaited<ReturnType<typeof stat>> | undefined;
+  let reportSyncs = 0;
+  vi.spyOn(prototype, "sync").mockImplementation(async function(this: FileHandle) {
+    // The verb creates --out itself; capture its identity once it exists, never by sync order.
+    reportIdentity ??= await stat(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    });
+    const identity = await this.stat();
+    if (reportIdentity === undefined || identity.dev !== reportIdentity.dev || identity.ino !== reportIdentity.ino) {
+      return realSync.call(this);
+    }
+    reportSyncs += 1;
+    await fixture(this);
+  });
+  return { count: () => reportSyncs, realSync };
+}
 
 const stack: Cleanup[] = [];
 afterEach(async () => {
@@ -707,10 +733,7 @@ describe("hermes owner verbs: memory-report", () => {
     const reports = join(f.root, "reports");
     await mkdir(reports, { mode: 0o700 });
     const target = join(reports, "report.json");
-    const probe = await open(join(f.root, "probe"), "w");
-    const fileHandle = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
-    await probe.close();
-    vi.spyOn(fileHandle, "sync").mockImplementation(async () => {
+    const fault = await spyOnReportSync(f.root, target, async () => {
       // The file exists with partial content when the failure arrives; a read-only parent blocks its removal.
       if (!removable) await chmod(reports, 0o500);
       throw new Error("sync fixture");
@@ -718,6 +741,7 @@ describe("hermes owner verbs: memory-report", () => {
     const run = await runVerb(f, ["memory-report", "--since", f.since, "--out", target]);
     vi.restoreAllMocks();
     await chmod(reports, 0o700);
+    expect(fault.count()).toBe(1);
     expect(run.code).toBe(1);
     expect(run.err).toContain("could not be written in full");
     expect(lastLine(run.err)).toContain(CLOSING);
@@ -737,16 +761,14 @@ describe("hermes owner verbs: memory-report", () => {
     await mkdir(reports, { mode: 0o700 });
     // An escape sequence, a C1 control and a right-to-left override in the file name the operator typed.
     const target = join(reports, "r\u001b]0;x\u0007\u009b\u202e.json");
-    const probe = await open(join(f.root, "probe"), "w");
-    const fileHandle = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
-    await probe.close();
-    vi.spyOn(fileHandle, "sync").mockImplementation(async () => {
+    const fault = await spyOnReportSync(f.root, target, async () => {
       await chmod(reports, 0o500);
       throw new Error("sync fixture");
     });
     const run = await runVerb(f, ["memory-report", "--since", f.since, "--out", target]);
     vi.restoreAllMocks();
     await chmod(reports, 0o700);
+    expect(fault.count()).toBe(1);
     expect(run.err).toContain("a partial file remains at");
     for (const raw of ["\u001b", "\u0007", "\u009b", "\u202e"]) expect(run.err).not.toContain(raw);
     expect(run.err).toContain("\\u{009B}");
@@ -757,24 +779,28 @@ describe("hermes owner verbs: memory-report", () => {
     expect(ok.out).not.toContain("\u202e");
   });
 
-  it("a report that was written and synced but did not close says the whole report is on disk", async () => {
+  it.each([false, true])("a report that was written and synced but did not close says the whole report is on disk (unrelated sync=%s)", async unrelatedSync => {
     const f = await ownerFortress(stack);
     const reports = join(f.root, "reports");
     await mkdir(reports, { mode: 0o700 });
     const target = join(reports, "report.json");
-    const probe = await open(join(f.root, "probe"), "w");
-    const fileHandle = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
-    await probe.close();
-    const realSync = fileHandle.sync;
-    // The report verb writes nothing in the fortress, so the only sync is the report file's own. Its close is
-    // an instance field, so the handle that synced gets a close that really closes and then reports failure.
-    vi.spyOn(fileHandle, "sync").mockImplementation(async function(this: { close: () => Promise<void> }) {
-      await realSync.call(this);
-      const realClose = this.close;
-      this.close = async () => { await realClose(); throw new Error("close fixture"); };
+    const fault = await spyOnReportSync(f.root, target, async handle => {
+      await fault.realSync.call(handle);
+      // Close is an instance field: only the synced report handle gets the close failure.
+      const realClose = handle.close;
+      handle.close = async () => { await realClose(); throw new Error("close fixture"); };
     });
+    if (unrelatedSync) {
+      const unrelated = await open(join(f.root, "unrelated"), "w");
+      try {
+        await unrelated.sync();
+      } finally {
+        await unrelated.close();
+      }
+    }
     const run = await runVerb(f, ["memory-report", "--since", f.since, "--out", target]);
     vi.restoreAllMocks();
+    expect(fault.count()).toBe(1);
     expect(run.code).toBe(1);
     expect(run.err).toContain(`the whole report was written and synced to ${JSON.stringify(target)}`);
     expect(run.err).not.toContain("The command could not finish");
