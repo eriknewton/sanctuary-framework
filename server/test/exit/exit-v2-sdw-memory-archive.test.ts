@@ -1,4 +1,4 @@
-// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
+// fail-before-exempt: FL-2 fixes signer seeds while keeping distinct identities per call; production behavior is unchanged.
 import { ed25519 } from "@noble/curves/ed25519";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -23,7 +23,6 @@ import {
 import { decrypt, encrypt } from "../../src/core/encryption.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import {
-  generateKeypair,
   legacyPublicKeyToDid,
   publicKeyToDid,
 } from "../../src/core/identity.js";
@@ -92,8 +91,11 @@ async function makeAdapter(input: {
   });
 }
 
+let signerSequence = 0;
 function makeSigner(fortressId: string): ExitV2MemorySigner {
-  const { publicKey, privateKey } = generateKeypair();
+  // Replay must distinguish successive signers without depending on a random key draw.
+  const privateKey = createHash("sha256").update(`exit-v2-memory-signer:${signerSequence++}`).digest();
+  const publicKey = ed25519.getPublicKey(privateKey);
   return {
     identity_id: `identity-${fortressId}`,
     fortress_id: fortressId,

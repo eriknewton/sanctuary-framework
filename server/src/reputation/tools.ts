@@ -29,6 +29,7 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { fixedDenial } from "../agent-native/safety-base.js";
+import { noteRefusalCause } from "../agent-native/denial-ledger.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { RuntimeStatus } from "../health/evidence.js";
@@ -751,6 +752,8 @@ export function createReputationTools(
                 ...storageName,
               },
             });
+            // This refusal's cause is noted by type at its source; the router records it once.
+            noteRefusalCause("storage_name_unusable");
             return toolResult(fixedDenial("audit:reputation_import"));
           }
           const invalid =
@@ -803,6 +806,11 @@ export function createReputationTools(
             },
           });
 
+          // Only the verification step's own error type means "unverified"; any other failure (quota, storage, custody, deadline) keeps the router's cause.
+          if (err instanceof ReputationBundleVerificationError) {
+            // This refusal's cause is noted by type at its source; the router records it once.
+            noteRefusalCause("reputation_import_unverified");
+          }
           return toolResult({
             error: message,
             imported_attestations: 0,

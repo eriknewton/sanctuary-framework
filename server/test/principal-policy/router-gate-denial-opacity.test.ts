@@ -364,7 +364,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "recall of an absent key",
-    cause: "post_allow_refusal",
+    cause: "target_absent",
     gateRow: false,
     run: async (b) => {
       // A first save settles the session's memory namespace, so the recall below reaches its handler.
@@ -374,7 +374,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "recall of a hidden key",
-    cause: "post_allow_refusal",
+    cause: "hidden_key",
     gateRow: false,
     run: async (b) => {
       expect((await call(b, "sanctuary_remember", { key: "hidden-key", value: "v" })).isError).not.toBe(true);
@@ -401,7 +401,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "compound step denial",
-    cause: "post_allow_refusal",
+    cause: "target_absent",
     gateRow: false,
     run: (b) => call(b, "sanctuary_compound_execute", {
       steps: [{ tool: "sanctuary_recall", args: { key: "never-written-compound" } }],
@@ -409,7 +409,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "compound missing approval",
-    cause: "post_allow_refusal",
+    cause: "compound_approval_missing",
     gateRow: false,
     run: (b) => call(b, "sanctuary_compound_execute", {
       steps: [{ tool: "sanctuary_forget", args: { key: "k", mode: "secure" } }],
@@ -417,7 +417,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "spent cursor",
-    cause: "post_allow_refusal",
+    cause: "cursor_unknown",
     gateRow: false,
     run: async (b) => {
       const opened = body(await call(b, "sanctuary_events_open_cursor", {}));
@@ -427,9 +427,24 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "unknown cursor",
-    cause: "post_allow_refusal",
+    cause: "cursor_unknown",
     gateRow: false,
     run: (b) => call(b, "sanctuary_events_read", { cursor: "cursor-that-was-never-opened" }),
+  },
+  {
+    label: "full cursor table",
+    cause: "cursor_table_full",
+    gateRow: false,
+    run: async (b) => {
+      // Must match MAX_OPEN_CURSORS in agent-native/cooperative-surface.ts; the opened cursors are closed again after.
+      const opened: string[] = [];
+      try {
+        for (let i = 0; i < 64; i++) opened.push(body(await call(b, "sanctuary_events_open_cursor", {})).cursor as string);
+        return await call(b, "sanctuary_events_open_cursor", {});
+      } finally {
+        for (const cursor of opened) await call(b, "sanctuary_events_close", { cursor });
+      }
+    },
   },
   {
     label: "write under integrity findings",
@@ -457,7 +472,7 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "proxy refusal",
-    cause: "post_allow_refusal",
+    cause: "proxy_admission",
     gateRow: false,
     run: async (b) => {
       const screen = vi.spyOn(ResponseScreen.prototype, "screen").mockRejectedValueOnce(new Error("injected screen fault"));
@@ -466,13 +481,13 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     label: "primitive state_write to a reserved namespace after allow",
-    cause: "post_allow_refusal",
+    cause: "namespace_refused",
     gateRow: false,
     run: (b) => call(b, "state_write", { namespace: "_reputation", key: "k", value: "v" }),
   },
   {
     label: "reserved-domain identity_sign",
-    cause: "post_allow_refusal",
+    cause: "sign_reserved_domain",
     gateRow: false,
     run: (b) => call(b, "identity_sign", {
       identity_id: b.identityId,
@@ -630,9 +645,9 @@ describe("one refusal through the production composition root", () => {
       const drew = (tool: string, cause: DenialCause) =>
         served.some((record) => record.cause === cause && (record.input as DenialRecordInput).tool === tool);
       expect(drew("state_delete", "gate_denied")).toBe(true);
-      expect(drew("sanctuary_recall", "post_allow_refusal")).toBe(true);
-      expect(drew("state_write", "post_allow_refusal")).toBe(true);
-      expect(drew(`proxy/${FIXTURE_UPSTREAM}/read`, "post_allow_refusal")).toBe(true);
+      expect(drew("sanctuary_recall", "hidden_key")).toBe(true);
+      expect(drew("state_write", "namespace_refused")).toBe(true);
+      expect(drew(`proxy/${FIXTURE_UPSTREAM}/read`, "proxy_admission")).toBe(true);
       // The one ledger wrote each tool's window row to the served process's audit log.
       await vi.waitFor(async () => {
         const rows = (await booted.app.auditLog.query({ operation_type: "denial_cause", limit: 1_000 })).entries;
